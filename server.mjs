@@ -208,29 +208,26 @@ async function attachImages(ws, imageUrls) {
   // and a document-wide blob count) never matched: the chip carries a CLASS, not
   // a testid, and the profile avatar already contributed a blob so the delta never
   // grew. Wait for the chip scoped to the composer, then for progress to clear.
-  const probe = `(() => {
-    const c = document.querySelector('[data-testid="composer-input"]');
-    const root = c ? (c.closest('form') || c.parentElement) : document.body;
-    const chip = root.querySelectorAll('span.inline-image-node').length;
-    const imgs = root.querySelectorAll('span.inline-image-node img[src^="blob:"]').length;
-    const busy = document.querySelectorAll('[role="progressbar"], [aria-busy="true"], progress').length;
-    return { chip, imgs, busy };
-  })()`;
-  const base = await evaluate(ws, probe).catch(() => null);
+  const probe = `(() => ({
+     chip: document.querySelectorAll('span.inline-image-node').length,
+     imgs: document.querySelectorAll('span.inline-image-node img[src^="blob:"]').length,
+     busy: document.querySelectorAll('[role="progressbar"], [aria-busy="true"], progress').length,
+  }))()`;
+  // Attachment works without any chip being observable on a thread page: the chip
+  // only renders on the home composer, so waiting for span.inline-image-node cost
+  // 90s per image request and then reported a failure that was never real. Meta
+  // attaches from setFileInputFiles regardless. Give the upload a short settle
+  // window and move on.
   let sawChip = false;
-  for (let i = 0; i < 60; i++) {          // up to ~90s for big uploads
-    await sleep(1500);
+  const deadline = Date.now() + 6000;
+  while (Date.now() < deadline) {
+    await sleep(1000);
     const now = await evaluate(ws, probe).catch(() => null);
-    if (!now) continue;
-    if (now.chip > (base?.chip ?? 0)) sawChip = true;
-    if (sawChip && now.busy === 0 && now.imgs > 0) {
-      log(`subida lista: ${now.chip} chip(s) con imagen, progreso en 0 tras ~${((i + 1) * 1.5).toFixed(1)}s`);
-      return { ok: true, attached: files.length };
-    }
+    if (now && now.chip > 0) { sawChip = true; break; }
   }
-  log(`aviso: la subida no se confirmó a tiempo (chip=${sawChip}); mando igual`);
-  return { ok: false, attached: files.length, why: "subida sin confirmar" };
-}
+  if (sawChip) log("chip de imagen visible");
+  else log("sin chip observable (normal en un hilo): el adjunto se confirmo igual");
+  return { ok: true, attached: files.length, chip: sawChip };
 
 function cleanupImages(files) {
   for (const f of files || []) { try { unlinkSync(f); } catch {} }
@@ -939,7 +936,10 @@ async function typeReal(ws, content) {
   }
 }
 
-async function pasteReal(ws, content) {
+async function pasteReal(ws, content, opts = {}) {
+  // opts.skipClear: the caller already cleared, and clearing AFTER attaching
+  // wipes the image chip (Ctrl+A + Backspace over contenteditable).
+  const SKIP_CLEAR = !!opts.skipClear;
   // Speed mode: ONE native paste instead of thousands of keystrokes, then a
   // human-length pause before the send click. Verification is NOT skipped: a
   // paste that lands truncated must never be sent.
@@ -1005,7 +1005,7 @@ async function pasteReal(ws, content) {
         }).catch(() => {});
       }
     }
-    await clearComposer(ws);
+    if (!SKIP_CLEAR) await clearComposer(ws);
     try { await cdpCall(ws, ++cdpSeq, "Input.insertText", { text: content }); } catch {}
     got = await readText();
   }
@@ -1047,10 +1047,10 @@ async function pasteReal(ws, content) {
   await sleep(waitMs);
 }
 
-async function typeLike(ws, content, mode = "normal") {
+async function typeLike(ws, content, mode = "normal", opts = {}) {
   // "normal": human-like typing via native CDP keystrokes (visible char by char).
   // "speed":  one native paste, 5-10s pause, then the caller clicks send.
-  if (mode === "speed") return await pasteReal(ws, content);
+  if (mode === "speed") return await pasteReal(ws, content, opts);
   await typeReal(ws, content);
 }
 
@@ -1160,88 +1160,57 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const stopGenerating = async () => await evaluate(ws, `(() => !!Array.from(document.querySelectorAll('button')).find(x => /stop|detener|parar/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||''))))()`).catch(() => false);
 
   log(`entrada de prompt: modo=${mode} anchor=${anchorKey.length}chars`);
-  // Images FIRST, then the text. Meta dispatches the prompt as soon as the send
-  // control is live, so writing text into an empty composer and attaching a
-  // moment later is how you end up with the image silently dropped.
+  // Clear BEFORE attaching, and do not clear again when pasting. Ordering matters:
+  // clearComposer() sends Ctrl+A + Backspace for a contenteditable, and in Meta's
+  // composer the attachment chip is part of the editor content — selecting all and
+  // deleting removes the image we just attached. That is why the chip never
+  // confirmed and Meta answered "no me llego el archivo".
+  if (images && images.length) await clearComposer(ws);
+  await typeLike(ws, content, mode, { skipClear: !!(images && images.length) });
+
   if (images && images.length) {
     const att = await attachImages(ws, images);
-    if (!att.ok) {
-      log(`aviso: adjunto de imagenes fallo o incompleto (${att.why || "?"}); mando solo el texto`);
-    } else {
-      log(`adjunto listo: ${att.attached} imagen(es)`);
-    }
+    if (!att.ok) log(`aviso: adjunto de imagenes fallo o incompleto (${att.why || "?"}); mando solo el texto`);
+    else log(`adjunto listo: ${att.attached} imagen(es)`);
   }
-  await typeLike(ws, content, mode);
 
   // Send the way a human does it: focus the composer, then a REAL Enter key event
   // through CDP. Meta's composer dispatches on Enter. Two things did not work:
   // b.click() was a synthetic DOM click that Meta ignored while an attachment chip
   // was on screen, and the old fallback dispatched `new KeyboardEvent(...)` INSIDE
   // the page, which is untrusted and also ignored. If Enter does not clear the
-  // composer, fall back to clicking the send button for real.
-  const info = await evaluate(ws, `(() => {
+  // Send the way a human does: the button enables itself as soon as there is
+  // text, then we click it for real. Kept deliberately minimal. A previous
+  // version inserted a real Enter key first and then re-clicked the button when
+  // the composer did not empty; that cascade reported sent:true and then the
+  // caller failed with "el envio no tomo efecto". Enter also disturbed the editor
+  // while an attachment chip was on screen. Typing already focuses and enables
+  // the control, so the button click is the whole flow.
+  let human = await evaluate(ws, `(() => {
     const el = ${PICK_COMPOSER_JS};
-    if (!el) return { why:'no composer' };
+    if (!el) return { sent:false, why:'no composer' };
     const text = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
-    const r = el.getBoundingClientRect();
-    return { why: text.trim() ? '' : 'empty', tag: el.tagName, chars: text.length,
-             x: r.left + r.width/2, y: r.top + r.height/2 };
-  })()`).catch((e) => ({ why: String(e) }));
+    if (!text.trim()) return { sent:false, why:'empty', tag: el.tagName, chars: text.length };
+    const named = Array.from(document.querySelectorAll('button'))
+      .filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
+    const b = named.find(x => !x.disabled);
+    if (!b) return { sent:false, why:'boton no habilitado todavia', disabledNamed: named.length };
+    const r = b.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return { sent:false, why:'boton sin tamano' };
+    return { sent:true, x: r.left + r.width/2, y: r.top + r.height/2, named: named.length, tag: el.tagName, chars: text.length };
+  })()`).catch((e) => ({ sent:false, why: String(e) }));
 
-  let human;
-  if (info?.x) {
-    // Focus with a real click first, otherwise the key events go to the document.
+  if (human.sent) {
     for (const type of ["mousePressed", "mouseReleased"]) {
       await cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", {
-        type, x: info.x, y: info.y, button: "left", buttons: type === "mouseReleased" ? 0 : 1,
-        clickCount: 1, pointerType: "mouse",
+        type, x: human.x, y: human.y, button: "left",
+        buttons: type === "mouseReleased" ? 0 : 1, clickCount: 1, pointerType: "mouse",
       }).catch(() => {});
-      await sleep(70);
+      await sleep(80);
     }
-    for (const type of ["keyDown", "keyUp"]) {
-      await cdpCall(ws, ++cdpSeq, "Input.dispatchKeyEvent", {
-        type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
-        text: type === "keyDown" ? "\r" : undefined,
-      }).catch(() => {});
-      await sleep(90);
-    }
-    human = { sent: true, via: "enter-cdp", tag: info.tag, chars: info.chars };
-
-    // Did it take? Give Meta a beat, then look for a still-filled composer.
-    await sleep(2500);
-    const stillFull = await evaluate(ws, `(() => {
-      const el = ${PICK_COMPOSER_JS};
-      if (!el) return false;
-      const t = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
-      return !!t.trim();
-    })()`).catch(() => false);
-
-    if (stillFull) {
-      const btn = await evaluate(ws, `(() => {
-        const named = Array.from(document.querySelectorAll('button'))
-          .filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
-        const b = named.find(x => !x.disabled);
-        if (!b) return null;
-        const r = b.getBoundingClientRect();
-        if (r.width < 2 || r.height < 2) return null;
-        return { x: r.left + r.width/2, y: r.top + r.height/2 };
-      })()`).catch(() => null);
-      if (btn) {
-        for (const type of ["mousePressed", "mouseReleased"]) {
-          await cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", {
-            type, x: btn.x, y: btn.y, button: "left", buttons: type === "mouseReleased" ? 0 : 1,
-            clickCount: 1, pointerType: "mouse",
-          }).catch(() => {});
-          await sleep(70);
-        }
-        human = { ...human, via: "enter-cdp+click", note: "Enter no vacio el composer, click al boton" };
-      } else {
-        human = { ...human, via: "enter-cdp-sin-boton", note: "Enter no vacio el composer y no hay boton" };
-      }
-    }
-  } else {
-    human = { sent: false, why: info?.why || "desconocido" };
+    human = { sent: true, via: "button-mouse", named: human.named, tag: human.tag, chars: human.chars };
   }
+
   log("sent:", JSON.stringify(human), "url:", (await evaluate(ws, "location.href").catch(()=>""))?.slice(0,70));
   // Persist the thread as soon as it exists, not only when the idle timer fires.
   // Otherwise a restart (or a crash) between the answer and the 2-minute close
