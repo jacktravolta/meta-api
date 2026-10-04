@@ -314,8 +314,11 @@ async function growPool() {
   if (growingPool) return growingPool;
   growingPool = (async () => {
     try {
-      if (workers.length >= MAX_WORKERS) return null;
-      if (!(await ensureChrome())) return null;           // no browser, nothing to grow into
+      log(`growPool: llamado (pool=${workers.length}/${MAX_WORKERS}, ocupados=${workers.filter((w) => w.busy).length})`);
+      if (workers.length >= MAX_WORKERS) { log("growPool: pool al maximo, no crezco"); return null; }
+      // Throws (with the real reason already logged) if the browser is dead.
+      await ensureChrome();
+      log(`growPool: tras ensureChrome pool=${workers.length}`);
       if (workers.length >= MAX_WORKERS) return null;    // someone else won the race
       // A new worker always opens its OWN thread. Reusing the remembered URL would
       // put two sessions in the same conversation.
@@ -419,6 +422,7 @@ async function ensureChromeInner() {
   await closeStrayTabs();
   for (const w of workers) await attachComposer(w);
   log(`broker ready: ${workers.length}/${MAX_WORKERS} workers`);
+  return true;   // growPool() branches on this: a falsy value silently skipped growth
 }
 
 // The page has SEVERAL textareas and the FIRST one is NOT the composer (on the home
@@ -907,35 +911,51 @@ async function acquireWorker() {
   if (free) return free;
   if (workers.length < MAX_WORKERS) {
     const grown = await growPool();          // gives back a brand new, idle worker
+    log(`acquireWorker: growPool devolvio ${grown ? "worker " + grown.id : "null"}`);
     if (grown && !grown.busy) return grown;
   }
   return null;                                // caller queues it
 }
 
-function submit(content, copy_at = null, mode = MODE_DEFAULT) {
-  const jobId = "job-" + randomUUID();
-  jobs.set(jobId, { job_id: jobId, status: "queued", _input: content, content: "", copy_at, mode, created: new Date().toISOString() });
-  const j = jobs.get(jobId);
-  // Async on purpose: a request that finds every worker busy must be able to WAIT
-  // for a new tab instead of being dumped on a worker whose composer is already
-  // occupied. That was the cross-session corruption: two OpenCode windows sharing
-  // one tab and writing into the same composer.
-  async function start() {
+// Serialize the acquire+assign critical section.
+//
+// Without this, N concurrent requests each run acquireWorker() as a microtask
+// BEFORE any of them has reached assign(), so they all observe the same "free"
+// workers, none is marked busy yet, and every job piles onto the same tab. The
+// pool then never grows because from its point of view nothing was ever busy.
+// Chaining on one promise makes the decision strictly sequential.
+let dispatchChain = Promise.resolve();
+function dispatchJob(job) {
+  dispatchChain = dispatchChain.then(async () => {
     try {
       await ensureChrome();
-    } catch { /* ensureChrome already logged the real reason */ }
-    if (!workers.length) { const w = pickWorkerSafe(); assign(j, w); return; }
+    } catch (err) {
+      job.status = "error";
+      job.error = String(err.message || err);
+      return;
+    }
+    if (!workers.length) {
+      job.status = "error";
+      job.error = "no hay workers: Chrome no arranco";
+      return;
+    }
     let w = await acquireWorker();
     if (!w) w = leastLoadedWorker();
-    assign(j, w);
-  }
-  const assign = (job, w) => {
     job.worker = w.id;
     w.queue.push(job.job_id);
     pump(w);
-  };
-  const pickWorkerSafe = () => workers.length ? pickWorker() : { id: -1, queue: [], busy: false, ws: null };
-  setTimeout(start, 0);
+  }).catch((e) => {
+    job.status = "error";
+    job.error = "dispatch: " + String(e.message || e);
+    log("dispatch error:", String(e.message || e));
+  });
+  return dispatchChain;
+}
+
+function submit(content, copy_at = null, mode = MODE_DEFAULT) {
+  const jobId = "job-" + randomUUID();
+  jobs.set(jobId, { job_id: jobId, status: "queued", _input: content, content: "", copy_at, mode, created: new Date().toISOString() });
+  setTimeout(() => dispatchJob(jobs.get(jobId)), 0);
   return jobId;
 }
 
