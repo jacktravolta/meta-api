@@ -18,9 +18,9 @@ Environment=PATH=/home/test/.nvm/versions/node/v22.23.3/bin:/usr/local/bin:/usr/
 Environment=META_API_HOST=127.0.0.1
 Environment=META_API_PORT=8055
 Environment=META_MODE=speed
-# One worker = ONE tab. 3 workers meant 3 Chrome tabs (3 threads, hundreds of MB of
-# RAM). With 1 the queue is serialized, which is what a single-tab broker can honour.
-Environment=META_WORKERS=1
+# One tab per worker by default (3 meant 3 Chrome tabs, 3 threads, hundreds of MB
+# of RAM). The pool is bounded by META_MIN_WORKERS / META_MAX_WORKERS. META_WORKERS
+# is only the legacy alias for META_MIN_WORKERS, so do not set it here.
 Environment=META_CDP_PORT=9233
 Environment=META_PROFILE=/home/test/.config/google-chrome-beta-debug
 # Close the browser 30s after the last job. The thread URL is persisted in

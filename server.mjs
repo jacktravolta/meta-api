@@ -5,22 +5,31 @@
  *   POST /v1/chat/completions        OpenAI-compatible (sync; auto-queues).
  *   POST /v1/chat/completions/async  Deferred, NOT concurrent: returns
  *                                    {job_id} immediately; poll GET /v1/jobs/{id}.
- *                                    With META_WORKERS=1 every job is serialized,
- *                                    because there is exactly one browser tab.
  *   GET  /v1/jobs/{job_id}           {job_id, url, status, content?, error?}
  *   GET  /v1/models · GET /health
  *   POST /v1/browser/close           Closes the chrome process (and clears pool).
- *   Idle lifecycle: after META_IDLE_CLOSE_MS (default 10 min) with no active
- *   job, the browser auto-closes so no window is left open. The next request
+ *   Idle lifecycle: after META_IDLE_CLOSE_MS with no activity (no jobs AND no
+ *   human typing in a visible window) the browser auto-closes. The next request
  *   reopens the SAME conversation (remembered thread URL + persisted profile),
  *   so the session resumes instead of starting fresh.
  *
- * Broker: one Chrome process with N page tabs (workers). Each tab is an
- * independent Meta conversation; the dispatcher hands requests to the next
- * free worker (round-robin), so concurrency == META_WORKERS. Within a single
- * tab, requests are strictly serialized by that worker's queue. Calling this
- * "async" is about the HTTP contract (job id instead of a held connection),
- * not about parallelism.
+ * Broker: ONE Chrome process with a dynamic pool of page tabs (workers), between
+ * META_MIN_WORKERS and META_MAX_WORKERS. Each tab is an independent Meta
+ * conversation and serializes its own queue. A request that finds every worker
+ * busy grows the pool; past the cap it queues on the least loaded worker.
+ * Worker 0 is the primary and the only one that resumes the remembered thread.
+ * Calling "/async" is about the HTTP contract (job id instead of a held
+ * connection), not about parallelism.
+ *
+ * Context: Meta exposes no token counter, so usage is estimated from what this
+ * broker sent and received. At META_CONTEXT_SOFT_PCT the thread is rotated:
+ * Meta is asked to summarize, the summary is saved, the old thread is deleted
+ * from Meta's own UI, a fresh thread opens and the summary is replayed as
+ * context so the conversation continues.
+ *
+ * Recovery: queued jobs are mirrored to pending-jobs.json and re-dispatched on
+ * boot. Chrome dying is handled in-memory by recycling the pool and rescuing
+ * jobs that had not yet reached the browser.
  *
  * No dependencies: Node 22 native fetch + WebSocket + http.
  */
@@ -91,20 +100,19 @@ function resolveMode(raw) {
 const FRESH = process.env.META_FRESH === "1";
 // Context guard against hallucination: Meta drifts when the thread gets too
 // much context. META_RESET_TURNS (default 8): after N turns per worker we
-// auto-copy the transcript to file and start a fresh thread. META_RESET_CHARS
-// (default 8000) also trips the reset when the DOM conversation exceeds chars.
+// auto-copy the transcript to file and start a fresh thread. This is a separate,
+// blunter mechanism from the percentage-based rotation below; whichever trips
+// first wins, and RESET_TURNS usually does.
 const RESET_TURNS = Number(process.env.META_RESET_TURNS || 8);
 // Context rotation. Meta's web UI exposes NO token/context counter, so usage is
 // ESTIMATED from the size of the thread against a configurable character budget.
-// At or above SOFT_PCT the broker asks Meta to summarize, opens a fresh thread and
-// replays the summary as context, so the conversation continues instead of
-// degrading into truncated answers.
+// At or above SOFT_PCT the broker asks Meta to summarize, deletes the old thread
+// from Meta's UI, opens a fresh one and replays the summary as context, so the
+// conversation continues instead of degrading into truncated answers.
 const CONTEXT_BUDGET_CHARS = Number(process.env.META_CONTEXT_BUDGET_CHARS || 24000);
 const CONTEXT_SOFT_PCT = Number(process.env.META_CONTEXT_SOFT_PCT || 70);
-const CONTEXT_HARD_CHARS = Number(process.env.META_CONTEXT_HARD_CHARS || 32000);
 // Starting estimate for a thread we resume but never saw being built.
 const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 8000);
-const RESET_CHARS = Number(process.env.META_RESET_CHARS || 8000);
 const TRANSCRIPTS_DIR = process.env.META_TRANSCRIPTS_DIR || "/home/test/test/transcriptos";
 
 let chromeProc = null;
@@ -387,7 +395,11 @@ async function rotateThread(worker, pct) {
   // the UI flow fails we still rotate, we just keep one extra thread around.
   const oldUrl = lastThreadUrl;
   if (isThreadUrl(oldUrl)) {
-    const del = await deleteThreadInMeta(ws, oldUrl);
+    // Hard isolation: deleting the old thread is a nicety, rotating is the job.
+    // A throw here (as a ReferenceError once did) must not fail the request.
+    let del = { ok: false, why: "excepcion inesperada" };
+    try { del = await deleteThreadInMeta(worker.ws, oldUrl); }
+    catch (e) { log("borrado lanzo excepcion:", String(e.message || e)); }
     log(del.ok
       ? `hilo anterior eliminado del historial (${del.before} -> ${del.after} hilos)`
       : `no pude eliminar el hilo anterior (${del.why}); roto igual`);

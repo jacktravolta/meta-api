@@ -61,7 +61,11 @@ the profile, so this is a one-time action.
 | `META_VISIBLE` | — | `1` shows the Chrome window on `DISPLAY` |
 | `META_PROFILE` | `~/.config/google-chrome-beta-debug` | Chrome profile (holds the session) |
 | `META_CDP_PORT` | `9233` | Chrome debug port |
-| `META_RESET_TURNS` / `META_RESET_CHARS` | `8` / `8000` | start a fresh thread after N turns or N chars |
+| `META_RESET_TURNS` | `8` | start a fresh thread after N turns on a worker |
+| `META_CONTEXT_SOFT_PCT` | `70` | rotate the thread when estimated context reaches this % |
+| `META_CONTEXT_BUDGET_CHARS` | `24000` | character budget the % is measured against |
+| `META_CONTEXT_SEED_CHARS` | `8000` | starting estimate for a thread we resume but never watched being built |
+| `META_RECOVERY_MAX_AGE_MS` | `1800000` | ignore persisted jobs older than this on boot; their caller has given up |
 
 ## Session continuity
 
@@ -85,6 +89,37 @@ Two rules make parallel sessions safe, and both were violated before:
 
 Worker 0 is the "primary": it resumes the remembered thread and is the tab whose
 URL gets persisted to `state.json`.
+
+The pool does not shrink back down on its own. It only drops to the idle-close
+and rebuilds from `META_MIN_WORKERS` on the next request.
+
+## Context rotation
+
+At or above `META_CONTEXT_SOFT_PCT` the broker asks Meta to summarize the thread,
+saves the transcript and the summary to disk, **deletes the old thread from Meta's
+own frontend**, opens a fresh one and replays the summary as context. The answer
+then continues as if nothing had been cut.
+
+Deleting the thread is best effort: the UI flow can fail without blocking the
+rotation, in which case the history keeps one extra thread.
+
+`META_RESET_TURNS` is a separate, blunter mechanism. Whichever trips first wins,
+and the turn counter usually does — raise it if you want the percentage to drive.
+
+Usage is **estimated**, not measured: Meta exposes no token counter and the thread
+is virtualized, so `main` reads ~250 chars on a long thread while `body` is ~190k
+of React payload. The broker counts what it sent and received instead. Tune
+`META_CONTEXT_BUDGET_CHARS` if Meta degrades before the threshold trips.
+
+## Recovery
+
+| Failure | Handling |
+|---|---|
+| Chrome dies | `recycleChrome` rescues queued jobs before wiping the pool. A job rescued twice is marked error, never looped |
+| Node dies | queued jobs are mirrored to `pending-jobs.json` and re-dispatched on boot |
+
+A job that had already typed its prompt into Meta before the crash gets replayed,
+so the message can appear twice in the thread.
 
 ## Known limitation: one shared composer
 
