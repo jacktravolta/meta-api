@@ -851,6 +851,31 @@ async function pasteReal(ws, content) {
   })()`).catch(() => "");
 
   let got = await readText();
+  // RETRY. On a freshly opened thread the composer DIV exists and measures fine,
+  // but Lexical has not hydrated yet: insertText and the direct set both land on an
+  // element with no model behind it, so the composer reads 0 chars. A second
+  // attempt after a short wait succeeds once the editor is live.
+  for (let attempt = 2; compact(got) !== compact(content) && attempt <= 4; attempt++) {
+    log(`aviso: paste fallo (compact ${compact(got).length}/${compact(content).length}), reintento ${attempt - 1}/3 tras ${attempt * 900}ms`);
+    await sleep(attempt * 900);
+    await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
+    const r2 = await evaluate(ws, `(() => {
+      const el = ${PICK_COMPOSER_JS};
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    })()`).catch(() => null);
+    if (r2) {
+      for (const type of ["mousePressed", "mouseReleased"]) {
+        await cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", {
+          type, x: r2.x, y: r2.y, button: "left", buttons: type === "mousePressed" ? 1 : 0, clickCount: 1,
+        }).catch(() => {});
+      }
+    }
+    await clearComposer(ws);
+    try { await cdpCall(ws, ++cdpSeq, "Input.insertText", { text: content }); } catch {}
+    got = await readText();
+  }
   if (compact(got) !== compact(content)) {
     // Fallback: set the value directly and fire the input event React listens to.
     log(`aviso: paste mismatch (compact ${compact(got).length}/${compact(content).length}), intento set directo`);
