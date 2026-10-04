@@ -228,6 +228,7 @@ async function attachImages(ws, imageUrls) {
   if (sawChip) log("chip de imagen visible");
   else log("sin chip observable (normal en un hilo): el adjunto se confirmo igual");
   return { ok: true, attached: files.length, chip: sawChip };
+}
 
 function cleanupImages(files) {
   for (const f of files || []) { try { unlinkSync(f); } catch {} }
