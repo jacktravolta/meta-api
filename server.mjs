@@ -1208,16 +1208,18 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   // thread. Read the URL BEFORE the click — after a real dispatch Meta may already
   // have navigated, and comparing the new URL against itself hides the move.
   const urlBefore = await evaluate(ws, "location.href").catch(() => "");
-  // Count the thread rows that are OURS: a user row whose text contains our own
-  // opening characters. This is the ONLY verification that also works on a RESUMED
-  // thread, where the URL cannot move because it is already /prompt/<uuid>.
-  const humanRows = async () => await evaluate(ws, `(() => {
-    const key = ${JSON.stringify(anchorKey)};
-    const compact = (s) => (s||'').replace(/\\s+/g,' ').trim();
-    return Array.from(document.querySelectorAll('[class*="group/message-row"]'))
+  // Count the thread rows that are OURS: a user row containing our own opening
+  // characters. The comparison runs in Node on purpose: anchorKey was built with
+  // THIS scope's compact(), which strips every space, so a probe that compacted
+  // the row differently could never match and reported every resumed send as a
+  // silent failure. Reusing the same function makes divergence impossible.
+  const humanRows = async () => {
+    const rows = await evaluate(ws, `(() => Array.from(document.querySelectorAll('[class*="group/message-row"]'))
       .filter(r => r.querySelector('[class*="user-message"]'))
-      .filter(r => compact(r.innerText).includes(key)).length;
-  })()`).catch(() => -1);
+      .map(r => r.innerText))()`).catch(() => null);
+    if (!Array.isArray(rows)) return -1;
+    return rows.filter((t) => compact(String(t || "")).includes(anchorKey)).length;
+  };
   const preHuman = await humanRows();
   log("pre-envio:", JSON.stringify({ url: (urlBefore || "").slice(0, 70), humanRows: preHuman }));
 
