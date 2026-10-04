@@ -49,7 +49,12 @@ const CHROME = process.env.META_CHROME || "/usr/bin/google-chrome-beta";
 const PROFILE = process.env.META_PROFILE ||
   "/home/test/.config/google-chrome-beta-debug";
 const CDP_PORT = Number(process.env.META_CDP_PORT || 9233);
-const WORKERS = Math.max(1, Number(process.env.META_WORKERS || 3));
+// Worker pool. MIN tabs exist up front; the pool GROWS on demand up to MAX, so two
+// concurrent sessions never share a tab (and therefore never share a composer and
+// cannot corrupt each other's prompt). Beyond MAX the extra requests queue on the
+// least busy worker instead of piling into one conversation.
+const MIN_WORKERS = Math.max(1, Number(process.env.META_MIN_WORKERS || process.env.META_WORKERS || 1));
+const MAX_WORKERS = Math.max(MIN_WORKERS, Number(process.env.META_MAX_WORKERS || 10));
 const HOME_URL = "https://www.meta.ai";
 // META_START_URL lets a restarted gateway reopen an EXISTING conversation
 // (/prompt/<uuid>) instead of starting a fresh thread. Defaults to home.
@@ -234,6 +239,98 @@ function scheduleIdleClose(delay = IDLE_CLOSE_MS) {
 }
 
 let ensuringChrome = null;
+
+// Bonus: hide the automation fingerprint on every new document, and record human
+// interaction so the idle timer can tell that someone is typing in a visible tab.
+const STEALTH = `(() => {
+    const wd = Object.getOwnPropertyDescriptor(Window.prototype, 'webdriver');
+    if (wd) Object.defineProperty(window, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = window.chrome || { runtime: {} };
+    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+
+    window.__metaLastInteract = Date.now();
+    const markInteract = () => { window.__metaLastInteract = Date.now(); };
+    for (const ev of ['input','keydown','keyup','paste','click','mousedown','wheel','scroll']) {
+      window.addEventListener(ev, markInteract, true);
+    }
+  })();`;
+
+// Wait until this tab has a VISIBLE composer. Requires bringToFront first: a
+// background tab measures 0x0 forever and the visibility check would reject the
+// real composer even though it is there.
+async function attachComposer(w) {
+  await cdpCall(w.ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
+  for (let i = 0; i < 12; i++) {
+    await sleep(1500);
+    const has = await evaluate(w.ws, `!!(${PICK_COMPOSER_JS})`).catch(() => false);
+    if (has) return true;
+  }
+  log(`worker ${w.id}: sin composer visible tras 18s (pestaña ${(w.url || "").slice(0, 70)})`);
+  return false;
+}
+
+// One independent conversation. `url` decides which thread it opens: worker 0
+// resumes the remembered session, extra workers start their OWN thread so parallel
+// sessions cannot interleave into the same conversation.
+async function createWorkerTab(url) {
+  const jsonUrl = `http://127.0.0.1:${CDP_PORT}/json/list`;
+  let t;
+  try {
+    const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json/new?${encodeURIComponent(url)}`, { method: "PUT" });
+    t = await r.json();
+  } catch {
+    const lst = await (await fetch(jsonUrl)).json();
+    t = lst.find((x) => x.type === "page" && (x.url || "").includes("meta.ai")) || lst.find((x) => x.type === "page");
+  }
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("ws error worker")); });
+  await cdpCall(ws, ++cdpSeq, "Page.enable");
+  await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
+  try { await cdpCall(ws, ++cdpSeq, "Page.addScriptToEvaluateOnNewDocument", { source: STEALTH }); } catch {}
+  return { id: workers.length, ws, pageId: t.id, url: t.url, queue: [], busy: false, turns: 0 };
+}
+
+// Close every page target that is NOT one of our workers (Chrome's startup tab).
+async function closeStrayTabs() {
+  try {
+    const jsonUrl = `http://127.0.0.1:${CDP_PORT}/json/list`;
+    const list = await (await fetch(jsonUrl)).json();
+    const keep = new Set(workers.map((w) => w.pageId));
+    let closed = 0;
+    for (const target of list) {
+      if (target.type !== "page" || keep.has(target.id)) continue;
+      await fetch(`http://127.0.0.1:${CDP_PORT}/json/close/${target.id}`).catch(() => {});
+      closed++;
+    }
+    if (closed) log(`pestanas sobrantes cerradas: ${closed}`);
+  } catch { /* best-effort cleanup */ }
+}
+
+let growingPool = null;
+// Grow the pool by one, up to MAX. Serialized so N concurrent requests do not all
+// try to create a tab at the same instant.
+async function growPool() {
+  if (growingPool) return growingPool;
+  growingPool = (async () => {
+    try {
+      if (workers.length >= MAX_WORKERS) return null;
+      if (!(await ensureChrome())) return null;           // no browser, nothing to grow into
+      if (workers.length >= MAX_WORKERS) return null;    // someone else won the race
+      // A new worker always opens its OWN thread. Reusing the remembered URL would
+      // put two sessions in the same conversation.
+      const w = await createWorkerTab(START_URL);
+      workers.push(w);
+      await attachComposer(w);
+      log(`pool crecido: ${workers.length}/${MAX_WORKERS} workers (hilo propio para el worker ${w.id})`);
+      return w;
+    } catch (e) {
+      log("no pude hacer crecer el pool:", String(e.message || e));
+      return null;
+    } finally { growingPool = null; }
+  })();
+  return growingPool;
+}
 // Concurrent HTTP requests (OpenCode fires the chat call AND a title-generation
 // call at once) both reached ensureChrome before the first launch finished, so
 // Chrome was spawned twice and the thread ended with TWO worker tabs writing to
@@ -262,7 +359,7 @@ async function ensureChromeInner() {
   // a bare "fetch failed". Intermittent by nature: it depends on who wins the race.
   await killStrays();
   if (chromeProc) { try { chromeProc.kill("SIGTERM"); } catch {} chromeProc = null; workers = []; }
-  log(`launching Chrome (${VISIBLE ? "VISIBLE on " + (process.env.DISPLAY || "no DISPLAY") : "headless"}) with ${WORKERS} worker tabs…`);
+  log(`launching Chrome (${VISIBLE ? "VISIBLE on " + (process.env.DISPLAY || "no DISPLAY") : "headless"}) with ${MIN_WORKERS}+ workers (max ${MAX_WORKERS})…`);
   const args = [
     "--user-data-dir=" + PROFILE,
     "--remote-debugging-port=" + CDP_PORT,
@@ -297,26 +394,7 @@ async function ensureChromeInner() {
   });
   chromeProc.on("exit", (code, signal) => log(`chrome exit code=${code} signal=${signal}`));
 
-  // Bonus: hide the automation fingerprint on every new document.
-  const STEALTH = `(() => {
-    const wd = Object.getOwnPropertyDescriptor(Window.prototype, 'webdriver');
-    if (wd) Object.defineProperty(window, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    window.chrome = window.chrome || { runtime: {} };
-    const orig = navigator.plugins;
-    Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-
-    // Interaction tracker: the broker only sees its OWN jobs, so it cannot tell that
-    // a human is typing in the visible window. Without this the idle timer closes
-    // the browser on someone mid-sentence.
-    window.__metaLastInteract = Date.now();
-    const markInteract = () => { window.__metaLastInteract = Date.now(); };
-    for (const ev of ['input','keydown','keyup','paste','click','mousedown','wheel','scroll']) {
-      window.addEventListener(ev, markInteract, true);
-    }
-  })();`
-
-  // discover browser page or create tabs per worker
+  // discover browser page, then open the MINIMUM number of independent workers
   let jsonUrl = `http://127.0.0.1:${CDP_PORT}/json/list`;
   let cdpUp = false;
   for (let i = 0; i < 30; i++) {
@@ -333,57 +411,14 @@ async function ensureChromeInner() {
       `Revisa las lineas "chrome:" de este log para la causa real.`
     );
   }
-  for (let i = 0; i < WORKERS; i++) {
-    let t;
-    try {
-      const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json/new?${encodeURIComponent(lastThreadUrl || START_URL)}`, { method: "PUT" });
-      t = await r.json();
-    } catch {
-      const lst = await (await fetch(jsonUrl)).json();
-      t = lst.find((x) => x.type === "page" && (x.url || "").includes("meta.ai")) || lst.find((x) => x.type === "page");
-    }
-    const ws = new WebSocket(t.webSocketDebuggerUrl);
-    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("ws error worker " + i)); });
-    await cdpCall(ws, ++cdpSeq, "Page.enable");
-    // CRITICAL: tabs created via PUT /json/new are BACKGROUND tabs. Chrome does not
-    // compose them, so their viewport stays 0x0, every getBoundingClientRect() returns
-    // 0 and the visible-composer check rejects the real composer forever. Observed:
-    // 2 of 3 workers never found a composer while the accidentally-activated one did
-    // in 1.5s. Bringing the tab to front is what gives it a real viewport.
-    await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
-    try { await cdpCall(ws, ++cdpSeq, "Page.addScriptToEvaluateOnNewDocument", { source: STEALTH }); } catch {}
-    workers.push({ id: i, ws, pageId: t.id, url: t.url, queue: [], busy: false });
+  // Worker 0 resumes the remembered thread; any other minimum worker opens its own
+  // thread, so sessions never interleave into one conversation.
+  for (let i = 0; i < MIN_WORKERS; i++) {
+    workers.push(await createWorkerTab(i === 0 ? (lastThreadUrl || START_URL) : START_URL));
   }
-  // Close every page target that is NOT one of our workers. Chrome's startup tab
-  // (about:blank / default NTP) survives the launch and shows up as an extra
-  // window; in visible mode the user then sees two windows and thinks the broker
-  // opened two browsers.
-  try {
-    const list = await (await fetch(jsonUrl)).json();
-    const keep = new Set(workers.map((w) => w.pageId));
-    let closed = 0;
-    for (const target of list) {
-      if (target.type !== "page" || keep.has(target.id)) continue;
-      await fetch(`http://127.0.0.1:${CDP_PORT}/json/close/${target.id}`).catch(() => {});
-      closed++;
-    }
-    if (closed) log(`pestanas sobrantes cerradas: ${closed} (solo queda la del worker)`);
-  } catch { /* best-effort cleanup */ }
-  // wait until every tab has a VISIBLE composer. A bare existence check used to
-  // pass on a hidden 0x0 textarea, so typing started before the real composer
-  // existed and every request died at "button disabled". Requires bringToFront
-  // first, otherwise a background tab measures 0x0 forever.
-  for (const w of workers) {
-    let seen = false;
-    for (let i = 0; i < 12; i++) {
-      await cdpCall(w.ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
-      await sleep(1500);
-      const has = await evaluate(w.ws, `!!(${PICK_COMPOSER_JS})`).catch(() => false);
-      if (has) { seen = true; break; }
-    }
-    if (!seen) log(`worker ${w.id}: sin composer visible tras 18s (pestaña ${(w.url || "").slice(0, 70)})`);
-  }
-  log(`broker ready: ${workers.length} workers`);
+  await closeStrayTabs();
+  for (const w of workers) await attachComposer(w);
+  log(`broker ready: ${workers.length}/${MAX_WORKERS} workers`);
 }
 
 // The page has SEVERAL textareas and the FIRST one is NOT the composer (on the home
@@ -631,6 +666,10 @@ async function typeLike(ws, content, mode = "normal") {
 
 async function askMeta(worker, content, progress = null, mode = "normal") {
   const ws = worker.ws;
+  // With more than one worker only ONE window can be foreground at a time, and a
+  // background window measures 0x0 — the composer check would fail on a worker that
+  // is perfectly fine. Claim the foreground before touching anything.
+  await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
   // The thread is VIRTUALIZED and Meta renames classes between deploys, so a
   // saved index/count is NOT a stable boundary (slicing from it spliced several
   // OLD answers together). Anchor on OUR OWN prompt instead: find the LAST
@@ -855,16 +894,47 @@ function pickWorker() {
   return w; // all busy: queue on this one
 }
 
+// Shortest queue first. Used when the pool is at MAX and cannot grow: spreading
+// over the least loaded worker is what keeps the extra requests moving instead of
+// stacking on one conversation.
+function leastLoadedWorker() {
+  return workers.reduce((best, w) => (w.queue.length < best.queue.length ? w : best), workers[0]);
+}
+
+// A free worker if there is one; otherwise grow the pool; otherwise queue.
+async function acquireWorker() {
+  const free = workers.find((w) => !w.busy && w.queue.length === 0);
+  if (free) return free;
+  if (workers.length < MAX_WORKERS) {
+    const grown = await growPool();          // gives back a brand new, idle worker
+    if (grown && !grown.busy) return grown;
+  }
+  return null;                                // caller queues it
+}
+
 function submit(content, copy_at = null, mode = MODE_DEFAULT) {
   const jobId = "job-" + randomUUID();
   jobs.set(jobId, { job_id: jobId, status: "queued", _input: content, content: "", copy_at, mode, created: new Date().toISOString() });
   const j = jobs.get(jobId);
-  function start() {
-    const w = pickWorker();
-    j.worker = w.id;
-    w.queue.push(jobId);
-    pump(w);
+  // Async on purpose: a request that finds every worker busy must be able to WAIT
+  // for a new tab instead of being dumped on a worker whose composer is already
+  // occupied. That was the cross-session corruption: two OpenCode windows sharing
+  // one tab and writing into the same composer.
+  async function start() {
+    try {
+      await ensureChrome();
+    } catch { /* ensureChrome already logged the real reason */ }
+    if (!workers.length) { const w = pickWorkerSafe(); assign(j, w); return; }
+    let w = await acquireWorker();
+    if (!w) w = leastLoadedWorker();
+    assign(j, w);
   }
+  const assign = (job, w) => {
+    job.worker = w.id;
+    w.queue.push(job.job_id);
+    pump(w);
+  };
+  const pickWorkerSafe = () => workers.length ? pickWorker() : { id: -1, queue: [], busy: false, ws: null };
   setTimeout(start, 0);
   return jobId;
 }
@@ -954,6 +1024,8 @@ async function route(req, res) {
       jobs_pending: [...jobs.values()].filter((j) => j.status === "queued" || j.status === "running").length,
       // Honest self-report: /async is a deferred job handle, not parallelism.
       concurrency: workers.length,
+      pool: { min: MIN_WORKERS, max: MAX_WORKERS, size: workers.length,
+              queued: workers.reduce((n, w) => n + w.queue.length, 0) },
       async_semantics: workers.length > 1 ? "parallel-across-tabs" : "serialized-single-tab",
       mode_default: MODE_DEFAULT,
       cooldown_until: cooldownUntil > Date.now() ? new Date(cooldownUntil).toISOString() : null,
@@ -1108,7 +1180,7 @@ async function route(req, res) {
 
 process.on("SIGINT", () => { if (chromeProc) try { chromeProc.kill("SIGTERM"); } catch {} process.exit(0); });
 http.createServer(route).listen(PORT, HOST, () => {
-  log(`meta-ai broker async on http://${HOST}:${PORT} (workers=${WORKERS}, mode=${VISIBLE ? "visible" : "hidden"}, fresh=${FRESH ? "yes" : "no"})`);
+  log(`meta-ai broker async on http://${HOST}:${PORT} (workers=${MIN_WORKERS}-${MAX_WORKERS}, mode=${VISIBLE ? "visible" : "hidden"}, fresh=${FRESH ? "yes" : "no"})`);
   log(RESUMED_URL
     ? `sesion reanudada desde disco: ${RESUMED_URL.slice(0, 80)}`
     : `sin sesion guardada; arranco en ${START_URL}`);

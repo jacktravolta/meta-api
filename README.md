@@ -53,7 +53,8 @@ the profile, so this is a one-time action.
 | Variable | Default | Meaning |
 |---|---|---|
 | `META_API_HOST` / `META_API_PORT` | `127.0.0.1` / `8055` | listen address |
-| `META_WORKERS` | `3` | browser tabs. **1** serializes requests; >1 means N independent threads |
+| `META_MIN_WORKERS` | `1` | tabs opened up front. Each tab is an independent conversation |
+| `META_MAX_WORKERS` | `10` | hard cap on the pool. Requests beyond it queue on the least loaded worker |
 | `META_MODE` | `normal` | `speed` pastes with `Input.insertText`. `normal` types per character over CDP |
 | `META_IDLE_CLOSE_MS` | `600000` | close the browser after N ms with no activity. `0` disables. "Activity" means broker jobs **and** human interaction in the visible window (typing, clicking, scrolling), so the timer is postponed while you are typing |
 | `META_COOLDOWN_MS` | `480000` | refuse requests for N ms after Meta returns an empty generation |
@@ -68,13 +69,31 @@ The current thread URL is written to `state.json` right after every successful
 send and reloaded at boot, so a reopen resumes the same conversation instead of
 landing on the home screen. Only real `/prompt/<uuid>` URLs are stored.
 
+## Concurrency
+
+The pool grows on demand: a request that finds every worker busy opens a new tab,
+up to `META_MAX_WORKERS`. Past that, requests queue on the least loaded worker.
+
+Two rules make parallel sessions safe, and both were violated before:
+
+- **Each worker past the first opens its own thread.** Only worker 0 resumes the
+  remembered session. Opening `lastThreadUrl` in every tab put two sessions in the
+  same conversation, which is how one request ended up sending another's prompt.
+- **`askMeta` brings its tab to the foreground first.** With several windows only
+  one can be foreground, and a background window measures 0×0, so the composer check
+  fails on a worker that is actually fine.
+
+Worker 0 is the "primary": it resumes the remembered thread and is the tab whose
+URL gets persisted to `state.json`.
+
 ## Known limitation: one shared composer
 
 The broker and a human share a single tab. If you type in the visible window
 while a broker request is in flight, they collide on the same composer and the
 request fails with `el envio no tomo efecto` or `paste incompleto`. Both recover
 on the next request (Chrome is recycled and relaunched), but do not type into the
-window while you are also driving it through the API.
+window while you are also driving it through the API. API-versus-API is safe: each
+request gets its own worker and thread.
 
 ## Troubleshooting
 
