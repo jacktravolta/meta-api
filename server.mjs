@@ -38,6 +38,8 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { runAgentLoop } from "./agent/loop.js";
+import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
 
 // HARD GUARD: this file needs the GLOBAL WebSocket, which only exists in Node >= 21.
 // The distro node (/usr/bin/node) is 18.x, so anything started OUTSIDE an
@@ -1307,7 +1309,12 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
       // and the idle auto-close was never armed. The browser stayed open with a
       // job that could never finish.
       idle++;
-      if (idle >= idleLimitFor(gen, sawGenerating)) { log(`finalizado por inactividad sin texto (${idle} polls vacios)`); break; }
+      // Empty reads at the START of a turn are normal and long: Meta spends
+      // 10-20s interpreting the prompt before any text appears. The first fix
+      // here counted empty polls at the same rate as stalled ones (~7s) and
+      // killed the turn before Meta began generating.
+      const emptyLimit = gen ? 24 : 45;
+      if (idle >= emptyLimit) { log(`finalizado por inactividad sin texto (${idle} polls vacios, ${Math.round(idle * 0.9)}s)`); break; }
       continue;
     }
     // High-water mark: virtualization/streaming can re-render the message SHORTER
@@ -1422,6 +1429,22 @@ function dispatchJob(job) {
     log("dispatch error:", String(e.message || e));
   });
   return dispatchChain;
+}
+
+// Agent jobs are ordinary jobs that carry an `agent` flag, so they ride the same
+// pool, the same queue, the same recovery-on-disk path and the same idle timer.
+function submitAgent(task, opts = {}) {
+  const jobId = "job-" + randomUUID();
+  jobs.set(jobId, {
+    job_id: jobId, status: "queued", _input: task, content: "",
+    agent: true, maxSteps: opts.maxSteps || 8,
+    allowWrite: !!opts.allowWrite, allowNetwork: !!opts.allowNetwork,
+    workdir: opts.workdir || null, mode: MODE_DEFAULT,
+    created: new Date().toISOString(),
+  });
+  persistPending();
+  setTimeout(() => dispatchJob(jobs.get(jobId)), 0);
+  return jobId;
 }
 
 function submit(content, copy_at = null, mode = MODE_DEFAULT, images = []) {
@@ -1543,7 +1566,31 @@ async function pump(worker) {
         worker.turns = 0;
       }
     }
+    if (j.agent) {
+      // Meta plans, the broker executes. ask() is one full Meta turn on this
+      // worker's thread, so the whole loop lives in one conversation.
+      const res = await runAgentLoop({
+        ask: (p) => askMeta(worker, p, j, j.mode || MODE_DEFAULT, []),
+        task: j._input,
+        maxSteps: Number(j.maxSteps) || 8,
+        sandbox: {
+          workdir: j.workdir || undefined,
+          allowWrite: !!j.allowWrite,
+          allowNetwork: !!j.allowNetwork,
+        },
+        onEvent: (e) => log("agent", JSON.stringify(e)),
+      });
+      j.content = res.answer || "";
+      j.agentResult = { ok: res.ok, reason: res.reason || null, steps: res.steps,
+                        transcript: (res.transcript || []).map((t) => ({
+                          role: t.role, step: t.step,
+                          text: t.text ? String(t.text).slice(0, 1200) : undefined,
+                          command: t.command,
+                          output: t.output ? String(t.output).slice(0, 1200) : undefined,
+                        })) };
+    } else {
     j.content = await askMeta(worker, content, j, j.mode || MODE_DEFAULT, j.images || []);
+    }
     // Everything this worker has carried is context the next turn inherits.
     worker.ctxChars = (worker.ctxChars || 0) + String(content).length + String(j.content || "").length;
     worker.turns = (worker.turns || 0) + 1;
@@ -1625,6 +1672,33 @@ async function route(req, res) {
     scheduleIdleClose();
     return json(200, { status: "ok", workers: workers.length, url: (workers[0] && workers[0].url) || null });
   }
+  if (req.method === "POST" && url.pathname === "/v1/agent") {
+    let payload;
+    try { payload = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "invalid JSON" } }); }
+    const task = String(payload.task || payload.messages?.[0]?.content || "").trim();
+    if (!task) return json(400, { error: { message: "falta 'task'" } });
+
+    // Refuse to run unless the sandbox proves it is actually enforcing. Running an
+    // agent with a broken sandbox would execute model-authored text on the host.
+    if (payload.verify !== false) {
+      const probe = await sandboxSelfCheck();
+      if (!probe.ok || !probe.networkBlocked || !probe.hostHomeInvisible) {
+        return json(503, { error: { message: "el sandbox no verifica, no ejecuto el agente", probe } });
+      }
+    }
+    if (payload.allowWrite && !payload.allowWriteAck) {
+      return json(400, { error: { message:
+        "allowWrite habilita escritura en el workspace. Reenvia con allowWriteAck:true para confirmar." } });
+    }
+    const jobId = submitAgent(task, {
+      maxSteps: payload.maxSteps,
+      allowWrite: !!payload.allowWrite,
+      allowNetwork: !!payload.allowNetwork,
+      workdir: payload.workdir,
+    });
+    return json(202, { job_id: jobId, status: "queued", poll: `/v1/jobs/${jobId}` });
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/models") {
     return json(200, { object: "list", data: [
       { id: "meta-ai", object: "model", owned_by: "meta-ai-headless", created: 0 },
@@ -1647,7 +1721,14 @@ async function route(req, res) {
   if (req.method === "GET" && url.pathname.startsWith("/v1/jobs/")) {
     const j = jobs.get(url.pathname.slice("/v1/jobs/".length));
     if (!j) return json(404, { error: { message: "job not found" } });
-    return json(200, { job_id: j.job_id, status: j.status, content: j.content || null, error: j.error || null, worker: j.worker ?? null });
+    return json(200, {
+      job_id: j.job_id, status: j.status, content: j.content || null,
+      error: j.error || null, worker: j.worker ?? null,
+      // Agent jobs carry their steps and the full tool transcript; without this
+      // the caller cannot tell "Meta answered without using a tool" from a real
+      // tool result.
+      ...(j.agentResult ? { agent: j.agentResult } : {}),
+    });
   }
 
   if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/chat/completions/async")) {
