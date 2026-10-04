@@ -202,19 +202,34 @@ async function attachImages(ws, imageUrls) {
     return { ok: false, attached: 0, why: String(e.message || e) };
   }
 
-  // Wait for the preview chips. Blob/data images in the composer area are the
-  // signal that Meta accepted the upload.
-  const before = await evaluate(ws, `document.querySelectorAll('img[src^="blob:"], img[src^="data:image"]').length`).catch(() => 0);
-  for (let i = 0; i < 20; i++) {
-    await sleep(700);
-    const now = await evaluate(ws, `document.querySelectorAll('img[src^="blob:"], img[src^="data:image"]').length`).catch(() => 0);
-    if (now > before) {
-      log(`previews listos: ${now - before} imagen(es) visibles tras ~${((i + 1) * 0.7).toFixed(1)}s`);
+  // Readiness signal, measured from the live DOM: attaching a file renders
+  // SPAN.inline-image-node containing an IMG with a blob: src, and Meta raises a
+  // busy indicator while uploading. The previous selectors ([data-testid*=attachment]
+  // and a document-wide blob count) never matched: the chip carries a CLASS, not
+  // a testid, and the profile avatar already contributed a blob so the delta never
+  // grew. Wait for the chip scoped to the composer, then for progress to clear.
+  const probe = `(() => {
+    const c = document.querySelector('[data-testid="composer-input"]');
+    const root = c ? (c.closest('form') || c.parentElement) : document.body;
+    const chip = root.querySelectorAll('span.inline-image-node').length;
+    const imgs = root.querySelectorAll('span.inline-image-node img[src^="blob:"]').length;
+    const busy = document.querySelectorAll('[role="progressbar"], [aria-busy="true"], progress').length;
+    return { chip, imgs, busy };
+  })()`;
+  const base = await evaluate(ws, probe).catch(() => null);
+  let sawChip = false;
+  for (let i = 0; i < 60; i++) {          // up to ~90s for big uploads
+    await sleep(1500);
+    const now = await evaluate(ws, probe).catch(() => null);
+    if (!now) continue;
+    if (now.chip > (base?.chip ?? 0)) sawChip = true;
+    if (sawChip && now.busy === 0 && now.imgs > 0) {
+      log(`subida lista: ${now.chip} chip(s) con imagen, progreso en 0 tras ~${((i + 1) * 1.5).toFixed(1)}s`);
       return { ok: true, attached: files.length };
     }
   }
-  log("aviso: las previews no aparecieron a tiempo; mando igual");
-  return { ok: false, attached: files.length, why: "sin previews visibles a tiempo" };
+  log(`aviso: la subida no se confirmó a tiempo (chip=${sawChip}); mando igual`);
+  return { ok: false, attached: files.length, why: "subida sin confirmar" };
 }
 
 function cleanupImages(files) {
@@ -768,6 +783,17 @@ async function ensureChromeInner() {
 // and returning it made every later step fail silently (CDP clicked at (0,0),
 // Input.insertText was swallowed, and the send button stayed disabled).
 const PICK_COMPOSER_JS = `(() => {
+  // Meta's composer is a Lexical editor. When an image is attached, the
+  // <textarea> collapses to 0x0 and the live editable becomes a DIV that shares
+  // the same data-testid="composer-input" (measured: textarea 0x0, div 728x50).
+  // The old size filter therefore returned null the moment an image was present,
+  // and clear/paste/send all silently stopped finding the composer. Prefer the
+  // live editor; only then fall back to any visible textarea.
+  const live = document.querySelector('div[data-testid="composer-input"][contenteditable="true"], div[data-testid="composer-input"][contenteditable="plaintext-only"]');
+  if (live) {
+    const r = live.getBoundingClientRect();
+    if (r.width > 20 && r.height > 8 && !live.disabled && !live.readOnly) return live;
+  }
   const cands = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [contenteditable="plaintext-only"]'));
   const visible = (e) => {
     const r = e.getBoundingClientRect();
@@ -1147,26 +1173,75 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   }
   await typeLike(ws, content, mode);
 
-  // send: ALWAYS the send button when found (proven path); Enter as fallback.
-  const human = await evaluate(ws, `(() => {
-    // SAME picker as the typing step. querySelector('textarea') read the FIRST
-    // textarea — a different, EMPTY field on the home screen — so the prompt sat
-    // verified in the real composer and the send refused with why:'empty'.
+  // Send the way a human does it: focus the composer, then a REAL Enter key event
+  // through CDP. Meta's composer dispatches on Enter. Two things did not work:
+  // b.click() was a synthetic DOM click that Meta ignored while an attachment chip
+  // was on screen, and the old fallback dispatched `new KeyboardEvent(...)` INSIDE
+  // the page, which is untrusted and also ignored. If Enter does not clear the
+  // composer, fall back to clicking the send button for real.
+  const info = await evaluate(ws, `(() => {
     const el = ${PICK_COMPOSER_JS};
-    if (!el) return { sent:false, why:'no composer' };
+    if (!el) return { why:'no composer' };
     const text = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
-    if (!text.trim()) return { sent:false, why:'empty', tag: el.tagName, chars: text.length };
-    const buttons = Array.from(document.querySelectorAll('button'));
-    const named = buttons.filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
-    const b = named.find(x => !x.disabled) || null;
-    if (b) { b.click(); return { sent:true, via:'button', named: named.length }; }
-    // Do NOT bail on "button disabled": that match is usually the WRONG button
-    // (the prompt is filled, so the real send control is enabled but named
-    // differently). Fall back to Enter on the composer instead of failing.
-    el.focus();
-    el.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', bubbles:true, cancelable:true }));
-    return { sent:true, via:'enter-fallback', disabledNamed: named.length };
-  })()`).catch((e) => ({ sent:false, why: String(e) }));
+    const r = el.getBoundingClientRect();
+    return { why: text.trim() ? '' : 'empty', tag: el.tagName, chars: text.length,
+             x: r.left + r.width/2, y: r.top + r.height/2 };
+  })()`).catch((e) => ({ why: String(e) }));
+
+  let human;
+  if (info?.x) {
+    // Focus with a real click first, otherwise the key events go to the document.
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", {
+        type, x: info.x, y: info.y, button: "left", buttons: type === "mouseReleased" ? 0 : 1,
+        clickCount: 1, pointerType: "mouse",
+      }).catch(() => {});
+      await sleep(70);
+    }
+    for (const type of ["keyDown", "keyUp"]) {
+      await cdpCall(ws, ++cdpSeq, "Input.dispatchKeyEvent", {
+        type, key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+        text: type === "keyDown" ? "\r" : undefined,
+      }).catch(() => {});
+      await sleep(90);
+    }
+    human = { sent: true, via: "enter-cdp", tag: info.tag, chars: info.chars };
+
+    // Did it take? Give Meta a beat, then look for a still-filled composer.
+    await sleep(2500);
+    const stillFull = await evaluate(ws, `(() => {
+      const el = ${PICK_COMPOSER_JS};
+      if (!el) return false;
+      const t = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
+      return !!t.trim();
+    })()`).catch(() => false);
+
+    if (stillFull) {
+      const btn = await evaluate(ws, `(() => {
+        const named = Array.from(document.querySelectorAll('button'))
+          .filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
+        const b = named.find(x => !x.disabled);
+        if (!b) return null;
+        const r = b.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return null;
+        return { x: r.left + r.width/2, y: r.top + r.height/2 };
+      })()`).catch(() => null);
+      if (btn) {
+        for (const type of ["mousePressed", "mouseReleased"]) {
+          await cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", {
+            type, x: btn.x, y: btn.y, button: "left", buttons: type === "mouseReleased" ? 0 : 1,
+            clickCount: 1, pointerType: "mouse",
+          }).catch(() => {});
+          await sleep(70);
+        }
+        human = { ...human, via: "enter-cdp+click", note: "Enter no vacio el composer, click al boton" };
+      } else {
+        human = { ...human, via: "enter-cdp-sin-boton", note: "Enter no vacio el composer y no hay boton" };
+      }
+    }
+  } else {
+    human = { sent: false, why: info?.why || "desconocido" };
+  }
   log("sent:", JSON.stringify(human), "url:", (await evaluate(ws, "location.href").catch(()=>""))?.slice(0,70));
   // Persist the thread as soon as it exists, not only when the idle timer fires.
   // Otherwise a restart (or a crash) between the answer and the 2-minute close
