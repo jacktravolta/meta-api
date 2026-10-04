@@ -261,6 +261,105 @@ async function contextUsage(worker, incoming) {
   return { chars, pct };
 }
 
+const MOUSE = (type, x, y, clickCount = 0, buttons = 0) =>
+  cdpCall(ws => ws, ++cdpSeq, "Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount, buttons, pointerType: "mouse" });
+// Delete a conversation through Meta's OWN frontend: hover the item, open its
+// "Más opciones" dropdown, click "Eliminar", confirm. Verified end to end in
+// visible mode (40 -> 39 threads, active thread untouched).
+//
+// Headless caveat: the dropdown is a Radix popover that did not materialise in
+// headless runs during development. A failure here is NEVER fatal: rotation
+// continues, we only keep the extra thread around.
+async function deleteThreadInMeta(ws, url) {
+  const uuid = (String(url || "").match(/prompt\/([0-9a-f-]{8,})/) || [])[1];
+  if (!uuid) return { ok: false, why: "sin uuid en la url" };
+  const mouse = (type, x, y, clickCount = 0, buttons = 0) =>
+    cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount, buttons, pointerType: "mouse" });
+  try {
+    await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
+    // The dropdown only opens on a tab Chrome is actually compositing.
+    await evaluate(ws, `(() => {
+      const b = Array.from(document.querySelectorAll('button')).find(x => /barra lateral/i.test(x.getAttribute('aria-label')||''));
+      const nav = document.querySelector('nav');
+      if (b && nav && nav.getBoundingClientRect().width <= 50) b.click();
+      return true;
+    })()`).catch(() => {});
+    await sleep(1200);
+
+    const count = async () => await evaluate(ws, `document.querySelectorAll('[data-testid="conversation-item"]').length`).catch(() => 0);
+    const before = await count();
+
+    const geo = await evaluate(ws, `(() => {
+      const li = Array.from(document.querySelectorAll('[data-testid="conversation-item"]'))
+        .find(x => (x.innerHTML||'').includes(${JSON.stringify(uuid)}));
+      if (!li) return null;
+      li.scrollIntoView({ block: 'center' });
+      const r = li.getBoundingClientRect();
+      return { ix: r.left + r.width/2, iy: r.top + r.height/2 };
+    })()`);
+    if (!geo) return { ok: false, why: "el hilo no aparece en el historial", before, after: before };
+    await sleep(500);
+
+    // Hover first: the trigger is a group-hover control.
+    await mouse("mouseMoved", geo.ix, geo.iy); await sleep(700);
+    const trig = await evaluate(ws, `(() => {
+      const li = Array.from(document.querySelectorAll('[data-testid="conversation-item"]'))
+        .find(x => (x.innerHTML||'').includes(${JSON.stringify(uuid)}));
+      if (!li) return null;
+      const t = li.querySelector('[data-slot="dropdown-menu-trigger"]') ||
+                Array.from(li.querySelectorAll('button,[role="button"]')).find(x => /m.s opciones|more options/i.test(x.getAttribute('aria-label')||''));
+      if (!t) return null;
+      const r = t.getBoundingClientRect();
+      return { x: r.left + r.width/2, y: r.top + r.height/2 };
+    })()`);
+    if (!trig) return { ok: false, why: "sin boton 'Mas opciones'", before, after: before };
+
+    await mouse("mouseMoved", trig.x, trig.y); await sleep(500);
+    await mouse("mousePressed", trig.x, trig.y, 1, 1); await sleep(70);
+    await mouse("mouseReleased", trig.x, trig.y, 1, 0);
+
+    let del = null;
+    for (let i = 0; i < 12 && !del; i++) {
+      await sleep(400);
+      del = await evaluate(ws, `(() => {
+        const c = document.querySelector('[data-slot="dropdown-menu-content"]');
+        if (!c) return null;
+        const it = Array.from(c.querySelectorAll('[data-slot="dropdown-menu-item"]'))
+          .find(e => /eliminar|delete/i.test((e.innerText||e.textContent||'').trim()));
+        if (!it) return null;
+        const r = it.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return null;
+        return { x: r.left + r.width/2, y: r.top + r.height/2 };
+      })()`);
+    }
+    if (!del) return { ok: false, why: "el menu no abrio o no tiene 'Eliminar'", before, after: before };
+    await mouse("mousePressed", del.x, del.y, 1, 1); await sleep(70);
+    await mouse("mouseReleased", del.x, del.y, 1, 0);
+    await sleep(1800);
+
+    // Meta asks for confirmation.
+    const yes = await evaluate(ws, `(() => {
+      const vis = (e) => { const r = e.getBoundingClientRect(); return r.width > 1 && r.height > 1; };
+      const b = Array.from(document.querySelectorAll('[role="dialog"] button, [role="alertdialog"] button'))
+        .filter(vis).find(x => /eliminar|delete/i.test((x.innerText||x.textContent||'').trim()));
+      if (!b) return null;
+      const r = b.getBoundingClientRect();
+      return { x: r.left + r.width/2, y: r.top + r.height/2 };
+    })()`);
+    if (yes) {
+      await mouse("mousePressed", yes.x, yes.y, 1, 1); await sleep(70);
+      await mouse("mouseReleased", yes.x, yes.y, 1, 0);
+      await sleep(2500);
+    }
+
+    const after = await count();
+    const gone = after < before;
+    return { ok: gone, before, after, why: gone ? "" : "el hilo sigue en el historial" };
+  } catch (e) {
+    return { ok: false, why: String(e.message || e) };
+  }
+}
+
 const SUMMARY_PROMPT = `Necesito que resumas esta conversación para poder continuar en un hilo nuevo sin perder nada. Escribí un resumen autocontenido que incluya: (1) el objetivo del trabajo, (2) las decisiones tomadas y sus motivos, (3) el estado actual exacto, (4) archivos, funciones o comandos concretos mencionados con sus nombres exactos, (5) lo que falta hacer y el siguiente paso. No me pidas confirmaciones ni hagas preguntas: solo el resumen, en texto plano, sin listas de tareas pendientes sin contexto.`;
 
 async function rotateThread(worker, pct) {
@@ -283,6 +382,16 @@ async function rotateThread(worker, pct) {
       `RESUMEN POR ROTACION DE CONTEXTO (${pct}%)\n\n${summary}\n`);
   } catch { /* best-effort */ }
   saveSummary(summary, pct);
+
+  // Discard the outgoing thread so the history does not fill up. Best effort: if
+  // the UI flow fails we still rotate, we just keep one extra thread around.
+  const oldUrl = lastThreadUrl;
+  if (isThreadUrl(oldUrl)) {
+    const del = await deleteThreadInMeta(ws, oldUrl);
+    log(del.ok
+      ? `hilo anterior eliminado del historial (${del.before} -> ${del.after} hilos)`
+      : `no pude eliminar el hilo anterior (${del.why}); roto igual`);
+  }
 
   // Fresh thread, then replay the summary as the context the user never saw.
   const opened = await evaluate(worker.ws, `(() => { location.href = ${JSON.stringify(START_URL)}; return true; })()`).catch(() => false);
