@@ -192,20 +192,44 @@ async function rememberThreadUrl() {
     }
   } catch { /* best-effort: keep the previous URL */ }
 }
-// Arm the auto-close. Any real work clears it (see pump/route handlers).
-function scheduleIdleClose() {
+// How long ago did a HUMAN last touch the page (typing, clicking, scrolling)?
+// The broker only knows about its own jobs, so without this the idle timer would
+// close the window while the user was typing in it. Returns Infinity when the
+// tracker is missing or there is no page to ask.
+async function msSincePageInteraction() {
+  const w = workers[0];
+  if (!w || !w.ws) return Infinity;
+  const r = await evaluate(w.ws, `(() => {
+    if (typeof window.__metaLastInteract !== "number") return -1;
+    return Date.now() - window.__metaLastInteract;
+  })()`).catch(() => -1);
+  const ms = typeof r === "number" ? r : -1;
+  return ms < 0 ? Infinity : ms; // tracker absent: do not block the close
+}
+
+// Arm the auto-close. Real broker work clears it (see pump/route handlers);
+// `delay` lets us re-arm for only the time actually left.
+function scheduleIdleClose(delay = IDLE_CLOSE_MS) {
   clearIdleTimer();
   if (!(IDLE_CLOSE_MS > 0)) return;
   idleTimer = setTimeout(async () => {
     idleTimer = null;
     idleDeadline = 0;
-    if (activeJobs() > 0) { scheduleIdleClose(); return; } // work arrived meanwhile
+    if (activeJobs() > 0) { scheduleIdleClose(); return; } // we are answering: never close
     if (!chromeProc) return;                               // already closed
+    // The user typing/scrolling in the visible window counts as activity too.
+    const sinceUser = await msSincePageInteraction();
+    if (sinceUser < IDLE_CLOSE_MS) {
+      const left = Math.max(1000, Math.round(IDLE_CLOSE_MS - sinceUser));
+      log(`idle postergado ${left}ms: el usuario interactuo hace ${Math.round(sinceUser / 1000)}s`);
+      scheduleIdleClose(left);
+      return;
+    }
     await rememberThreadUrl();
     await recycleChrome(`inactivo ${Math.round(IDLE_CLOSE_MS / 1000)}s`);
     log(`idle: browser cerrado tras inactividad; la proxima peticion reabre ${lastThreadUrl}`);
-  }, IDLE_CLOSE_MS);
-  idleDeadline = Date.now() + IDLE_CLOSE_MS;
+  }, delay);
+  idleDeadline = Date.now() + delay;
   idleTimer.unref?.();
 }
 
@@ -281,6 +305,15 @@ async function ensureChromeInner() {
     window.chrome = window.chrome || { runtime: {} };
     const orig = navigator.plugins;
     Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+
+    // Interaction tracker: the broker only sees its OWN jobs, so it cannot tell that
+    // a human is typing in the visible window. Without this the idle timer closes
+    // the browser on someone mid-sentence.
+    window.__metaLastInteract = Date.now();
+    const markInteract = () => { window.__metaLastInteract = Date.now(); };
+    for (const ev of ['input','keydown','keyup','paste','click','mousedown','wheel','scroll']) {
+      window.addEventListener(ev, markInteract, true);
+    }
   })();`
 
   // discover browser page or create tabs per worker

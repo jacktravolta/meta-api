@@ -55,7 +55,7 @@ the profile, so this is a one-time action.
 | `META_API_HOST` / `META_API_PORT` | `127.0.0.1` / `8055` | listen address |
 | `META_WORKERS` | `3` | browser tabs. **1** serializes requests; >1 means N independent threads |
 | `META_MODE` | `normal` | `speed` pastes with `Input.insertText`. `normal` types per character over CDP |
-| `META_IDLE_CLOSE_MS` | `600000` | close the browser after N ms idle. `0` disables |
+| `META_IDLE_CLOSE_MS` | `600000` | close the browser after N ms with no activity. `0` disables. "Activity" means broker jobs **and** human interaction in the visible window (typing, clicking, scrolling), so the timer is postponed while you are typing |
 | `META_COOLDOWN_MS` | `480000` | refuse requests for N ms after Meta returns an empty generation |
 | `META_VISIBLE` | — | `1` shows the Chrome window on `DISPLAY` |
 | `META_PROFILE` | `~/.config/google-chrome-beta-debug` | Chrome profile (holds the session) |
@@ -67,6 +67,14 @@ the profile, so this is a one-time action.
 The current thread URL is written to `state.json` right after every successful
 send and reloaded at boot, so a reopen resumes the same conversation instead of
 landing on the home screen. Only real `/prompt/<uuid>` URLs are stored.
+
+## Known limitation: one shared composer
+
+The broker and a human share a single tab. If you type in the visible window
+while a broker request is in flight, they collide on the same composer and the
+request fails with `el envio no tomo efecto` or `paste incompleto`. Both recover
+on the next request (Chrome is recycled and relaunched), but do not type into the
+window while you are also driving it through the API.
 
 ## Troubleshooting
 
