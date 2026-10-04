@@ -105,16 +105,16 @@ const FRESH = process.env.META_FRESH === "1";
 // context. Previously a separate resetThread() ran first and started a fresh
 // thread WITHOUT replaying a summary, silently dropping the conversation every
 // RESET_TURNS requests.
-const RESET_TURNS = Number(process.env.META_RESET_TURNS || 8);
+const RESET_TURNS = Number(process.env.META_RESET_TURNS || 60);
 // Context rotation. Meta's web UI exposes NO token/context counter, so usage is
 // ESTIMATED from the size of the thread against a configurable character budget.
 // At or above SOFT_PCT the broker asks Meta to summarize, deletes the old thread
 // from Meta's UI, opens a fresh one and replays the summary as context, so the
 // conversation continues instead of degrading into truncated answers.
-const CONTEXT_BUDGET_CHARS = Number(process.env.META_CONTEXT_BUDGET_CHARS || 24000);
+const CONTEXT_BUDGET_CHARS = Number(process.env.META_CONTEXT_BUDGET_CHARS || 150000);
 const CONTEXT_SOFT_PCT = Number(process.env.META_CONTEXT_SOFT_PCT || 70);
 // Starting estimate for a thread we resume but never saw being built.
-const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 8000);
+const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 25000);
 // ---- Image attachments ------------------------------------------------------
 // OpenAI-style multimodal content: content is an ARRAY of parts, not a string.
 // Stringifying it yields "[object Object],[object Object]", which is what Meta
