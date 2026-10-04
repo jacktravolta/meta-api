@@ -98,11 +98,12 @@ function resolveMode(raw) {
 // DEFAULT=0 -> keep the browser AND the conversation thread alive so you can
 // converse with Meta across requests (window stays open; same hilo).
 const FRESH = process.env.META_FRESH === "1";
-// Context guard against hallucination: Meta drifts when the thread gets too
-// much context. META_RESET_TURNS (default 8): after N turns per worker we
-// auto-copy the transcript to file and start a fresh thread. This is a separate,
-// blunter mechanism from the percentage-based rotation below; whichever trips
-// first wins, and RESET_TURNS usually does.
+// Context rotation has a single mechanism with two triggers: the estimated
+// percentage (META_CONTEXT_SOFT_PCT) and a turn backstop (META_RESET_TURNS).
+// Both route through rotateThread, so the conversation always continues with its
+// context. Previously a separate resetThread() ran first and started a fresh
+// thread WITHOUT replaying a summary, silently dropping the conversation every
+// RESET_TURNS requests.
 const RESET_TURNS = Number(process.env.META_RESET_TURNS || 8);
 // Context rotation. Meta's web UI exposes NO token/context counter, so usage is
 // ESTIMATED from the size of the thread against a configurable character budget.
@@ -370,8 +371,8 @@ async function deleteThreadInMeta(ws, url) {
 
 const SUMMARY_PROMPT = `Necesito que resumas esta conversación para poder continuar en un hilo nuevo sin perder nada. Escribí un resumen autocontenido que incluya: (1) el objetivo del trabajo, (2) las decisiones tomadas y sus motivos, (3) el estado actual exacto, (4) archivos, funciones o comandos concretos mencionados con sus nombres exactos, (5) lo que falta hacer y el siguiente paso. No me pidas confirmaciones ni hagas preguntas: solo el resumen, en texto plano, sin listas de tareas pendientes sin contexto.`;
 
-async function rotateThread(worker, pct) {
-  log(`contexto al ${pct}%| (${CONTEXT_SOFT_PCT}% umbral): rotando el hilo con un resumen`);
+async function rotateThread(worker, pct, reason = "limite de contexto") {
+  log(`rotando el hilo (${reason}, ${pct}% del presupuesto de ${CONTEXT_BUDGET_CHARS} chars): pidiendo resumen`);
   let summary = "";
   try {
     summary = (await askMeta(worker, SUMMARY_PROMPT, null, MODE_DEFAULT)) || "";
@@ -1261,23 +1262,10 @@ async function recycleChrome(reason = "fresh per request") {
   persistPending();
 }
 
-async function resetThread(worker) {
-  // Context guard: save the transcript and open a fresh thread so the model
-  // never drifts into hallucination from an overgrown context.
-  try {
-    const blocks = await evaluate(worker.ws, `(() => Array.from(document.querySelectorAll('.markdown-content')).map(e => {
-      const pre = e.querySelector('pre'); const codeEl = pre && pre.querySelector('code');
-      return ((codeEl ? codeEl.textContent : (pre ? pre.textContent : e.textContent)) || '').trim();
-    }).filter(t => t && !/^(mostrar|show)\\s+razonamiento$/i.test(t)))()`).catch(() => []);
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    try { mkdirSync(TRANSCRIPTS_DIR, { recursive: true }); } catch {}
-    writeFileSync(`${TRANSCRIPTS_DIR}/${ts}-transcripto.txt`,
-      `TRANSCRIPTO (${blocks.length} bloques) ${new Date().toISOString()}\n\n${blocks.join("\n\n---\n\n")}\n`);
-    const ok = await evaluate(worker.ws, `(() => { location.href = "https://www.meta.ai"; return true; })()`).catch(() => false);
-    await sleep(3500);
-    log("contexto reiniciado: transcripto guardado + navegado a hilo nuevo (ok=" + ok + ")");
-  } catch (e) { log("resetThread error:", String(e.message || e)); }
-}
+// NOTE: the old resetThread() is gone. It started a fresh thread WITHOUT replaying
+// any summary, so every RESET_TURNS requests the conversation silently lost its
+// context while the transcript went to a file nobody reads. It also ran before the
+// percentage check, so the rotation below almost never got a chance to fire.
 
 async function pump(worker) {
   if (worker.busy) return;
@@ -1288,21 +1276,24 @@ async function pump(worker) {
   j.status = "running";
   clearIdleTimer(); // work is happening: cancel any pending auto-close
   try {
-    if ((worker.turns || 0) >= RESET_TURNS) {
-      await resetThread(worker);
-      worker.turns = 0;
-    }
-    // Context rotation at the soft threshold. Runs BEFORE the job, so the answer
-    // comes from a fresh thread seeded with the summary instead of a thread that
-    // Meta is about to start truncating.
+    // One rotation mechanism, two triggers. Both go through rotateThread so the
+    // conversation ALWAYS continues with its context: the turn counter is a
+    // backstop for pathological message sizes, not a competing reset that dropped
+    // the thread on the floor every N requests.
     const usage = await contextUsage(worker, j._input);
     worker.context = usage;
+    const byTurns = (worker.turns || 0) >= RESET_TURNS;
+    const byPct = usage.pct >= CONTEXT_SOFT_PCT;
     let content = j._input;
-    if (usage.pct >= CONTEXT_SOFT_PCT) {
-      const summary = await rotateThread(worker, usage.pct);
+    if (byPct || byTurns) {
+      const why = byPct && !byTurns ? `${usage.pct}% de contexto`
+        : byTurns && !byPct ? `${worker.turns} turnos en el hilo`
+        : `${usage.pct}% de contexto y ${worker.turns} turnos`;
+      const summary = await rotateThread(worker, usage.pct, why);
       if (summary) {
         content = withRecoveredContext(summary, j._input);
         worker.ctxChars = 0; // fresh thread: the summary is the new baseline
+        worker.turns = 0;
       }
     }
     j.content = await askMeta(worker, content, j, j.mode || MODE_DEFAULT);

@@ -61,7 +61,7 @@ the profile, so this is a one-time action.
 | `META_VISIBLE` | — | `1` shows the Chrome window on `DISPLAY` |
 | `META_PROFILE` | `~/.config/google-chrome-beta-debug` | Chrome profile (holds the session) |
 | `META_CDP_PORT` | `9233` | Chrome debug port |
-| `META_RESET_TURNS` | `8` | start a fresh thread after N turns on a worker |
+| `META_RESET_TURNS` | `8` | backstop: rotate after N turns on a worker. Same rotation, not a separate reset |
 | `META_CONTEXT_SOFT_PCT` | `70` | rotate the thread when estimated context reaches this % |
 | `META_CONTEXT_BUDGET_CHARS` | `24000` | character budget the % is measured against |
 | `META_CONTEXT_SEED_CHARS` | `8000` | starting estimate for a thread we resume but never watched being built |
@@ -103,8 +103,12 @@ then continues as if nothing had been cut.
 Deleting the thread is best effort: the UI flow can fail without blocking the
 rotation, in which case the history keeps one extra thread.
 
-`META_RESET_TURNS` is a separate, blunter mechanism. Whichever trips first wins,
-and the turn counter usually does — raise it if you want the percentage to drive.
+`META_RESET_TURNS` is the second trigger for the **same** rotation, not a competing
+mechanism: a backstop for pathological message sizes that never reach the
+percentage. Both go through `rotateThread`, so the conversation always continues
+with its context. There used to be a separate `resetThread()` that ran first and
+opened a fresh thread without replaying any summary, silently dropping the
+conversation every 8 requests.
 
 Usage is **estimated**, not measured: Meta exposes no token counter and the thread
 is virtualized, so `main` reads ~250 chars on a long thread while `body` is ~190k
