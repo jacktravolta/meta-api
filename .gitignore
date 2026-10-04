@@ -1,0 +1,8 @@
+# Runtime state: the remembered thread URL changes on every request, it is not source.
+state.json
+
+# Pre-fix backup of server.mjs, kept locally only as a safety net.
+server.mjs.bak-*
+
+node_modules/
+*.log
