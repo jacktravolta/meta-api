@@ -176,6 +176,21 @@ async function saveImageToFile(url, idx) {
 // with the image missing, so this wait is load-bearing, not cosmetic.
 async function attachImages(ws, imageUrls) {
   if (!imageUrls || !imageUrls.length) return { ok: true, attached: 0 };
+  // Remove leftover chips FIRST. clearComposer() clears text but not attachments,
+  // so every failed run left its image stuck in the composer and the next run
+  // started with a polluted one (a stale chip was what "chip de imagen visible"
+  // was reporting). Each chip carries a remove control (button, 16x16, absolute
+  // end-0.5). Clean, then attach.
+  const removed = await evaluate(ws, `(() => {
+    const chips = Array.from(document.querySelectorAll('span.inline-image-node'));
+    let n = 0;
+    for (const chip of chips) {
+      const btn = chip.parentElement?.querySelector('button');
+      if (btn) { btn.click(); n++; }
+    }
+    return n;
+  })()`).catch(() => 0);
+  if (removed) { log(`limpiados ${removed} chip(s) de imagen del intento anterior`); await sleep(1200); }
   const files = [];
   for (let i = 0; i < imageUrls.length; i++) {
     try { files.push(await saveImageToFile(imageUrls[i], i)); }
