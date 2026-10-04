@@ -265,6 +265,9 @@ let idleDeadline = 0;    // epoch ms when that auto-close fires (for /health)
 // the conversation and the next request reopened the bare home screen.
 const STATE_FILE = process.env.META_STATE_FILE ||
   "/home/test/test/meta-api/state.json";
+// Consecutive silent generations per thread URL. Lives in module scope so it
+// survives the Chrome recycle that the error path performs.
+const silentStreaks = new Map();
 const isThreadUrl = (u) => typeof u === "string" &&
   /^https:\/\/(www\.)?meta\.ai\/prompt\/[0-9a-f-]{8,}/i.test(u);
 
@@ -551,6 +554,39 @@ async function rotateThread(worker, pct, reason = "limite de contexto") {
   await attachComposer(worker);
   log(`hilo rotado. resumen de ${summary.length} chars inyectado como contexto`);
   return summary;
+}
+
+// A thread that ACCEPTED a prompt and then produced nothing is dead, not throttled.
+// Recycling Chrome reopens the same corpse, so the request fails identically forever.
+// Verified live: a thread with four long answers went silent, a fresh thread answered
+// the same prompt immediately.
+//
+// rotateThread cannot cover this case: it asks Meta for a summary, and a silent thread
+// does not answer summaries either, so it returns null and keeps the corpse. Here we
+// carry no summary on purpose: the honest outcome is a fresh thread that lost the
+// history, not a confident-looking invention of what the history said.
+async function abandonThread(worker, reason = "hilo silencioso") {
+  log(`abandonando el hilo (${reason}): acepto el prompt y no escribio nada; reciclarlo reabriria el mismo`);
+  const oldUrl = lastThreadUrl;
+  if (isThreadUrl(oldUrl)) {
+    let del = { ok: false, why: "excepcion inesperada" };
+    try { del = await deleteThreadInMeta(worker.ws, oldUrl); }
+    catch (e) { log("borrado lanzo excepcion:", String(e.message || e)); }
+    log(del.ok
+      ? `hilo muerto eliminado del historial (${del.before} -> ${del.after} hilos)`
+      : `no pude eliminar el hilo muerto (${del.why}); abro uno nuevo igual`);
+  }
+  const opened = await evaluate(worker.ws, `(() => { location.href = ${JSON.stringify(START_URL)}; return true; })()`).catch(() => false);
+  if (!opened) { log("no pude abrir el hilo nuevo: sigo en el muerto"); return false; }
+  await sleep(4000);
+  worker.turns = 0;
+  worker.ctxChars = 0; // fresh thread carries no history, so it starts from zero
+  await attachComposer(worker);
+  // Do not let a later recycle reopen the corpse we just walked away from.
+  lastThreadUrl = START_URL;
+  try { saveThreadUrl(START_URL); } catch { /* best effort */ }
+  log("hilo nuevo abierto, sin resumen: la conversacion anterior se perdio");
+  return true;
 }
 
 // Wrap the user's message with the recovered summary so the new thread continues
@@ -1617,7 +1653,40 @@ async function pump(worker) {
                           output: t.output ? String(t.output).slice(0, 1200) : undefined,
                         })) };
     } else {
-    j.content = await askMeta(worker, content, j, j.mode || MODE_DEFAULT, j.images || []);
+    // Both of these errors are thrown AFTER the send was confirmed, so the prompt
+    // reached the thread and the thread still said nothing. That points at the
+    // THREAD rather than the account, but it is NOT proof: the same thread went
+    // silent twice and then answered the next prompt in 1.5s. So a single silent
+    // generation is treated as noise and only a REPEATED one abandons the thread.
+    // Recycling Chrome used to be the only response, and it reopened the same
+    // thread, so a genuinely dead thread failed identically forever.
+    const askOnce = () => askMeta(worker, content, j, j.mode || MODE_DEFAULT, j.images || []);
+    const SILENT_STREAK_LIMIT = Number(process.env.META_SILENT_STREAK_LIMIT || 2);
+    // Keyed by thread and held in module scope, not on the worker: the error path
+    // recycles Chrome, which recreates the worker object, so a per-worker counter
+    // would reset on every failure and never reach the limit.
+    const streakKey = () => lastThreadUrl || START_URL;
+    try {
+      j.content = await askOnce();
+      silentStreaks.delete(streakKey());
+    } catch (e) {
+      const msg = String(e.message || e);
+      const silent = /no genero respuesta nueva|detuvo la generacion/i.test(msg);
+      if (!silent) throw e;
+      const streak = (silentStreaks.get(streakKey()) || 0) + 1;
+      silentStreaks.set(streakKey(), streak);
+      if (j._retriedFresh || streak < SILENT_STREAK_LIMIT) {
+        log(`hilo mudo ${streak}/${SILENT_STREAK_LIMIT} (${msg.slice(0, 60)}); lo trato como transitorio`);
+        throw e;
+      }
+      log(`hilo mudo ${streak} veces seguidas: no es transitorio, reintento en hilo nuevo`);
+      j._retriedFresh = true;
+      const freed = await abandonThread(worker, `hilo mudo ${streak} veces seguidas`);
+      if (!freed) throw e;
+      j.content = await askOnce();
+      silentStreaks.delete(streakKey());
+      log("el hilo nuevo respondio el mismo prompt: la falla era del hilo, no de la cuenta");
+    }
     }
     // Everything this worker has carried is context the next turn inherits.
     worker.ctxChars = (worker.ctxChars || 0) + String(content).length + String(j.content || "").length;
