@@ -1265,6 +1265,16 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   let last = "";
   let stable = "";
   let idle = 0;
+  // Declared BEFORE the poll loop: it is now consulted from the empty-read path
+  // too, and a const used before its declaration is a TDZ ReferenceError.
+  // 24 polls while Meta still says "generating" (~36s), fewer once it stops.
+  const idleLimitFor = (gen, saw) => (gen ? 24 : (saw ? 6 : 10));
+  // Absolute cap on the whole answer wait. Every other exit is content based, so
+  // a pathological case could still keep a job alive indefinitely and, with it,
+  // the browser: activeJobs() would never reach 0 and the idle auto-close would
+  // never fire.
+  const HARD_TIMEOUT_MS = Number(process.env.META_JOB_TIMEOUT_MS || 300000);
+  const startedAt = Date.now();
   let reply = "";
   let sawGenerating = false;
   // High-water mark for the answer: if Meta re-renders it SHORTER (virtualization,
@@ -1291,6 +1301,13 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
         setCooldown();
         throw new Error("Meta detuvo la generacion sin emitir bloques (bloqueo o limite de tasa)");
       }
+      // Count empty reads toward giving up. This used to `continue` without
+      // touching `idle`, so when Meta produced no text the counter stayed at 0
+      // forever: the job polled indefinitely, activeJobs() never dropped to 0,
+      // and the idle auto-close was never armed. The browser stayed open with a
+      // job that could never finish.
+      idle++;
+      if (idle >= idleLimitFor(gen, sawGenerating)) { log(`finalizado por inactividad sin texto (${idle} polls vacios)`); break; }
       continue;
     }
     // High-water mark: virtualization/streaming can re-render the message SHORTER
@@ -1315,8 +1332,12 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     // writes anything, so every longer answer came back truncated to its
     // preamble ("Interpretando solicitud..."). The short limits only apply once
     // generation has actually stopped.
-    const idleLimit = gen ? 24 : (sawGenerating ? 6 : 10);
+    const idleLimit = idleLimitFor(gen, sawGenerating);
     if (idle >= idleLimit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
+    if (Date.now() - startedAt > HARD_TIMEOUT_MS) {
+      log(`finalizado por timeout absoluto (${Math.round((Date.now() - startedAt) / 1000)}s) con ${idle} polls sin cambio`);
+      break;
+    }
     stable = now || "";
   }
   if (!reply) {
