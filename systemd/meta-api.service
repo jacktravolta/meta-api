@@ -1,0 +1,43 @@
+[Unit]
+Description=Meta AI broker — API compatible con OpenAI sobre scrape de navegador (CDP)
+Documentation=file:///home/test/test/meta-api/server.mjs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/test/test/meta-api
+
+# NOT /usr/bin/node. The distro node is 18.x and has NO global WebSocket, so it
+# fails hours later with "WebSocket is not defined". This needs nvm's Node 22.
+ExecStart=/home/test/.nvm/versions/node/v22.23.3/bin/node /home/test/test/meta-api/server.mjs
+Environment=PATH=/home/test/.nvm/versions/node/v22.23.3/bin:/usr/local/bin:/usr/bin:/bin
+
+# META_MODE=speed: usa Input.insertText. El modo "normal" (tecleo caracter a
+# caracter via CDP) hoy no aterriza texto: falla con "tipeo incompleto (0/N chars)".
+Environment=META_API_HOST=127.0.0.1
+Environment=META_API_PORT=8055
+Environment=META_MODE=speed
+# One worker = ONE tab. 3 workers meant 3 Chrome tabs (3 threads, hundreds of MB of
+# RAM). With 1 the queue is serialized, which is what a single-tab broker can honour.
+Environment=META_WORKERS=1
+Environment=META_CDP_PORT=9233
+Environment=META_PROFILE=/home/test/.config/google-chrome-beta-debug
+# Close the browser 30s after the last job. The thread URL is persisted in
+# state.json and the cookies live in the profile, so reopening is cheap: the next
+# request lands on the SAME conversation instead of starting a new one.
+Environment=META_IDLE_CLOSE_MS=30000
+Environment=META_COOLDOWN_MS=480000
+Environment=NODE_ENV=production
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meta-api
+
+[Install]
+WantedBy=default.target
