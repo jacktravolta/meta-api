@@ -1170,16 +1170,83 @@ function dispatchJob(job) {
 function submit(content, copy_at = null, mode = MODE_DEFAULT) {
   const jobId = "job-" + randomUUID();
   jobs.set(jobId, { job_id: jobId, status: "queued", _input: content, content: "", copy_at, mode, created: new Date().toISOString() });
+  persistPending(); // mirror to disk BEFORE dispatch: if we die now, the job survives
   setTimeout(() => dispatchJob(jobs.get(jobId)), 0);
   return jobId;
 }
 
+// ---- Crash recovery ---------------------------------------------------------
+// Two different failures need two different fixes:
+//   * Chrome dies  -> in-memory rescue in recycleChrome() (queued jobs never
+//     reached the browser, so replaying them is side-effect free).
+//   * Node dies    -> nothing in memory survives, so queued jobs are mirrored to
+//     disk and re-dispatched on boot. Without this, a restart silently drops
+//     every request the caller is still polling for.
+const JOBS_FILE = process.env.META_JOBS_FILE || "/home/test/test/meta-api/pending-jobs.json";
+const RECOVERY_MAX_AGE_MS = Number(process.env.META_RECOVERY_MAX_AGE_MS || 30 * 60 * 1000);
+const MAX_PERSISTED = Number(process.env.META_MAX_PERSISTED || 50);
+
+function persistPending() {
+  try {
+    const pending = [...jobs.values()]
+      .filter((j) => j.status === "queued" || j.status === "running")
+      .slice(0, MAX_PERSISTED)
+      .map((j) => ({ job_id: j.job_id, input: j._input, mode: j.mode, copy_at: j.copy_at, created: j.created }));
+    writeFileSync(JOBS_FILE, JSON.stringify(pending, null, 2));
+  } catch (e) { log("aviso: no pude persistir jobs:", String(e.message || e)); }
+}
+
+// Re-create job handles for requests that were still pending when the process
+// died. Jobs older than the window are dropped: their caller has long given up.
+function loadPending() {
+  let arr = [];
+  try { arr = JSON.parse(readFileSync(JOBS_FILE, "utf8")) || []; } catch { return []; }
+  const now = Date.now();
+  const recovered = [];
+  for (const p of arr) {
+    const age = now - Date.parse(p.created || "");
+    if (!Number.isFinite(age) || age < 0 || age > RECOVERY_MAX_AGE_MS) continue;
+    if (!p.job_id || !p.input) continue;
+    jobs.set(p.job_id, {
+      job_id: p.job_id, status: "queued", _input: p.input, content: "",
+      copy_at: p.copy_at ?? null, mode: p.mode || MODE_DEFAULT,
+      created: p.created, rescued: 1, recovered: true,
+    });
+    recovered.push(p.job_id);
+  }
+  if (recovered.length) log(`recuperacion: ${recovered.length} job(s) reencolados desde ${JOBS_FILE}`);
+  return recovered;
+}
+
 async function recycleChrome(reason = "fresh per request") {
+  // Rescue BEFORE wiping. A job still sitting in a worker queue never reached
+  // the browser, so replaying it is safe. A job that was already running got its
+  // status set to "error" by pump's catch, so it is not in here.
+  const rescue = [];
+  for (const w of workers) {
+    for (const jobId of w.queue) {
+      const j = jobs.get(jobId);
+      if (!j || j.status !== "queued") continue;
+      if (j.rescued) {           // second death: stop, or we loop forever
+        j.status = "error";
+        j.error = "Chrome murio dos veces; el job se descarta";
+        continue;
+      }
+      j.rescued = 1;
+      rescue.push(jobId);
+    }
+    w.queue.length = 0;
+  }
   if (chromeProc) { try { chromeProc.kill("SIGTERM"); } catch {} }
   chromeProc = null;
   for (const w of workers) { try { w.ws.close(); } catch {} }
   workers = [];
   log("chrome recycled (" + reason + ")");
+  if (rescue.length) {
+    log(`rescate: ${rescue.length} job(s) reencolados`);
+    for (const jobId of rescue) dispatchJob(jobs.get(jobId));
+  }
+  persistPending();
 }
 
 async function resetThread(worker) {
@@ -1255,8 +1322,9 @@ async function pump(worker) {
     // Prune the finished job: it retains _input (the whole prompt) and finished
     // jobs were never deleted — a slow memory leak on a long-running broker.
     // A TTL keeps /v1/jobs/{id} pollable for late async clients.
-    setTimeout(() => jobs.delete(jobId), 10 * 60 * 1000).unref?.();
+    setTimeout(() => { jobs.delete(jobId); persistPending(); }, 10 * 60 * 1000).unref?.();
   }
+  persistPending();
 }
 
 async function route(req, res) {
@@ -1447,4 +1515,8 @@ http.createServer(route).listen(PORT, HOST, () => {
     ? `sesion reanudada desde disco: ${RESUMED_URL.slice(0, 80)}`
     : `sin sesion guardada; arranco en ${START_URL}`);
   log(`auto-cierre: ${IDLE_CLOSE_MS > 0 ? Math.round(IDLE_CLOSE_MS / 1000) + "s de inactividad" : "desactivado"}`);
+  // Re-dispatch anything that was pending when we last died. ensureChrome() runs
+  // lazily on the first request, so this only restores the handles.
+  const recovered = loadPending();
+  for (const jobId of recovered) dispatchJob(jobs.get(jobId));
 });
