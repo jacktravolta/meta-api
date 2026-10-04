@@ -94,6 +94,16 @@ const FRESH = process.env.META_FRESH === "1";
 // auto-copy the transcript to file and start a fresh thread. META_RESET_CHARS
 // (default 8000) also trips the reset when the DOM conversation exceeds chars.
 const RESET_TURNS = Number(process.env.META_RESET_TURNS || 8);
+// Context rotation. Meta's web UI exposes NO token/context counter, so usage is
+// ESTIMATED from the size of the thread against a configurable character budget.
+// At or above SOFT_PCT the broker asks Meta to summarize, opens a fresh thread and
+// replays the summary as context, so the conversation continues instead of
+// degrading into truncated answers.
+const CONTEXT_BUDGET_CHARS = Number(process.env.META_CONTEXT_BUDGET_CHARS || 24000);
+const CONTEXT_SOFT_PCT = Number(process.env.META_CONTEXT_SOFT_PCT || 70);
+const CONTEXT_HARD_CHARS = Number(process.env.META_CONTEXT_HARD_CHARS || 32000);
+// Starting estimate for a thread we resume but never saw being built.
+const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 8000);
 const RESET_CHARS = Number(process.env.META_RESET_CHARS || 8000);
 const TRANSCRIPTS_DIR = process.env.META_TRANSCRIPTS_DIR || "/home/test/test/transcriptos";
 
@@ -121,8 +131,20 @@ function loadThreadUrl() {
   return null;
 }
 function saveThreadUrl(url) {
-  try { writeFileSync(STATE_FILE, JSON.stringify({ lastThreadUrl: url, savedAt: new Date().toISOString() }, null, 2) + "\n"); }
+  try { writeFileSync(STATE_FILE, JSON.stringify({ ...loadStateRaw(), lastThreadUrl: url, savedAt: new Date().toISOString() }, null, 2) + "\n"); }
   catch (e) { log("aviso: no pude guardar la sesion:", String(e.message || e)); }
+}
+function loadStateRaw() {
+  try { return JSON.parse(readFileSync(STATE_FILE, "utf8")) || {}; } catch { return {}; }
+}
+// The summary that seeds the fresh thread, kept so a crash between the summary and
+// the new tab does not lose it.
+function saveSummary(summary, pct) {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify({
+      ...loadStateRaw(), lastSummary: summary, summaryAt: new Date().toISOString(), summaryPct: pct,
+    }, null, 2) + "\n");
+  } catch (e) { log("aviso: no pude guardar el resumen:", String(e.message || e)); }
 }
 
 const RESUMED_URL = loadThreadUrl();
@@ -197,6 +219,87 @@ async function rememberThreadUrl() {
     }
   } catch { /* best-effort: keep the previous URL */ }
 }
+// Measured context usage of a worker's thread, as a percentage of the assumed
+// budget. textContent is used on purpose: innerText returns "" for a window Chrome
+// is not compositing, which would report a busy thread as empty.
+async function threadChars(ws) {
+  const r = await evaluate(ws, `(() => {
+    const strip = (e) => ((e && e.textContent) || '').length;
+    const md = document.querySelectorAll('.ur-markdown');
+    let mdChars = 0; for (const e of md) mdChars += strip(e);
+    const main = document.querySelector('main') || document.querySelector('div[role="main"]');
+    return {
+      url: location.href,
+      mdBlocks: md.length, mdChars,
+      mainChars: strip(main), bodyChars: strip(document.body),
+      mainTag: main ? main.tagName + (main.className ? '.' + String(main.className).split(' ')[0] : '') : null,
+    };
+  })()`).catch(() => null);
+  if (!r) return 0;
+  if (!ws.__ctxProbed) {
+    ws.__ctxProbed = true;
+    log("contexto: sonda inicial " + JSON.stringify(r));
+  }
+  // Prefer the assistant markdown blocks; fall back to the main region, then the
+  // whole body. The thread is VIRTUALIZED, so only part of it is ever in the DOM —
+  // which is exactly why this can only ever be an estimate.
+  if (r.mdChars > 200) return r.mdChars;
+  if (r.mainChars > 200) return r.mainChars;
+  return r.bodyChars || 0;
+}
+
+// ESTIMATED context usage, counted from what this broker itself sent and received
+// on that worker. The page cannot be used for this: the thread is VIRTUALIZED, so
+// `main` is nearly empty (250 chars on a long thread) while `body` is ~190k chars of
+// React/JSON payload. Measured evidence: mdBlocks 5 with 10 chars of actual text.
+// Meta exposes no token counter, so this is a proxy — tune the budget, do not trust
+// it as an exact percentage.
+async function contextUsage(worker, incoming) {
+  const prior = worker.ctxChars || 0;
+  const chars = prior + String(incoming || "").length;
+  const pct = Math.round((chars / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100);
+  return { chars, pct };
+}
+
+const SUMMARY_PROMPT = `Necesito que resumas esta conversación para poder continuar en un hilo nuevo sin perder nada. Escribí un resumen autocontenido que incluya: (1) el objetivo del trabajo, (2) las decisiones tomadas y sus motivos, (3) el estado actual exacto, (4) archivos, funciones o comandos concretos mencionados con sus nombres exactos, (5) lo que falta hacer y el siguiente paso. No me pidas confirmaciones ni hagas preguntas: solo el resumen, en texto plano, sin listas de tareas pendientes sin contexto.`;
+
+async function rotateThread(worker, pct) {
+  log(`contexto al ${pct}%| (${CONTEXT_SOFT_PCT}% umbral): rotando el hilo con un resumen`);
+  let summary = "";
+  try {
+    summary = (await askMeta(worker, SUMMARY_PROMPT, null, MODE_DEFAULT)) || "";
+  } catch (e) {
+    log("no pude resumir el hilo:", String(e.message || e));
+  }
+  if (!summary.trim()) {
+    log("resumen vacio: NO roto el hilo (seguir en el actual es mas seguro)");
+    return null;
+  }
+  // Keep the outgoing thread and the summary on disk before touching the tab.
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  try {
+    mkdirSync(TRANSCRIPTS_DIR, { recursive: true });
+    writeFileSync(`${TRANSCRIPTS_DIR}/${ts}-resumen-rotacion.txt`,
+      `RESUMEN POR ROTACION DE CONTEXTO (${pct}%)\n\n${summary}\n`);
+  } catch { /* best-effort */ }
+  saveSummary(summary, pct);
+
+  // Fresh thread, then replay the summary as the context the user never saw.
+  const opened = await evaluate(worker.ws, `(() => { location.href = ${JSON.stringify(START_URL)}; return true; })()`).catch(() => false);
+  if (!opened) { log("no pude abrir el hilo nuevo: sigo en el actual"); return null; }
+  await sleep(4000);
+  worker.turns = 0;
+  await attachComposer(worker);
+  log(`hilo rotado. resumen de ${summary.length} chars inyectado como contexto`);
+  return summary;
+}
+
+// Wrap the user's message with the recovered summary so the new thread continues
+// as if nothing had been cut.
+function withRecoveredContext(summary, userContent) {
+  return `Contexto recuperado de una conversación anterior (resumen automatico por limite de contexto):\n\n${summary}\n\n---\n\nContinuá la conversación desde ese punto. Este es el nuevo mensaje del usuario:\n\n${userContent}`;
+}
+
 // How long ago did a HUMAN last touch the page (typing, clicking, scrolling)?
 // The broker only knows about its own jobs, so without this the idle timer would
 // close the window while the user was typing in it. Returns Infinity when the
@@ -288,7 +391,10 @@ async function createWorkerTab(url) {
   await cdpCall(ws, ++cdpSeq, "Page.enable");
   await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
   try { await cdpCall(ws, ++cdpSeq, "Page.addScriptToEvaluateOnNewDocument", { source: STEALTH }); } catch {}
-  return { id: workers.length, ws, pageId: t.id, url: t.url, queue: [], busy: false, turns: 0 };
+  return { id: workers.length, ws, pageId: t.id, url: t.url, queue: [], busy: false, turns: 0,
+           // A resumed thread already carries history this broker never saw. Seed it
+           // so the first measured percentage is not a lie of omission.
+           ctxChars: url === lastThreadUrl ? CONTEXT_SEED_CHARS : 0 };
 }
 
 // Close every page target that is NOT one of our workers (Chrome's startup tab).
@@ -998,7 +1104,22 @@ async function pump(worker) {
       await resetThread(worker);
       worker.turns = 0;
     }
-    j.content = await askMeta(worker, j._input, j, j.mode || MODE_DEFAULT);
+    // Context rotation at the soft threshold. Runs BEFORE the job, so the answer
+    // comes from a fresh thread seeded with the summary instead of a thread that
+    // Meta is about to start truncating.
+    const usage = await contextUsage(worker, j._input);
+    worker.context = usage;
+    let content = j._input;
+    if (usage.pct >= CONTEXT_SOFT_PCT) {
+      const summary = await rotateThread(worker, usage.pct);
+      if (summary) {
+        content = withRecoveredContext(summary, j._input);
+        worker.ctxChars = 0; // fresh thread: the summary is the new baseline
+      }
+    }
+    j.content = await askMeta(worker, content, j, j.mode || MODE_DEFAULT);
+    // Everything this worker has carried is context the next turn inherits.
+    worker.ctxChars = (worker.ctxChars || 0) + String(content).length + String(j.content || "").length;
     worker.turns = (worker.turns || 0) + 1;
     j.status = "done";
     if (j.copy_at) {
@@ -1046,6 +1167,18 @@ async function route(req, res) {
       concurrency: workers.length,
       pool: { min: MIN_WORKERS, max: MAX_WORKERS, size: workers.length,
               queued: workers.reduce((n, w) => n + w.queue.length, 0) },
+      // ESTIMATED, not measured: Meta's UI exposes no token counter. The page cannot
+    // be used: the thread is virtualized, so `main` reads ~250 chars on a long
+    // thread while `body` is ~190k chars of React payload. This counts what this
+    // broker sent and received instead.
+    context: { soft_pct: CONTEXT_SOFT_PCT, budget_chars: CONTEXT_BUDGET_CHARS,
+               seed_chars: CONTEXT_SEED_CHARS,
+               per_worker: workers.map((w) => ({
+                 id: w.id,
+                 chars: w.ctxChars || 0,
+                 pct: Math.round(((w.ctxChars || 0) / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100),
+                 rotates_at: Math.round(((w.ctxChars || 0) / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100) >= CONTEXT_SOFT_PCT,
+               })) },
       async_semantics: workers.length > 1 ? "parallel-across-tabs" : "serialized-single-tab",
       mode_default: MODE_DEFAULT,
       cooldown_until: cooldownUntil > Date.now() ? new Date(cooldownUntil).toISOString() : null,
