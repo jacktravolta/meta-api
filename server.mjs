@@ -36,7 +36,8 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // HARD GUARD: this file needs the GLOBAL WebSocket, which only exists in Node >= 21.
 // The distro node (/usr/bin/node) is 18.x, so anything started OUTSIDE an
@@ -114,6 +115,112 @@ const CONTEXT_BUDGET_CHARS = Number(process.env.META_CONTEXT_BUDGET_CHARS || 240
 const CONTEXT_SOFT_PCT = Number(process.env.META_CONTEXT_SOFT_PCT || 70);
 // Starting estimate for a thread we resume but never saw being built.
 const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 8000);
+// ---- Image attachments ------------------------------------------------------
+// OpenAI-style multimodal content: content is an ARRAY of parts, not a string.
+// Stringifying it yields "[object Object],[object Object]", which is what Meta
+// used to receive when a screenshot was pasted into the chat.
+const IMAGES_DIR = process.env.META_IMAGES_DIR || "/tmp/opencode/meta-images";
+const MAX_IMAGE_BYTES = Number(process.env.META_MAX_IMAGE_BYTES || 20 * 1024 * 1024);
+
+function parseUserContent(raw) {
+  if (typeof raw === "string") return { text: raw.trim(), images: [] };
+  if (!Array.isArray(raw)) return { text: String(raw ?? "").trim(), images: [] };
+  let text = "";
+  const images = [];
+  for (const part of raw) {
+    if (part == null) continue;
+    if (typeof part === "string") { text += part; continue; }
+    const type = String(part.type || "");
+    if (type === "text" || type === "input_text") { text += part.text || ""; continue; }
+    if (type === "image_url" || type === "input_image" || type === "image" || type === "image_file") {
+      const url = typeof part.image_url === "string" ? part.image_url
+        : part.image_url?.url || part.image || part.url || part.file_url;
+      if (url) images.push(String(url));
+      continue;
+    }
+    if (part.text) text += part.text;   // unknown part: keep any text it carries
+  }
+  return { text: text.trim(), images };
+}
+
+// Turn any supported image reference into a real file on disk, because CDP's
+// DOM.setFileInputFiles needs a path.
+async function saveImageToFile(url, idx) {
+  let buf, ext = ".png";
+  const dataUrl = /^data:image\/([a-zA-Z0-9.+-]+);base64,([\s\S]*)$/.exec(url);
+  if (dataUrl) {
+    ext = "." + (dataUrl[1] === "jpeg" ? "jpg" : dataUrl[1].replace("+xml", ""));
+    buf = Buffer.from(dataUrl[2], "base64");
+  } else if (/^https?:\/\//i.test(url)) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`descarga de imagen HTTP ${r.status}`);
+    buf = Buffer.from(await r.arrayBuffer());
+    const ct = String(r.headers.get("content-type") || "").split("/")[1] || "";
+    if (ct) ext = "." + ct.replace("+xml", "").split(";")[0];
+  } else if (/^file:\/\//i.test(url)) {
+    buf = readFileSync(fileURLToPath(url));
+    ext = "." + (url.split(".").pop() || "png").split(/[?#]/)[0];
+  } else {
+    throw new Error("formato de imagen no soportado (data:, http(s): o file://)");
+  }
+  if (!buf || !buf.length) throw new Error("imagen vacia");
+  if (buf.length > MAX_IMAGE_BYTES) throw new Error(`imagen de ${Math.round(buf.length / 1048576)}MB supera el maximo`);
+  mkdirSync(IMAGES_DIR, { recursive: true });
+  const path = `${IMAGES_DIR}/${Date.now()}-${idx}${ext}`;
+  writeFileSync(path, buf);
+  return path;
+}
+
+// Hand the files to Meta's real <input type="file"> and wait until the previews
+// render. Sending the text before the upload lands makes Meta dispatch the prompt
+// with the image missing, so this wait is load-bearing, not cosmetic.
+async function attachImages(ws, imageUrls) {
+  if (!imageUrls || !imageUrls.length) return { ok: true, attached: 0 };
+  const files = [];
+  for (let i = 0; i < imageUrls.length; i++) {
+    try { files.push(await saveImageToFile(imageUrls[i], i)); }
+    catch (e) { log(`imagen ${i + 1} descartada:`, String(e.message || e)); }
+  }
+  if (!files.length) return { ok: false, attached: 0, why: "ninguna imagen se pudo preparar" };
+
+  try {
+    // DOM.enable is required: Page.enable does not turn the DOM domain on, and
+    // DOM.getDocument without it errors instead of returning a tree.
+    await cdpCall(ws, ++cdpSeq, "DOM.enable").catch(() => {});
+    // cdpCall resolves with m.result (not the whole CDP message), so the shapes
+    // here are {root:{nodeId}} and {nodeId}.
+    const doc = await cdpCall(ws, ++cdpSeq, "DOM.getDocument", { depth: -1 });
+    const rootId = doc?.root?.nodeId;
+    if (!rootId) throw new Error("DOM.getDocument no devolvio root");
+    const q = await cdpCall(ws, ++cdpSeq, "DOM.querySelector", { nodeId: rootId, selector: 'input[type="file"]' });
+    const inputNodeId = q?.nodeId;
+    if (!inputNodeId) throw new Error("Meta no expone input[type=file] en esta pagina");
+    await cdpCall(ws, ++cdpSeq, "DOM.setFileInputFiles", { files, nodeId: inputNodeId });
+    log(`imagenes adjuntas: ${files.length} archivo(s) -> input[type=file]`);
+  } catch (e) {
+    for (const f of files) { try { unlinkSync(f); } catch {} }
+    return { ok: false, attached: 0, why: String(e.message || e) };
+  }
+
+  // Wait for the preview chips. Blob/data images in the composer area are the
+  // signal that Meta accepted the upload.
+  const before = await evaluate(ws, `document.querySelectorAll('img[src^="blob:"], img[src^="data:image"]').length`).catch(() => 0);
+  for (let i = 0; i < 20; i++) {
+    await sleep(700);
+    const now = await evaluate(ws, `document.querySelectorAll('img[src^="blob:"], img[src^="data:image"]').length`).catch(() => 0);
+    if (now > before) {
+      log(`previews listos: ${now - before} imagen(es) visibles tras ~${((i + 1) * 0.7).toFixed(1)}s`);
+      return { ok: true, attached: files.length };
+    }
+  }
+  log("aviso: las previews no aparecieron a tiempo; mando igual");
+  return { ok: false, attached: files.length, why: "sin previews visibles a tiempo" };
+}
+
+function cleanupImages(files) {
+  for (const f of files || []) { try { unlinkSync(f); } catch {} }
+}
+
 const TRANSCRIPTS_DIR = process.env.META_TRANSCRIPTS_DIR || "/home/test/test/transcriptos";
 
 let chromeProc = null;
@@ -921,7 +1028,7 @@ async function typeLike(ws, content, mode = "normal") {
   await typeReal(ws, content);
 }
 
-async function askMeta(worker, content, progress = null, mode = "normal") {
+async function askMeta(worker, content, progress = null, mode = "normal", images = []) {
   const ws = worker.ws;
   // With more than one worker only ONE window can be foreground at a time, and a
   // background window measures 0x0 — the composer check would fail on a worker that
@@ -1027,6 +1134,17 @@ async function askMeta(worker, content, progress = null, mode = "normal") {
   const stopGenerating = async () => await evaluate(ws, `(() => !!Array.from(document.querySelectorAll('button')).find(x => /stop|detener|parar/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||''))))()`).catch(() => false);
 
   log(`entrada de prompt: modo=${mode} anchor=${anchorKey.length}chars`);
+  // Images FIRST, then the text. Meta dispatches the prompt as soon as the send
+  // control is live, so writing text into an empty composer and attaching a
+  // moment later is how you end up with the image silently dropped.
+  if (images && images.length) {
+    const att = await attachImages(ws, images);
+    if (!att.ok) {
+      log(`aviso: adjunto de imagenes fallo o incompleto (${att.why || "?"}); mando solo el texto`);
+    } else {
+      log(`adjunto listo: ${att.attached} imagen(es)`);
+    }
+  }
   await typeLike(ws, content, mode);
 
   // send: ALWAYS the send button when found (proven path); Enter as fallback.
@@ -1205,9 +1323,12 @@ function dispatchJob(job) {
   return dispatchChain;
 }
 
-function submit(content, copy_at = null, mode = MODE_DEFAULT) {
+function submit(content, copy_at = null, mode = MODE_DEFAULT, images = []) {
   const jobId = "job-" + randomUUID();
-  jobs.set(jobId, { job_id: jobId, status: "queued", _input: content, content: "", copy_at, mode, created: new Date().toISOString() });
+  jobs.set(jobId, {
+    job_id: jobId, status: "queued", _input: content, content: "",
+    copy_at, mode, images, created: new Date().toISOString(),
+  });
   persistPending(); // mirror to disk BEFORE dispatch: if we die now, the job survives
   setTimeout(() => dispatchJob(jobs.get(jobId)), 0);
   return jobId;
@@ -1229,7 +1350,7 @@ function persistPending() {
     const pending = [...jobs.values()]
       .filter((j) => j.status === "queued" || j.status === "running")
       .slice(0, MAX_PERSISTED)
-      .map((j) => ({ job_id: j.job_id, input: j._input, mode: j.mode, copy_at: j.copy_at, created: j.created }));
+      .map((j) => ({ job_id: j.job_id, input: j._input, mode: j.mode, copy_at: j.copy_at, images: j.images || [], created: j.created }));
     writeFileSync(JOBS_FILE, JSON.stringify(pending, null, 2));
   } catch (e) { log("aviso: no pude persistir jobs:", String(e.message || e)); }
 }
@@ -1247,7 +1368,7 @@ function loadPending() {
     if (!p.job_id || !p.input) continue;
     jobs.set(p.job_id, {
       job_id: p.job_id, status: "queued", _input: p.input, content: "",
-      copy_at: p.copy_at ?? null, mode: p.mode || MODE_DEFAULT,
+      copy_at: p.copy_at ?? null, mode: p.mode || MODE_DEFAULT, images: p.images || [],
       created: p.created, rescued: 1, recovered: true,
     });
     recovered.push(p.job_id);
@@ -1321,7 +1442,7 @@ async function pump(worker) {
         worker.turns = 0;
       }
     }
-    j.content = await askMeta(worker, content, j, j.mode || MODE_DEFAULT);
+    j.content = await askMeta(worker, content, j, j.mode || MODE_DEFAULT, j.images || []);
     // Everything this worker has carried is context the next turn inherits.
     worker.ctxChars = (worker.ctxChars || 0) + String(content).length + String(j.content || "").length;
     worker.turns = (worker.turns || 0) + 1;
@@ -1432,9 +1553,20 @@ async function route(req, res) {
     let payload;
     try { payload = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "invalid JSON" } }); }
     const msgs = Array.isArray(payload.messages) ? payload.messages : [];
-    const lastUser = [...msgs].reverse().find((m) => m && m.role === "user" && String(m.content ?? "").trim());
-    if (!lastUser) return json(400, { error: { message: "messages[].role user required" } });
-    const content = String(lastUser.content).trim();
+    // content can be a plain string OR an array of multimodal parts. The old
+    // String(content) turned a pasted screenshot into "[object Object]".
+    const rawUser = [...msgs].reverse().find((m) => {
+      if (!m || m.role !== "user") return false;
+      const { text, images } = parseUserContent(m.content);
+      return text || images.length;
+    });
+    if (!rawUser) return json(400, { error: { message: "messages[].role user required" } });
+    const parsed = parseUserContent(rawUser.content);
+    const content = parsed.text;
+    const images = parsed.images;
+    if (!content && !images.length) {
+      return json(400, { error: { message: "el mensaje del usuario esta vacio (ni texto ni imagenes)" } });
+    }
     const mode = resolveMode(payload.mode);
 
     clearIdleTimer();
@@ -1453,7 +1585,7 @@ async function route(req, res) {
       // so the client failed with "stream ended without finish_reason". Emit real
       // `chat.completion.chunk` objects: roles first, content deltas, then
       // `delta: {}` + `finish_reason: "stop"`, then the `[DONE]` sentinel.
-      const jobId = submit(content, Number(payload.copy_at) || null, mode);
+      const jobId = submit(content, Number(payload.copy_at) || null, mode, images);
       const model = payload.model || "meta-ai";
       const chunkId = "chatcmpl-" + randomUUID();
       const created = Math.floor(Date.now() / 1000);
@@ -1510,12 +1642,12 @@ async function route(req, res) {
     }
 
     if (url.pathname.endsWith("/async")) {
-      const jobId = submit(content, Number(payload.copy_at) || null, mode);
+      const jobId = submit(content, Number(payload.copy_at) || null, mode, images);
       return json(202, { job_id: jobId, status: "queued", poll: `/v1/jobs/${jobId}` });
     }
 
     // sync OpenAI style: wait for the job to finish
-    const jobId = submit(content, Number(payload.copy_at) || null, mode);
+    const jobId = submit(content, Number(payload.copy_at) || null, mode, images);
     for (let i = 0; i < 90; i++) {
       await sleep(2000);
       const j = jobs.get(jobId);
