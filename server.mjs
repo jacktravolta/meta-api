@@ -27,7 +27,21 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+
+// HARD GUARD: this file needs the GLOBAL WebSocket, which only exists in Node >= 21.
+// The distro node (/usr/bin/node) is 18.x, so anything started OUTSIDE an
+// interactive shell (systemd, cron @reboot, a .desktop launcher) silently ran on
+// Node 18 and died later with "WebSocket is not defined" — hours after the cause.
+// Fail at boot, loudly, instead.
+const [NODE_MAJOR] = process.versions.node.split(".").map(Number);
+if (NODE_MAJOR < 22) {
+  console.error(
+    `[meta-api] ABORTANDO: se requiere Node >= 22 (WebSocket global) y este binario es ${process.version} (${process.execPath}).\n` +
+    `[meta-api] Usa el Node de nvm: /home/test/.nvm/versions/node/v22.23.3/bin/node`
+  );
+  process.exit(1);
+}
 
 const PORT = Number(process.env.META_API_PORT || 8055);
 const HOST = process.env.META_API_HOST || "127.0.0.1";
@@ -85,7 +99,29 @@ const jobs = new Map();    // job_id -> {status,content,error,url,created}
 let cdpSeq = 0;
 let idleTimer = null;    // pending auto-close after inactivity
 let idleDeadline = 0;    // epoch ms when that auto-close fires (for /health)
-let lastThreadUrl = START_URL; // last conversation to reopen (same session)
+// Session memory must survive a service restart or a reboot, not just the browser
+// going idle: lastThreadUrl used to be a module variable, so every restart dropped
+// the conversation and the next request reopened the bare home screen.
+const STATE_FILE = process.env.META_STATE_FILE ||
+  "/home/test/test/meta-api/state.json";
+const isThreadUrl = (u) => typeof u === "string" &&
+  /^https:\/\/(www\.)?meta\.ai\/prompt\/[0-9a-f-]{8,}/i.test(u);
+
+function loadThreadUrl() {
+  try {
+    const raw = readFileSync(STATE_FILE, "utf8");
+    const url = JSON.parse(raw)?.lastThreadUrl;
+    if (isThreadUrl(url)) return url;
+  } catch { /* first run, or unreadable: start from home */ }
+  return null;
+}
+function saveThreadUrl(url) {
+  try { writeFileSync(STATE_FILE, JSON.stringify({ lastThreadUrl: url, savedAt: new Date().toISOString() }, null, 2) + "\n"); }
+  catch (e) { log("aviso: no pude guardar la sesion:", String(e.message || e)); }
+}
+
+const RESUMED_URL = loadThreadUrl();
+let lastThreadUrl = RESUMED_URL || START_URL; // last conversation to reopen (same session)
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -148,7 +184,12 @@ async function rememberThreadUrl() {
   if (!w || !w.ws) return;
   try {
     const href = await evaluate(w.ws, "location.href");
-    if (href && /meta\.ai/.test(href)) lastThreadUrl = href;
+    // Persist only REAL thread URLs; the bare home screen is not worth storing.
+    if (isThreadUrl(href)) {
+      if (href !== lastThreadUrl) { lastThreadUrl = href; saveThreadUrl(href); log("sesion guardada:", href.slice(0, 80)); }
+    } else if (href && /meta\.ai/.test(href)) {
+      lastThreadUrl = href;
+    }
   } catch { /* best-effort: keep the previous URL */ }
 }
 // Arm the auto-close. Any real work clears it (see pump/route handlers).
@@ -190,7 +231,12 @@ async function ensureChromeInner() {
     try { chromeProc.kill("SIGTERM"); } catch {}
     chromeProc = null; workers = [];
   }
-  killStrays(); // clear the singleton before any visible launch
+  // AWAIT IT. killStrays spawns `pkill -f -- --user-data-dir=<PROFILE>`; called
+  // without await it runs CONCURRENTLY with the spawn below, so pkill can reach
+  // /proc after Chrome already appeared and SIGTERM the instance we just created.
+  // Chrome then never opens the debug port and every request dies 21s later with
+  // a bare "fetch failed". Intermittent by nature: it depends on who wins the race.
+  await killStrays();
   if (chromeProc) { try { chromeProc.kill("SIGTERM"); } catch {} chromeProc = null; workers = []; }
   log(`launching Chrome (${VISIBLE ? "VISIBLE on " + (process.env.DISPLAY || "no DISPLAY") : "headless"}) with ${WORKERS} worker tabs…`);
   const args = [
@@ -200,9 +246,32 @@ async function ensureChromeInner() {
     "--disable-component-update", "--disable-background-networking",
     "--disable-gpu", "--no-sandbox", "--disable-sync",
     "--disable-blink-features=AutomationControlled",
+    // Minimal chrome: no restore/crash bubbles, no infobar, no "choose your
+    // search engine" screen, no background apps. Without these Chrome opens its
+    // default New Tab Page (Qwant on this machine) plus a crash-restore prompt.
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--disable-infobars",
+    "--disable-search-engine-choice-screen",
+    "--no-service-autorun",
+    "--disable-features=Translate,MediaRouter,OptimizationHints",
+    // Launch into a blank page, NOT the NTP, so no search tab is ever created.
+    "about:blank",
   ];
   if (!VISIBLE) args.unshift("--headless=new");
-  chromeProc = spawn(CHROME, args, { stdio: "ignore" });
+  // Do NOT use stdio:"ignore" for stderr: a failed launch used to log nothing at
+  // all, which turned every browser problem into guesswork.
+  chromeProc = spawn(CHROME, args, { stdio: ["ignore", "ignore", "pipe"] });
+  chromeProc.stderr.on("data", (b) => {
+    for (const line of b.toString().split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      if (/DevTools listening|TensorFlow|XNNPACK/i.test(s)) continue;      // normal boot noise
+      if (/crashpad.*\.lock: File exists/i.test(s)) continue;              // benign: stale crashpad lock
+      log("chrome:", s);
+    }
+  });
+  chromeProc.on("exit", (code, signal) => log(`chrome exit code=${code} signal=${signal}`));
 
   // Bonus: hide the automation fingerprint on every new document.
   const STEALTH = `(() => {
@@ -216,9 +285,20 @@ async function ensureChromeInner() {
 
   // discover browser page or create tabs per worker
   let jsonUrl = `http://127.0.0.1:${CDP_PORT}/json/list`;
+  let cdpUp = false;
   for (let i = 0; i < 30; i++) {
     await sleep(700);
-    try { const r = await fetch(jsonUrl); if (r.ok) break; } catch { /* retry */ }
+    try { const r = await fetch(jsonUrl); if (r.ok) { cdpUp = true; break; } } catch { /* retry */ }
+  }
+  // Fail loudly and specifically. Falling through to tab creation just converts a
+  // dead browser into an opaque "fetch failed" 21 seconds later.
+  if (!cdpUp) {
+    try { chromeProc.kill("SIGTERM"); } catch {}
+    chromeProc = null; workers = [];
+    throw new Error(
+      `Chrome no abrio CDP en ${CDP_PORT} tras 21s. Perfil: ${PROFILE}. ` +
+      `Revisa las lineas "chrome:" de este log para la causa real.`
+    );
   }
   for (let i = 0; i < WORKERS; i++) {
     let t;
@@ -232,16 +312,43 @@ async function ensureChromeInner() {
     const ws = new WebSocket(t.webSocketDebuggerUrl);
     await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("ws error worker " + i)); });
     await cdpCall(ws, ++cdpSeq, "Page.enable");
+    // CRITICAL: tabs created via PUT /json/new are BACKGROUND tabs. Chrome does not
+    // compose them, so their viewport stays 0x0, every getBoundingClientRect() returns
+    // 0 and the visible-composer check rejects the real composer forever. Observed:
+    // 2 of 3 workers never found a composer while the accidentally-activated one did
+    // in 1.5s. Bringing the tab to front is what gives it a real viewport.
+    await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
     try { await cdpCall(ws, ++cdpSeq, "Page.addScriptToEvaluateOnNewDocument", { source: STEALTH }); } catch {}
     workers.push({ id: i, ws, pageId: t.id, url: t.url, queue: [], busy: false });
   }
-  // wait until every tab has a composer
-  for (const w of workers) {
-    for (let i = 0; i < 12; i++) {
-      await sleep(1500);
-      const has = await evaluate(w.ws, `!!(document.querySelector('textarea') || document.querySelector('[contenteditable="true"]'))`).catch(() => false);
-      if (has) break;
+  // Close every page target that is NOT one of our workers. Chrome's startup tab
+  // (about:blank / default NTP) survives the launch and shows up as an extra
+  // window; in visible mode the user then sees two windows and thinks the broker
+  // opened two browsers.
+  try {
+    const list = await (await fetch(jsonUrl)).json();
+    const keep = new Set(workers.map((w) => w.pageId));
+    let closed = 0;
+    for (const target of list) {
+      if (target.type !== "page" || keep.has(target.id)) continue;
+      await fetch(`http://127.0.0.1:${CDP_PORT}/json/close/${target.id}`).catch(() => {});
+      closed++;
     }
+    if (closed) log(`pestanas sobrantes cerradas: ${closed} (solo queda la del worker)`);
+  } catch { /* best-effort cleanup */ }
+  // wait until every tab has a VISIBLE composer. A bare existence check used to
+  // pass on a hidden 0x0 textarea, so typing started before the real composer
+  // existed and every request died at "button disabled". Requires bringToFront
+  // first, otherwise a background tab measures 0x0 forever.
+  for (const w of workers) {
+    let seen = false;
+    for (let i = 0; i < 12; i++) {
+      await cdpCall(w.ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
+      await sleep(1500);
+      const has = await evaluate(w.ws, `!!(${PICK_COMPOSER_JS})`).catch(() => false);
+      if (has) { seen = true; break; }
+    }
+    if (!seen) log(`worker ${w.id}: sin composer visible tras 18s (pestaña ${(w.url || "").slice(0, 70)})`);
   }
   log(`broker ready: ${workers.length} workers`);
 }
@@ -250,10 +357,20 @@ async function ensureChromeInner() {
 // screen it is a different field). Every step that touches the input — focus, verify,
 // send, cleared-check — MUST resolve the same element, or typing and sending disagree
 // about which box holds the prompt, and the request dies with why:'empty'.
+// MUST return null instead of cands[0]: a 0x0 hidden textarea is NOT the composer,
+// and returning it made every later step fail silently (CDP clicked at (0,0),
+// Input.insertText was swallowed, and the send button stayed disabled).
 const PICK_COMPOSER_JS = `(() => {
   const cands = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [contenteditable="plaintext-only"]'));
-  const visible = (e) => { const r = e.getBoundingClientRect(); return r.width > 20 && r.height > 8; };
-  return cands.find((e) => visible(e) && !e.disabled && !e.readOnly) || cands.find(visible) || cands[0] || null;
+  const visible = (e) => {
+    const r = e.getBoundingClientRect();
+    if (r.width <= 20 || r.height <= 8) return false;
+    if (e.disabled || e.readOnly) return false;
+    if (e.closest('[aria-hidden="true"]')) return false;
+    const st = getComputedStyle(e);
+    return st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity) > 0.05;
+  };
+  return cands.find(visible) || null;
 })()`;
 
 function keyCodeOf(ch) {
@@ -265,22 +382,52 @@ function keyCodeOf(ch) {
 // One cleared-composer routine for both modes. Non-modifier and verified: the
 // old Ctrl+A path leaked a literal control byte and ate the head of the prompt.
 async function clearComposer(ws) {
+  // Use the SAME picker as the paste step. This function used to carry its own
+  // copy of the selector (with the old "|| cands[0]" fallback), so it could clear a
+  // DIFFERENT element than the one we then type into.
+  const STRIP_JS = `s => String(s||'').replace(/[\\s\\u200B-\\u200D\\u2060\\uFEFF\\u00A0]+/g,'')`;
   const clearRes = await evaluate(ws, `(() => {
-    const cands = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [contenteditable="plaintext-only"]'));
-    const visible = (e) => { const r = e.getBoundingClientRect(); return r.width > 20 && r.height > 8; };
-    const el = cands.find((e) => visible(e) && !e.disabled && !e.readOnly) || cands.find(visible) || cands[0];
-    if (!el) return { ok:false, why:'sin composer' };
+    const strip = ${STRIP_JS};
+    const el = ${PICK_COMPOSER_JS};
+    if (!el) return { ok:false, why:'sin composer visible' };
     const read = () => (el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || ''));
-    const before = read().length;
+    // Strip zero-width chars: Meta/Lexical leaves phantom U+200B nodes, so a fresh
+    // composer reads as 1 char and every "did it clear?" check failed for nothing.
+    const before = strip(read()).length;
     el.focus();
-    if (el.tagName === 'TEXTAREA') el.value = ''; else el.textContent = '';
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    return { ok: read().length === 0, before, after: read().length };
+    if (el.tagName === 'TEXTAREA') {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(el, '');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    return { ok:true, before, tag: el.tagName, needsKeys: el.tagName !== 'TEXTAREA' };
   })()`).catch((e) => ({ ok:false, why:String(e) }));
-  if (!clearRes || !clearRes.ok) log("aviso: no pude limpiar el composer antes de tipear:", JSON.stringify(clearRes));
-  else if (clearRes.before) log(`composer limpiado (${clearRes.before} chars previos descartados)`);
+
+  // A Lexical editor keeps its own model: assigning textContent leaves the phantom
+  // nodes behind. Clear it with REAL key events (Ctrl+A, Backspace), which is the
+  // only thing Lexical honours.
+  if (clearRes && clearRes.needsKeys) {
+    for (const k of [
+      { type: "keyDown", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65 },
+      { type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65 },
+      { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 },
+      { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 },
+    ]) await cdpCall(ws, ++cdpSeq, "Input.dispatchKeyEvent", k).catch(() => {});
+  }
+
+  const after = await evaluate(ws, `(() => {
+    const strip = ${STRIP_JS};
+    const el = ${PICK_COMPOSER_JS};
+    if (!el) return 0;
+    return strip(el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '')).length;
+  })()`).catch(() => -1);
+
+  const res = { ...clearRes, after };
+  res.ok = res.ok && after === 0;
+  if (!res.ok) log("aviso: no pude limpiar el composer antes de tipear:", JSON.stringify(res));
+  else if (res.before) log(`composer limpiado (${res.before} chars previos descartados)`);
   await sleep(120);
-  return clearRes;
+  return res;
 }
 
 async function typeReal(ws, content) {
@@ -363,8 +510,26 @@ async function pasteReal(ws, content) {
   // Speed mode: ONE native paste instead of thousands of keystrokes, then a
   // human-length pause before the send click. Verification is NOT skipped: a
   // paste that lands truncated must never be sent.
-  const focused = await evaluate(ws, `(() => { const el = ${PICK_COMPOSER_JS}; if (!el) return false; el.focus(); return true; })()`).catch(() => false);
-  if (!focused) log("aviso: no se encontro composer visible para enfocar");
+  // Focus with a REAL CDP mouse click, NOT el.focus(). meta.ai's composer is a
+  // rich editor that only accepts Input.insertText when the element is genuinely
+  // focused at the browser level; a JS .focus() leaves insertText aimed at the
+  // document, which is why the paste used to read back 0 chars.
+  const rect = await evaluate(ws, `(() => {
+    const el = ${PICK_COMPOSER_JS};
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { tag: el.tagName, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
+  })()`).catch(() => null);
+  if (!rect) { log("aviso: no se encontro composer visible para enfocar"); return; }
+  // Re-assert foreground: a tab can fall back to the background (another worker
+  // activating itself) between job start and now, which zeroes its viewport again.
+  await cdpCall(ws, ++cdpSeq, "Page.bringToFront").catch(() => {});
+  log(`composer: ${rect.tag} ${Math.round(rect.w)}x${Math.round(rect.h)} en (${Math.round(rect.x)},${Math.round(rect.y)})`);
+  for (const type of ["mousePressed", "mouseReleased"]) {
+    await cdpCall(ws, ++cdpSeq, "Input.dispatchMouseEvent", {
+      type, x: rect.x, y: rect.y, button: "left", buttons: type === "mousePressed" ? 1 : 0, clickCount: 1,
+    }).catch(() => {});
+  }
   await clearComposer(ws);
 
   const t0 = Date.now();
@@ -378,7 +543,7 @@ async function pasteReal(ws, content) {
   // or as separate blocks, and textContent then carries no separators at all.
   // Comparing compacted text (all whitespace removed) verifies the payload
   // survived without depending on how the editor represents line breaks.
-  const compact = (s) => String(s || "").replace(/\s+/g, "");
+  const compact = (s) => String(s || "").replace(/[\s-‍⁠﻿ ]+/g, "");
   const readText = async () => await evaluate(ws, `(() => {
     const el = ${PICK_COMPOSER_JS};
     if (!el) return "";
@@ -389,13 +554,25 @@ async function pasteReal(ws, content) {
   if (compact(got) !== compact(content)) {
     // Fallback: set the value directly and fire the input event React listens to.
     log(`aviso: paste mismatch (compact ${compact(got).length}/${compact(content).length}), intento set directo`);
+    // CRITICAL: React installs its own `value` setter on the DOM node, so a plain
+    // `el.value = x` updates the DOM but NOT React state: onChange never fires and
+    // the send button stays disabled forever. Bypass React's instance-level setter
+    // and use the NATIVE prototype setter, then fire the input event it listens to.
+    // Symptom this fixes: text reads back fine but send reports "button disabled".
     await evaluate(ws, `(() => {
       const el = ${PICK_COMPOSER_JS};
       if (!el) return false;
       el.focus();
-      if (el.tagName === 'TEXTAREA') el.value = ${JSON.stringify(content)};
-      else el.textContent = ${JSON.stringify(content)};
+      const text = ${JSON.stringify(content)};
+      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        setter.call(el, text);
+      } else {
+        el.textContent = text;
+      }
       el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
     })()`).catch(() => false);
     got = await readText();
@@ -427,7 +604,7 @@ async function askMeta(worker, content, progress = null, mode = "normal") {
   // user-message row whose text contains the prompt, then read the assistant
   // message(s) that follow it. This is immune to virtualization, to old turns,
   // and to a repeated answer text (an older identical "ok" stays where it is).
-  const compact = (s) => String(s || "").replace(/\s+/g, "");
+  const compact = (s) => String(s || "").replace(/[\s-‍⁠﻿ ]+/g, "");
   const anchorKey = compact(content).slice(0, 80); // first 80 compacted chars: unique enough and survives UI truncation
   const readAnswerExpr = `(() => {
     const compact = (s) => String(s || "").replace(/\\s+/g, "");
@@ -532,23 +709,31 @@ async function askMeta(worker, content, progress = null, mode = "normal") {
     if (!el) return { sent:false, why:'no composer' };
     const text = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
     if (!text.trim()) return { sent:false, why:'empty', tag: el.tagName, chars: text.length };
-    const b = Array.from(document.querySelectorAll('button')).find(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
-    if (b) {
-      if (b.disabled) return { sent:false, why:'button disabled' };
-      b.click();
-      return { sent:true, via:'button' };
-    }
+    const buttons = Array.from(document.querySelectorAll('button'));
+    const named = buttons.filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
+    const b = named.find(x => !x.disabled) || null;
+    if (b) { b.click(); return { sent:true, via:'button', named: named.length }; }
+    // Do NOT bail on "button disabled": that match is usually the WRONG button
+    // (the prompt is filled, so the real send control is enabled but named
+    // differently). Fall back to Enter on the composer instead of failing.
     el.focus();
     el.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', code:'Enter', bubbles:true, cancelable:true }));
-    return { sent:true, via:'enter-fallback' };
+    return { sent:true, via:'enter-fallback', disabledNamed: named.length };
   })()`).catch((e) => ({ sent:false, why: String(e) }));
   log("sent:", JSON.stringify(human), "url:", (await evaluate(ws, "location.href").catch(()=>""))?.slice(0,70));
+  // Persist the thread as soon as it exists, not only when the idle timer fires.
+  // Otherwise a restart (or a crash) between the answer and the 2-minute close
+  // loses the conversation and the next request starts from the home screen.
+  await rememberThreadUrl();
   await sleep(2500);
 
   // Prove the submit landed: a cleared composer is the signal that the click sent.
   const cleared = await evaluate(ws, `(() => { const el = ${PICK_COMPOSER_JS}; if (!el) return true; return !(el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '')).trim(); })()`).catch(()=>false);
   if (!human.sent) throw new Error("envio fallido (" + (human.why || "?") + ")");
-  if (!cleared) log("aviso: composer no se vacio tras enviar (el envio pudo noaisescribir)");
+  if (!cleared) throw new Error(
+    `el envio no tomo efecto: el composer sigue lleno (via=${human.via}). ` +
+    `Meta no recibio el prompt; revisa login o dialogos abiertos.`
+  );
 
   let last = "";
   let stable = "";
@@ -598,7 +783,12 @@ async function askMeta(worker, content, progress = null, mode = "normal") {
     //     already a strong hint the turn is over without paying the old 20s.
     if (idle >= 1 && ((await countCopies()) || 0) > preCopies) { log("finalizado por copy-control"); break; }
     if (idle >= 1 && sawGenerating && !gen) { log("finalizado por fin de generacion (stop control ausente)"); break; }
-    const idleLimit = sawGenerating ? 3 : 6;
+    // Do NOT give up while Meta still reports "generating". The old limit was
+    // 3 polls (~2.7s) and Meta PAUSES while it interprets the prompt before it
+    // writes anything, so every longer answer came back truncated to its
+    // preamble ("Interpretando solicitud..."). The short limits only apply once
+    // generation has actually stopped.
+    const idleLimit = gen ? 24 : (sawGenerating ? 6 : 10);
     if (idle >= idleLimit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
     stable = now || "";
   }
@@ -886,4 +1076,8 @@ async function route(req, res) {
 process.on("SIGINT", () => { if (chromeProc) try { chromeProc.kill("SIGTERM"); } catch {} process.exit(0); });
 http.createServer(route).listen(PORT, HOST, () => {
   log(`meta-ai broker async on http://${HOST}:${PORT} (workers=${WORKERS}, mode=${VISIBLE ? "visible" : "hidden"}, fresh=${FRESH ? "yes" : "no"})`);
+  log(RESUMED_URL
+    ? `sesion reanudada desde disco: ${RESUMED_URL.slice(0, 80)}`
+    : `sin sesion guardada; arranco en ${START_URL}`);
+  log(`auto-cierre: ${IDLE_CLOSE_MS > 0 ? Math.round(IDLE_CLOSE_MS / 1000) + "s de inactividad" : "desactivado"}`);
 });
