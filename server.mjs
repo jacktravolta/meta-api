@@ -1123,7 +1123,7 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const compact = (s) => String(s || "").replace(/[\s-‍⁠﻿ ]+/g, "");
   const anchorKey = compact(content).slice(0, 80); // first 80 compacted chars: unique enough and survives UI truncation
   const readAnswerExpr = `(() => {
-    const compact = (s) => String(s || "").replace(/\\s+/g, "");
+    const compact = (s) => String(s || "").replace(/[\\s-‍⁠﻿ ]+/g, "");
     const key = ${JSON.stringify(anchorKey)};
     const BT = String.fromCharCode(96);
     // Meta renders the model's Markdown to HTML. Reading textContent then DROPPED
@@ -1331,10 +1331,18 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   let last = "";
   let stable = "";
   let idle = 0;
+  let lastWhy = "";
   // Declared BEFORE the poll loop: it is now consulted from the empty-read path
   // too, and a const used before its declaration is a TDZ ReferenceError.
   // 24 polls while Meta still says "generating" (~36s), fewer once it stops.
   const idleLimitFor = (gen, saw) => (gen ? 24 : (saw ? 6 : 10));
+  // Patience knobs (env-tunable, defaults keep old behavior). Essay-style
+  // prompts make Meta reason in silence BEFORE the first visible block; the
+  // fixed 24-poll window (~22s) cut live generations and surfaced as a
+  // phantom "rate limit" in the caller.
+  const GEN_EMPTY_POLLS = Math.max(24, Number(process.env.META_GEN_EMPTY_POLLS || 24));
+  const STOP_GONE_MIN_POLLS = Math.max(8, Number(process.env.META_STOP_GONE_MIN_POLLS || 8));
+  const MAX_POLLS = Math.max(260, Number(process.env.META_MAX_POLLS || 260));
   // Absolute cap on the whole answer wait. Every other exit is content based, so
   // a pathological case could still keep a job alive indefinitely and, with it,
   // the browser: activeJobs() would never reach 0 and the idle auto-close would
@@ -1350,7 +1358,7 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   // Poll cadence: fast enough that a short answer is detected and confirmed in a
   // few seconds. The old fixed 2500ms x 8-idle = 20s of dead waiting on EVERY turn.
   const POLL_MS = Math.max(400, Number(process.env.META_POLL_MS || 900));
-  for (let i = 0; i < 260; i++) {
+  for (let i = 0; i < MAX_POLLS; i++) {
     await sleep(POLL_MS);
     const res = await readAnswer();
     const ans = res && res.found ? (res.text || "") : "";
@@ -1358,12 +1366,12 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     // more than the old 120s budget); absent => blocked/dead, fail early.
     const gen = await stopGenerating();
     if (gen) sawGenerating = true;
-    if (i % 8 === 0) log("poll", i, "found:", !!(res && res.found), "n:", (res && res.n) || 0, "len:", ans.length, "generando:", gen, "idle:", idle);
+    if (i % 8 === 0) log("poll", i, "found:", !!(res && res.found), "why:", (res && res.why) || "-", "n:", (res && res.n) || 0, "len:", ans.length, "generando:", gen, "idle:", idle);
     if (!ans) {
       // Started but produced nothing and the stop control vanished => Meta gave up
       // (rate limit / silent block). Fail fast with a typed reason and cool down
       // instead of burning the whole budget on a dead request.
-      if (sawGenerating && i >= 8 && !gen) {
+      if (sawGenerating && i >= STOP_GONE_MIN_POLLS && !gen) {
         setCooldown();
         throw new Error("Meta detuvo la generacion sin emitir bloques (bloqueo o limite de tasa)");
       }
@@ -1373,12 +1381,13 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
       // and the idle auto-close was never armed. The browser stayed open with a
       // job that could never finish.
       idle++;
+      if (res && res.why) lastWhy = res.why;
       // Empty reads at the START of a turn are normal and long: Meta spends
       // 10-20s interpreting the prompt before any text appears. The first fix
       // here counted empty polls at the same rate as stalled ones (~7s) and
       // killed the turn before Meta began generating.
-      const emptyLimit = gen ? 24 : 45;
-      if (idle >= emptyLimit) { log(`finalizado por inactividad sin texto (${idle} polls vacios, ${Math.round(idle * 0.9)}s)`); break; }
+      const emptyLimit = gen ? GEN_EMPTY_POLLS : 45;
+      if (idle >= emptyLimit) { log(`finalizado por inactividad sin texto (${idle} polls vacios, ${Math.round(idle * 0.9)}s, ultimo why=${lastWhy || "?"})`); break; }
       continue;
     }
     // High-water mark: virtualization/streaming can re-render the message SHORTER
