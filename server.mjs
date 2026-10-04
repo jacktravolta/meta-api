@@ -1204,6 +1204,23 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   // caller failed with "el envio no tomo efecto". Enter also disturbed the editor
   // while an attachment chip was on screen. Typing already focuses and enables
   // the control, so the button click is the whole flow.
+  // Source of truth for "did the prompt actually land": OUR row sitting in the
+  // thread. Read the URL BEFORE the click — after a real dispatch Meta may already
+  // have navigated, and comparing the new URL against itself hides the move.
+  const urlBefore = await evaluate(ws, "location.href").catch(() => "");
+  // Count the thread rows that are OURS: a user row whose text contains our own
+  // opening characters. This is the ONLY verification that also works on a RESUMED
+  // thread, where the URL cannot move because it is already /prompt/<uuid>.
+  const humanRows = async () => await evaluate(ws, `(() => {
+    const key = ${JSON.stringify(anchorKey)};
+    const compact = (s) => (s||'').replace(/\\s+/g,' ').trim();
+    return Array.from(document.querySelectorAll('[class*="group/message-row"]'))
+      .filter(r => r.querySelector('[class*="user-message"]'))
+      .filter(r => compact(r.innerText).includes(key)).length;
+  })()`).catch(() => -1);
+  const preHuman = await humanRows();
+  log("pre-envio:", JSON.stringify({ url: (urlBefore || "").slice(0, 70), humanRows: preHuman }));
+
   let human = await evaluate(ws, `(() => {
     const el = ${PICK_COMPOSER_JS};
     if (!el) return { sent:false, why:'no composer' };
@@ -1229,23 +1246,24 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     human = { sent: true, via: "button-mouse", named: human.named, tag: human.tag, chars: human.chars };
   }
 
-  // Prove the submit landed.
-  //
-  // A cleared composer is the signal for a text-only prompt, but it is WRONG when
-  // an image is attached: the attachment chip is composer content, so the check
-  // always reported "still full", the job failed, and pump's finally recycled
-  // Chrome — which is exactly the "it attaches, then the window closes and it
-  // never finishes" symptom. With an image, the reliable signal is the thread
-  // URL moving to a NEW prompt: Meta navigates only after dispatching.
-  const urlBefore = await evaluate(ws, "location.href").catch(() => "");
+  // A cleared composer is NOT proof of dispatch. On a resumed thread the React
+  // editor can remount EMPTY while the click did nothing at all, so an empty
+  // composer used to report a silent send failure as a success: the job then burned
+  // 41s of polling a page that never changed. Composer-empty stays as a hint, not
+  // as confirmation; the thread row is what counts.
   log("sent:", JSON.stringify(human), "url:", (await evaluate(ws, "location.href").catch(()=>""))?.slice(0,70));
   // Persist the thread as soon as it exists, not only when the idle timer fires.
   // Otherwise a restart (or a crash) between the answer and the close loses the
   // conversation and the next request starts from the home screen.
   await rememberThreadUrl();
 
-  let cleared = false, urlMoved = false;
-  for (let i = 0; i < 8 && !cleared && !urlMoved; i++) {
+  let cleared = false, urlMoved = false, humanLanded = false;
+  // Only a STRONG signal may end this loop early. `cleared` must NOT be in the
+  // condition: it is the weak signal this whole fix is about, and letting it
+  // exit after the first poll meant the thread row was never re-read, so a
+  // genuine silent send failure still slipped through. A weak `cleared` is
+  // recorded for the log and nothing else.
+  for (let i = 0; i < 8 && !urlMoved && !humanLanded; i++) {
     await sleep(1200);
     const snap = await evaluate(ws, `(() => {
       const el = ${PICK_COMPOSER_JS};
@@ -1255,14 +1273,22 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     if (!snap) continue;
     cleared = snap.empty;
     urlMoved = !!urlBefore && !!snap.href && snap.href !== urlBefore;
+    if (!humanLanded) {
+      const hn = await humanRows();
+      if (hn >= 0 && preHuman >= 0 && hn > preHuman) humanLanded = true;
+    }
   }
-  const confirmed = cleared || urlMoved;
+  // Meta navigates only after dispatching, so a moved URL is trustworthy. Otherwise
+  // the only trustworthy signal is our own row appearing in the thread.
+  const confirmed = urlMoved || humanLanded;
+  log("confirmacion:", JSON.stringify({ cleared, urlMoved, humanLanded, preHuman }));
   if (!human.sent) throw new Error("envio fallido (" + (human.why || "?") + ")");
   if (!confirmed) throw new Error(
-    `el envio no tomo efecto: el composer sigue lleno (via=${human.via}) y la URL no cambio. ` +
-    `Meta no recibio el prompt; revisa login o dialogos abiertos.`
+    `el envio no tomo efecto: ${humanLanded ? "" : "nuestro mensaje no aparecio en el hilo, "}` +
+    `el composer ${cleared ? "se vacio pero no se despachio" : "sigue lleno"} y la URL no cambio ` +
+    `(via=${human.via}). Meta no recibio el prompt; revisa login o dialogos abiertos.`
   );
-  if (urlMoved && !cleared) log("envio confirmado por cambio de hilo (el chip sigue en el composer)");
+  if (urlMoved && !humanLanded) log("envio confirmado por cambio de hilo (nuestra fila todavia no renderizada)");
 
   let last = "";
   let stable = "";
