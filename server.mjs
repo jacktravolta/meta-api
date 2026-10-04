@@ -1227,20 +1227,40 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     human = { sent: true, via: "button-mouse", named: human.named, tag: human.tag, chars: human.chars };
   }
 
+  // Prove the submit landed.
+  //
+  // A cleared composer is the signal for a text-only prompt, but it is WRONG when
+  // an image is attached: the attachment chip is composer content, so the check
+  // always reported "still full", the job failed, and pump's finally recycled
+  // Chrome — which is exactly the "it attaches, then the window closes and it
+  // never finishes" symptom. With an image, the reliable signal is the thread
+  // URL moving to a NEW prompt: Meta navigates only after dispatching.
+  const urlBefore = await evaluate(ws, "location.href").catch(() => "");
   log("sent:", JSON.stringify(human), "url:", (await evaluate(ws, "location.href").catch(()=>""))?.slice(0,70));
   // Persist the thread as soon as it exists, not only when the idle timer fires.
-  // Otherwise a restart (or a crash) between the answer and the 2-minute close
-  // loses the conversation and the next request starts from the home screen.
+  // Otherwise a restart (or a crash) between the answer and the close loses the
+  // conversation and the next request starts from the home screen.
   await rememberThreadUrl();
-  await sleep(2500);
 
-  // Prove the submit landed: a cleared composer is the signal that the click sent.
-  const cleared = await evaluate(ws, `(() => { const el = ${PICK_COMPOSER_JS}; if (!el) return true; return !(el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '')).trim(); })()`).catch(()=>false);
+  let cleared = false, urlMoved = false;
+  for (let i = 0; i < 8 && !cleared && !urlMoved; i++) {
+    await sleep(1200);
+    const snap = await evaluate(ws, `(() => {
+      const el = ${PICK_COMPOSER_JS};
+      const text = !el ? '' : (el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || ''));
+      return { empty: !text.trim(), href: location.href };
+    })()`).catch(() => null);
+    if (!snap) continue;
+    cleared = snap.empty;
+    urlMoved = !!urlBefore && !!snap.href && snap.href !== urlBefore;
+  }
+  const confirmed = cleared || urlMoved;
   if (!human.sent) throw new Error("envio fallido (" + (human.why || "?") + ")");
-  if (!cleared) throw new Error(
-    `el envio no tomo efecto: el composer sigue lleno (via=${human.via}). ` +
+  if (!confirmed) throw new Error(
+    `el envio no tomo efecto: el composer sigue lleno (via=${human.via}) y la URL no cambio. ` +
     `Meta no recibio el prompt; revisa login o dialogos abiertos.`
   );
+  if (urlMoved && !cleared) log("envio confirmado por cambio de hilo (el chip sigue en el composer)");
 
   let last = "";
   let stable = "";
