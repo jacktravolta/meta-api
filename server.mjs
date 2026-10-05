@@ -1649,20 +1649,28 @@ async function pump(worker) {
     // conversation ALWAYS continues with its context: the turn counter is a
     // backstop for pathological message sizes, not a competing reset that dropped
     // the thread on the floor every N requests.
-    const usage = await contextUsage(worker, j._input);
-    worker.context = usage;
-    const byTurns = (worker.turns || 0) >= RESET_TURNS;
-    const byPct = usage.pct >= CONTEXT_SOFT_PCT;
+    //
+    // Agent jobs skip rotation entirely: the loop drives this worker's thread
+    // turn by turn, so the mission transcript IS the context. Rotating first
+    // spends a full Meta turn on a summary the loop never reads and deletes
+    // the thread the loop is still writing to. Chat jobs keep the exact
+    // current behavior.
     let content = j._input;
-    if (byPct || byTurns) {
-      const why = byPct && !byTurns ? `${usage.pct}% de contexto`
-        : byTurns && !byPct ? `${worker.turns} turnos en el hilo`
-        : `${usage.pct}% de contexto y ${worker.turns} turnos`;
-      const summary = await rotateThread(worker, usage.pct, why);
-      if (summary) {
-        content = withRecoveredContext(summary, j._input);
-        worker.ctxChars = 0; // fresh thread: the summary is the new baseline
-        worker.turns = 0;
+    if (!j.agent) {
+      const usage = await contextUsage(worker, j._input);
+      worker.context = usage;
+      const byTurns = (worker.turns || 0) >= RESET_TURNS;
+      const byPct = usage.pct >= CONTEXT_SOFT_PCT;
+      if (byPct || byTurns) {
+        const why = byPct && !byTurns ? `${usage.pct}% de contexto`
+          : byTurns && !byPct ? `${worker.turns} turnos en el hilo`
+          : `${usage.pct}% de contexto y ${worker.turns} turnos`;
+        const summary = await rotateThread(worker, usage.pct, why);
+        if (summary) {
+          content = withRecoveredContext(summary, j._input);
+          worker.ctxChars = 0; // fresh thread: the summary is the new baseline
+          worker.turns = 0;
+        }
       }
     }
     if (j.agent) {
