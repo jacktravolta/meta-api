@@ -1506,11 +1506,25 @@ function dispatchJob(job) {
 
 // Agent jobs are ordinary jobs that carry an `agent` flag, so they ride the same
 // pool, the same queue, the same recovery-on-disk path and the same idle timer.
+
+// Per-job wall-clock budget for the agent loop: a request field clamped to
+// [30s, 1h]. An absent or invalid value falls back to META_AGENT_BUDGET_MS
+// (default 900000). runAgentLoop enforces it between steps.
+const AGENT_BUDGET_MIN_MS = 30_000;
+const AGENT_BUDGET_MAX_MS = 3_600_000;
+function agentBudgetMs(raw) {
+  const n = Number(raw);
+  const base = Number.isFinite(n) && n > 0 ? n
+    : Number(process.env.META_AGENT_BUDGET_MS) || 900_000;
+  return Math.max(AGENT_BUDGET_MIN_MS, Math.min(AGENT_BUDGET_MAX_MS, Math.round(base)));
+}
+
 function submitAgent(task, opts = {}) {
   const jobId = "job-" + randomUUID();
   jobs.set(jobId, {
     job_id: jobId, status: "queued", _input: task, content: "",
     agent: true, maxSteps: opts.maxSteps || 8,
+    budgetMs: opts.budgetMs ?? null,
     allowWrite: !!opts.allowWrite, allowNetwork: !!opts.allowNetwork,
     workdir: opts.workdir || null, mode: MODE_DEFAULT,
     created: new Date().toISOString(),
@@ -1680,6 +1694,7 @@ async function pump(worker) {
         ask: (p) => askMeta(worker, p, j, j.mode || MODE_DEFAULT, []),
         task: j._input,
         maxSteps: Number(j.maxSteps) || 8,
+        budgetMs: Number(j.budgetMs) || undefined,   // absent -> loop default (env)
         sandbox: {
           workdir: j.workdir || undefined,
           allowWrite: !!j.allowWrite,
@@ -1838,6 +1853,7 @@ async function route(req, res) {
     }
     const jobId = submitAgent(task, {
       maxSteps: payload.maxSteps,
+      budgetMs: agentBudgetMs(payload.budgetMs),
       allowWrite: !!payload.allowWrite,
       allowNetwork: !!payload.allowNetwork,
       workdir: payload.workdir,

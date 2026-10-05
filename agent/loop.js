@@ -11,15 +11,23 @@
 import { runSandboxed } from "./sandbox.js";
 import { TOOL_PROTOCOL, parseToolCall, formatResult } from "./tools.js";
 
+// Wall-clock budget for the whole loop, checked between steps. The default
+// comes from the environment so a deployment can tune it without code
+// changes: 15 minutes covers real multi-step missions (Meta turns run
+// 20-90s), which the old hardcoded 180s killed after 2-4 steps.
+export function defaultBudgetMs() {
+  const n = Number(process.env.META_AGENT_BUDGET_MS);
+  return Number.isFinite(n) && n > 0 ? n : 900_000;
+}
+
 const DEFAULTS = {
   maxSteps: 8,
-  budgetMs: 180_000,
   sandbox: {},          // merged into every runSandboxed call
   onEvent: () => {},
 };
 
 export async function runAgentLoop({ ask, task, ...opts }) {
-  const o = { ...DEFAULTS, ...opts };
+  const o = { budgetMs: defaultBudgetMs(), ...DEFAULTS, ...opts };
   // The sandbox executor is injectable so the loop is testable without docker:
   // tests stub it to drive multi-step transcripts. Production callers never
   // pass one and always get the real runSandboxed.

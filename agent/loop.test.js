@@ -4,7 +4,7 @@
 // got, and the tool turns it already collected.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runAgentLoop } from "./loop.js";
+import { runAgentLoop, defaultBudgetMs } from "./loop.js";
 
 // Stands in for runSandboxed: no docker, instant, records what it ran.
 function stubExec(runs) {
@@ -60,4 +60,34 @@ test("a meta-error failure surfaces through onEvent", async () => {
     onEvent: (e) => events.push(e),
   });
   assert.ok(events.some((e) => e.type === "meta-error" && /hilo mudo/.test(e.error)));
+});
+
+test("the wall-clock budget resolves the loop with reason budget", async () => {
+  const runs = [];
+  const res = await runAgentLoop({
+    // Each ask outlives the budget, so step 2 must trip the between-steps check.
+    ask: async () => { await new Promise((r) => setTimeout(r, 30)); return "```sh\nls\n```"; },
+    task: "t",
+    budgetMs: 5,
+    maxSteps: 8,
+    exec: stubExec(runs),
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "budget");
+  assert.equal(res.steps, 1);
+  assert.deepEqual(runs, ["ls"]);           // step 1 really ran (tool and all)
+  assert.equal(res.transcript.length, 3);
+});
+
+test("defaultBudgetMs follows META_AGENT_BUDGET_MS and falls back to 900000", () => {
+  const prev = process.env.META_AGENT_BUDGET_MS;
+  try {
+    process.env.META_AGENT_BUDGET_MS = "123456";
+    assert.equal(defaultBudgetMs(), 123456);
+    delete process.env.META_AGENT_BUDGET_MS;
+    assert.equal(defaultBudgetMs(), 900_000);
+  } finally {
+    if (prev === undefined) delete process.env.META_AGENT_BUDGET_MS;
+    else process.env.META_AGENT_BUDGET_MS = prev;
+  }
 });
