@@ -1547,7 +1547,13 @@ function persistPending() {
     const pending = [...jobs.values()]
       .filter((j) => j.status === "queued" || j.status === "running")
       .slice(0, MAX_PERSISTED)
-      .map((j) => ({ job_id: j.job_id, input: j._input, mode: j.mode, copy_at: j.copy_at, images: j.images || [], created: j.created }));
+      .map((j) => ({ job_id: j.job_id, input: j._input, mode: j.mode, copy_at: j.copy_at, images: j.images || [], created: j.created,
+        // Agent identity must survive the restart: a recovered agent job has
+        // to replay through the loop + sandbox, not as a plain chat completion
+        // (raw task to Meta, no protocol, no isolation).
+        ...(j.agent ? { agent: true, maxSteps: j.maxSteps, budgetMs: j.budgetMs ?? null,
+                        allowWrite: !!j.allowWrite, allowNetwork: !!j.allowNetwork,
+                        workdir: j.workdir || null } : {}) }));
     writeFileSync(JOBS_FILE, JSON.stringify(pending, null, 2));
   } catch (e) { log("aviso: no pude persistir jobs:", String(e.message || e)); }
 }
@@ -1567,6 +1573,11 @@ function loadPending() {
       job_id: p.job_id, status: "queued", _input: p.input, content: "",
       copy_at: p.copy_at ?? null, mode: p.mode || MODE_DEFAULT, images: p.images || [],
       created: p.created, rescued: 1, recovered: true,
+      // Mirror of persistPending's agent block: pump's agent branch keys off
+      // j.agent, so the recovered job replays as an agent job end to end.
+      ...(p.agent ? { agent: true, maxSteps: p.maxSteps, budgetMs: p.budgetMs ?? null,
+                      allowWrite: !!p.allowWrite, allowNetwork: !!p.allowNetwork,
+                      workdir: p.workdir || null } : {}),
     });
     recovered.push(p.job_id);
   }
