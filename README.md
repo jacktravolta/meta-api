@@ -7,7 +7,8 @@ requests are serialized and latency is browser latency.
 ```
 POST /v1/chat/completions        OpenAI-compatible (sync)
 POST /v1/chat/completions/async  returns {job_id} immediately
-GET  /v1/jobs/{job_id}           {status, content?, error?}
+POST /v1/agent                   shell-tool agent mission (see Agent below)
+GET  /v1/jobs/{job_id}           {status, content?, error?, agent?}
 GET  /v1/models · GET /health
 ```
 
@@ -66,6 +67,10 @@ the profile, so this is a one-time action.
 | `META_CONTEXT_BUDGET_CHARS` | `24000` | character budget the % is measured against |
 | `META_CONTEXT_SEED_CHARS` | `8000` | starting estimate for a thread we resume but never watched being built |
 | `META_RECOVERY_MAX_AGE_MS` | `1800000` | ignore persisted jobs older than this on boot; their caller has given up |
+| `META_AGENT_BUDGET_MS` | `900000` | default wall-clock budget of an agent job; the per-request `budgetMs` is clamped to 30s..1h |
+| `META_SANDBOX_WORKDIR_ROOTS` | `/home/test/test` | colon-separated roots; an agent `workdir` must realpath inside one of them or the request is refused |
+| `META_SANDBOX_WORKDIR` | `/home/test/test` | workspace mounted at `/workspace` when the request carries no `workdir`; validated against the roots too |
+| `META_SANDBOX_IMAGE` | `meta-sandbox:1` | Docker image for agent commands. Build: `docker build -f agent/Dockerfile.sandbox -t meta-sandbox:1 agent/` |
 
 ## Session continuity
 
@@ -114,6 +119,79 @@ Usage is **estimated**, not measured: Meta exposes no token counter and the thre
 is virtualized, so `main` reads ~250 chars on a long thread while `body` is ~190k
 of React payload. The broker counts what it sent and received instead. Tune
 `META_CONTEXT_BUDGET_CHARS` if Meta degrades before the threshold trips.
+
+Agent jobs never rotate: the loop drives its worker's thread turn by turn, so
+the mission transcript is the context. Rotating first would spend a Meta turn
+on a summary the loop never reads and delete the thread mid-mission.
+
+## Agent: POST /v1/agent
+
+Meta AI plans, the broker executes. The model is framed to answer with a shell
+command in a code block tagged `sh`; the broker runs it in an ephemeral sandbox
+and feeds the output back, repeating until the model answers in plain text.
+
+```bash
+curl -s -X POST http://127.0.0.1:8055/v1/agent -d '{
+  "task": "find every TODO in the project and count them"
+}'
+# -> {"job_id":"job-...","status":"queued","poll":"/v1/jobs/job-..."}
+curl -s http://127.0.0.1:8055/v1/jobs/job-...
+```
+
+Request fields:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `task` | required | the mission. Capped at 8000 chars |
+| `verify` | `true` | run the sandbox self-check first; the route answers **503** if the sandbox does not prove it enforces the default posture (write denied, mount visible, network blocked, host invisible) |
+| `maxSteps` | `8` | step budget, clamped to 1..32 |
+| `budgetMs` | `META_AGENT_BUDGET_MS` (900000) | wall-clock budget, clamped to 30000..3600000 |
+| `allowWrite` | `false` | mount the workspace read-write; requires `allowWriteAck:true` as an explicit confirmation |
+| `allowNetwork` | `false` | give the container network access (`bridge` instead of `none`) |
+| `workdir` | `META_SANDBOX_WORKDIR` | host directory mounted at `/workspace`; must `realpath` inside `META_SANDBOX_WORKDIR_ROOTS` or the route answers **400** |
+
+The poll response carries the mission result:
+
+```json
+{
+  "job_id": "job-...", "status": "done",
+  "content": "hay 14 TODOs",
+  "agent": {
+    "ok": true, "reason": null, "steps": 3,
+    "transcript": [
+      { "role": "user", "step": 1, "text": "..." },
+      { "role": "assistant", "step": 1, "text": "```sh\nrg -n TODO\n```" },
+      { "role": "tool", "step": 1, "command": "rg -n TODO", "output": "..." }
+    ]
+  }
+}
+```
+
+`agent.ok:false` means the loop ended without a final answer: `max-steps`,
+`budget`, or `meta-error:<msg>` (Meta failed mid-mission — the partial
+transcript is still delivered). `text`/`output` are capped at 1200 chars per
+turn. Queued agent jobs survive a broker restart with their identity
+(`maxSteps`, `budgetMs`, write/network flags, `workdir`), so they replay as
+agent jobs, never as raw chat.
+
+Execution is **deny-by-default**: commands are classified against a read-only
+whitelist (every pipe segment must pass; substitution, backticks, `find
+-exec`/`-delete`, `xargs` and `awk/sed system(...)` all classify as writes),
+and the container runs `--network none`, `--read-only`, `--cap-drop=ALL`,
+`--security-opt=no-new-privileges`, with capped memory/CPU/PIDs and a hard
+timeout on both sides. Writes inside the container require the explicit
+`allowWrite` + `allowWriteAck` pair.
+
+The agent modules carry their own regression suite (zero dependencies):
+
+```bash
+node --test agent/*.test.js   # bare `node --test` also finds them
+```
+
+The suite pins the parser, the classifier, the loop and the sandbox
+self-check; the self-check test skips itself when the Docker daemon is
+unreachable. Note that this Node's runner rejects directory arguments
+(`node --test agent/`), so pass files or a glob.
 
 ## Recovery
 

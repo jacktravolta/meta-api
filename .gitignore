@@ -5,4 +5,4 @@ state.json
 server.mjs.bak-*
 
 node_modules/
-*.logagent/
+*.log
