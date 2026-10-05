@@ -39,7 +39,9 @@ const READ_ONLY = [
 
 // A pipe chain is read-only only if EVERY segment is. Splitting on the shell
 // operators is what makes `ls | head` allowed while `ls | tee file` is not.
-function classify(command) {
+// Exported for the test suite: the policy is the security boundary, so its
+// decisions on concrete commands are pinned by regression tests.
+export function classify(command) {
   if (WRITE_MARKERS.test(command)) return { write: true, why: "operador o comando mutante" };
   for (const segment of String(command).split(/[|;&]/)) {
     const s = segment.trim();
@@ -128,26 +130,52 @@ export async function runSandboxed(command, opts = {}) {
   });
 }
 
-// Cheap capability probe, so the loop can refuse to start when the sandbox is
-// not actually enforcing anything. Uses allowWrite on purpose: this is our own
-// probe, never model output, and it needs to test that writes DO fail inside.
+// Capability probe, so the loop can refuse to start when the sandbox is not
+// actually enforcing anything. Each dimension gets its own sub-probe so each
+// one classifies the way its assertion needs:
+//
+//   * write  : the write attempt runs under the DEFAULT policy and must be
+//              DENIED by the policy layer (writeBlocked). It is never
+//              executed, so nothing can appear on the host. The previous
+//              single-probe version passed allowWrite:true and leaked
+//              .sandbox-probe into the workspace on every verified request.
+//   * fs     : a read-classified command must execute and see the mounted
+//              workspace (test -r is NOT whitelisted, so the probe uses ls).
+//   * network : trusted static code, never model output. It still needs
+//              allowWrite because curl and the >/dev/null redirect classify
+//              as write; what it verifies is the allowNetwork DEFAULT: the
+//              fetch must fail because of --network none, not because we
+//              granted egress. hostHomeInvisible rides along on it for the
+//              same reason: `hostname` is not on the read-only whitelist.
 export async function selfCheck() {
-  // Probe the DEFAULT policy: writes must be refused by the policy AND the mount
-  // must be read-only. Probing with allowWrite would show a write succeeding and
-  // wrongly report the sandbox as unprotected.
-  const r = await runSandboxed(
-    'test -r /workspace && echo FS_OK; ' +
-    'curl -s -m 3 https://example.com >/dev/null 2>&1 && echo NET_LEAK || echo NET_BLOCKED; ' +
-    'echo x > /workspace/.sandbox-probe 2>/dev/null && echo WRITE_LEAK || echo WRITE_BLOCKED; ' +
-    'id -u; hostname',
-    { timeoutMs: 25000, allowWrite: true });
-  const out = r.output || "";
+  // (a) Write policy: denied:true means the policy layer refused the command
+  // before any container existed. Anything else (the write running, or a
+  // docker failure) means the sandbox is not enforcing the default policy.
+  const writeProbe = await runSandboxed("echo probe > /workspace/.sandbox-probe");
+  const writeBlocked = writeProbe.denied === true;
+
+  // (b) Mount proof: a read-classified command under the default policy.
+  const fsProbe = await runSandboxed("ls /workspace && echo FS_OK");
+  const fsRead = fsProbe.ok && /FS_OK/.test(fsProbe.output || "");
+
+  // (c) + (d) Network posture and host visibility: trusted static code.
+  const netProbe = await runSandboxed(
+    "curl -s -m 3 https://example.com >/dev/null 2>&1 && echo NET_LEAK || echo NET_BLOCKED; " +
+    "id -u; hostname",
+    { allowWrite: true },
+  );
+  const netOut = netProbe.output || "";
+  const networkBlocked = /NET_BLOCKED/.test(netOut);
+  // hostHomeInvisible: the last line is the container hostname, never the
+  // host's. A shared network namespace would leak it.
+  const hostHomeInvisible = !/\btest\b/.test(netOut.split("\n").slice(-1)[0] || "");
+
   return {
-    ok: r.ok && /FS_OK/.test(out),
-    fsRead: /FS_OK/.test(out),
-    networkBlocked: /NET_BLOCKED/.test(out),
-    // hostHomeInvisible: the last line is the container hostname, never "test".
-    hostHomeInvisible: !/\btest\b/.test(out.split("\n").slice(-1)[0] || ""),
-    raw: out.trim(),
+    ok: writeBlocked && fsRead && networkBlocked && hostHomeInvisible,
+    writeBlocked,
+    fsRead,
+    networkBlocked,
+    hostHomeInvisible,
+    raw: [writeProbe.output, fsProbe.output, netOut].filter(Boolean).join("\n---\n").trim(),
   };
 }

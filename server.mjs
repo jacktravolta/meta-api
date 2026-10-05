@@ -1786,9 +1786,11 @@ async function route(req, res) {
 
     // Refuse to run unless the sandbox proves it is actually enforcing. Running an
     // agent with a broken sandbox would execute model-authored text on the host.
+    // writeBlocked is the policy layer itself refusing the probe write; without
+    // it a misclassified probe would execute and leak into the host workspace.
     if (payload.verify !== false) {
       const probe = await sandboxSelfCheck();
-      if (!probe.ok || !probe.networkBlocked || !probe.hostHomeInvisible) {
+      if (!probe.ok || !probe.writeBlocked || !probe.networkBlocked || !probe.hostHomeInvisible) {
         return json(503, { error: { message: "el sandbox no verifica, no ejecuto el agente", probe } });
       }
     }
