@@ -6,3 +6,6 @@ server.mjs.bak-*
 
 node_modules/
 *.log
+systemd/meta-api.service.d/medicion.conf
+pending-jobs.json
+state.json
