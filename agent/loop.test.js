@@ -91,3 +91,62 @@ test("defaultBudgetMs follows META_AGENT_BUDGET_MS and falls back to 900000", ()
     else process.env.META_AGENT_BUDGET_MS = prev;
   }
 });
+
+test("multi-step success: tool turns then a plain-text final answer", async () => {
+  const runs = [];
+  const answers = ["```sh\nls /workspace\n```", "```sh\nwc -l server.mjs\n```", "listo: 1970 lineas"];
+  let n = 0;
+  const events = [];
+  const res = await runAgentLoop({
+    ask: async () => answers[n++],
+    task: "revisa el proyecto",
+    exec: stubExec(runs),
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.steps, 3);
+  assert.equal(res.answer, "listo: 1970 lineas");
+  assert.deepEqual(runs, ["ls /workspace", "wc -l server.mjs"]);
+  // step1 (u+a+t) + step2 (u+a+t) + step3 (u+a) = 8 transcript turns
+  assert.equal(res.transcript.length, 8);
+  assert.equal(res.transcript.at(-1).role, "assistant");
+  // the step-2 prompt is the formatted feedback of step 1's tool result
+  assert.match(res.transcript[3].text, /Comando: `ls \/workspace`/);
+  assert.match(res.transcript[3].text, /```result\nsalida de: ls \/workspace\n```/);
+  assert.ok(events.some((e) => e.type === "final"));
+});
+
+test("a parser rejection burns a step and asks for a corrected block", async () => {
+  const runs = [];
+  const answers = [
+    "```\n{\"tool\":\"eval\",\"command\":\"ls\"}\n```",  // rejected: unknown tool
+    "```sh\nls\n```",                                   // corrected
+    "listo",
+  ];
+  let n = 0;
+  const events = [];
+  const res = await runAgentLoop({
+    ask: async () => answers[n++],
+    task: "t",
+    exec: stubExec(runs),
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.steps, 3);
+  assert.ok(events.some((e) => e.type === "tool-rejected" && /herramienta no permitida/.test(e.error)));
+  // the rejection was fed back: the step-2 user turn IS the correction prompt
+  assert.match(res.transcript[2].text, /La herramienta fue rechazada/);
+  assert.deepEqual(runs, ["ls"]);   // the corrected block really executed
+});
+
+test("exceeding maxSteps resolves ok:false with reason max-steps", async () => {
+  const res = await runAgentLoop({
+    ask: async () => "```sh\nls\n```",
+    task: "t",
+    maxSteps: 2,
+    exec: stubExec([]),
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "max-steps");
+  assert.equal(res.steps, 2);
+});
