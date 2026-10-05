@@ -27,3 +27,35 @@ test("selfCheck network probe classifies as write, so it runs as trusted static 
     "id -u; hostname",
   ).write, true);
 });
+
+// ---- Indirection hardening -------------------------------------------------
+// The read-only whitelist is textual, so anything that turns a whitelisted
+// command into an executor of OTHER text is a write. These pins keep the
+// escape closed: $(...), backticks, find -exec/-delete, xargs, awk/sed system().
+
+test("command substitution classifies as write", () => {
+  assert.equal(classify("cat $(echo x)").write, true);
+  assert.equal(classify("cat $(( 1 + 1 ))").write, true);
+  assert.equal(classify("echo `id`").write, true);
+});
+
+test("find -exec and -delete classify as write", () => {
+  assert.equal(classify("find . -name x -delete").write, true);
+  assert.equal(classify("find . -type f -exec cat {} ;").write, true);
+  assert.equal(classify("find . -name x -execdir rm {} +").write, true);
+});
+
+test("xargs classifies as write", () => {
+  assert.equal(classify("cat list | xargs cat").write, true);
+});
+
+test("awk/sed system(...) classifies as write", () => {
+  assert.equal(classify("awk 'system(\"ls\")'").write, true);
+  assert.equal(classify("sed 's/x/y/system(/'").write, true);
+});
+
+test("plain reads still classify as read after the hardening", () => {
+  assert.equal(classify("find . -type f -name '*.mjs'").write, false);
+  assert.equal(classify("awk '{print $1}'").write, false);
+  assert.equal(classify("ls /workspace && echo FS_OK").write, false);
+});

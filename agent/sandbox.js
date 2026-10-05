@@ -28,8 +28,14 @@ const DEFAULTS = {
 // token alone, so `echo ok > /workspace/f.txt` matched the read-only `echo` rule
 // and the workspace stayed read-only even with allowWrite. Now anything that
 // mutates is a write unless it is unambiguously a read.
+//
+// The blocklist also covers INDIRECTION, which executes text the whitelist
+// never sees: command substitution ($(...), backticks), find -exec/-delete,
+// xargs, and awk/sed system(...). These are patterns, not a shell parser: a
+// rare false positive denies a read (the safe direction — the model can
+// rephrase), while a missed indirection would be code execution.
 const WRITE_MARKERS =
-  /(>\s*\S|\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|\btruncate\b|\btee\b|\bdd\b|\bmount\b|\bsudo\b|\bsu\b|\bapt\b|\bapt-get\b|\bpip\s+install\b|\bnpm\s+i\b|\bgit\s+(add|commit|checkout|reset|push|merge|rebase|clean|init|apply|stash|tag)\b|\bsed\s+-i\b|\bcrontab\b)/;
+  /(>\s*\S|\$\(|`|\bxargs\b|\bfind\b[^;&|]*\s-(exec|execdir|ok|okdir|delete)\b|\b(awk|gawk|mawk|sed)\b[^;&|]*\bsystem\s*\(|\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|\btruncate\b|\btee\b|\bdd\b|\bmount\b|\bsudo\b|\bsu\b|\bapt\b|\bapt-get\b|\bpip\s+install\b|\bnpm\s+i\b|\bgit\s+(add|commit|checkout|reset|push|merge|rebase|clean|init|apply|stash|tag)\b|\bsed\s+-i\b|\bcrontab\b)/;
 
 const READ_ONLY = [
   /^\s*(ls|cat|head|tail|wc|grep|egrep|rg|find|file|stat|du|df|echo|pwd|date|whoami|id|which|realpath|basename|dirname|sort|uniq|cut|awk|tr|diff|less|seq|env|printenv|nl|md5sum|sha256sum)\b[^;&|]*$/,

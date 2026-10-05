@@ -36,7 +36,7 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, unlinkSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runAgentLoop } from "./agent/loop.js";
 import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
@@ -1519,11 +1519,37 @@ function agentBudgetMs(raw) {
   return Math.max(AGENT_BUDGET_MIN_MS, Math.min(AGENT_BUDGET_MAX_MS, Math.round(base)));
 }
 
+// The agent may only mount workspaces the operator designated: a request
+// workdir must realpath inside META_SANDBOX_WORKDIR_ROOTS (colon-separated,
+// default /home/test/test) or the submission is refused. realpath closes the
+// symlink escape (/roots/link -> /etc classifies as /etc). The default workdir
+// (META_SANDBOX_WORKDIR) passes through the same check, so a broken default
+// configuration can never silently widen the sandbox.
+const WORKDIR_ROOTS = String(process.env.META_SANDBOX_WORKDIR_ROOTS || "/home/test/test")
+  .split(":").map((r) => r.trim()).filter(Boolean);
+function resolveAgentWorkdir(raw) {
+  const requested = raw ? String(raw) : (process.env.META_SANDBOX_WORKDIR || "/home/test/test");
+  let real;
+  try { real = realpathSync(requested); }
+  catch { return { error: `no existe o no se puede resolver: ${requested}` }; }
+  const inside = WORKDIR_ROOTS.some((root) => {
+    let r;
+    try { r = realpathSync(root); } catch { return false; }
+    return real === r || real.startsWith(r + "/");
+  });
+  if (!inside) {
+    return { error: `debe resolver (realpath) dentro de META_SANDBOX_WORKDIR_ROOTS (${WORKDIR_ROOTS.join(":")})` };
+  }
+  return { path: real };
+}
+
 function submitAgent(task, opts = {}) {
   const jobId = "job-" + randomUUID();
   jobs.set(jobId, {
     job_id: jobId, status: "queued", _input: task, content: "",
-    agent: true, maxSteps: opts.maxSteps || 8,
+    // maxSteps is clamped here so every stored job (and therefore every
+    // recovered replay of it) carries a bounded step budget: 1..32, default 8.
+    agent: true, maxSteps: Math.min(32, Math.max(1, Math.round(Number(opts.maxSteps) || 8))),
     budgetMs: opts.budgetMs ?? null,
     allowWrite: !!opts.allowWrite, allowNetwork: !!opts.allowNetwork,
     workdir: opts.workdir || null, mode: MODE_DEFAULT,
@@ -1836,6 +1862,9 @@ async function route(req, res) {
     try { payload = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "invalid JSON" } }); }
     const task = String(payload.task || payload.messages?.[0]?.content || "").trim();
     if (!task) return json(400, { error: { message: "falta 'task'" } });
+    if (task.length > 8000) {
+      return json(400, { error: { message: `task demasiado larga: ${task.length} chars (maximo 8000)` } });
+    }
 
     // Refuse to run unless the sandbox proves it is actually enforcing. Running an
     // agent with a broken sandbox would execute model-authored text on the host.
@@ -1851,12 +1880,19 @@ async function route(req, res) {
       return json(400, { error: { message:
         "allowWrite habilita escritura en el workspace. Reenvia con allowWriteAck:true para confirmar." } });
     }
+    // The workdir reaches docker -v, so it is never taken at face value:
+    // it must realpath inside the configured roots (the default workdir goes
+    // through the same check). A job always stores the resolved path.
+    const workdirRes = resolveAgentWorkdir(payload.workdir);
+    if (workdirRes.error) {
+      return json(400, { error: { message: `workdir invalido: ${workdirRes.error}` } });
+    }
     const jobId = submitAgent(task, {
       maxSteps: payload.maxSteps,
       budgetMs: agentBudgetMs(payload.budgetMs),
       allowWrite: !!payload.allowWrite,
       allowNetwork: !!payload.allowNetwork,
-      workdir: payload.workdir,
+      workdir: workdirRes.path,
     });
     return json(202, { job_id: jobId, status: "queued", poll: `/v1/jobs/${jobId}` });
   }
@@ -2023,4 +2059,10 @@ http.createServer(route).listen(PORT, HOST, () => {
   // lazily on the first request, so this only restores the handles.
   const recovered = loadPending();
   for (const jobId of recovered) dispatchJob(jobs.get(jobId));
+  // Surface a broken agent workdir default at boot instead of at the first
+  // refused submission: the route re-validates per request and 400s while the
+  // configuration is wrong. Log-only on purpose — a chat-only deployment must
+  // still boot with the agent misconfigured.
+  const workdirCheck = resolveAgentWorkdir(null);
+  if (workdirCheck.error) log(`aviso: workdir por defecto del agente invalido (${workdirCheck.error})`);
 });
