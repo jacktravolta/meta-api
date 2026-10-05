@@ -1621,6 +1621,21 @@ async function recycleChrome(reason = "fresh per request") {
 // context while the transcript went to a file nobody reads. It also ran before the
 // percentage check, so the rotation below almost never got a chance to fire.
 
+// One line of honest prose for a loop that resolved without a final answer.
+// The full evidence rides in agentResult; this is what a plain poller reads as
+// the job's content so an empty string never hides a half-finished mission.
+function agentFailureSummary(res) {
+  const steps = res.steps || 0;
+  const reason = String(res.reason || "");
+  if (reason === "max-steps") return `[agente] limite de pasos alcanzado (${steps}); sin respuesta final.`;
+  if (reason === "budget") return `[agente] presupuesto de tiempo agotado tras ${steps} paso(s); sin respuesta final.`;
+  if (reason.startsWith("meta-error:")) {
+    return `[agente] Meta fallo en el paso ${steps + 1} (${reason.slice("meta-error:".length)}); ` +
+           `transcripcion parcial en agent.transcript.`;
+  }
+  return `[agente] no completo (${reason || "sin razon"}) tras ${steps} paso(s).`;
+}
+
 async function pump(worker) {
   if (worker.busy) return;
   const jobId = worker.queue.shift();
@@ -1664,7 +1679,11 @@ async function pump(worker) {
         },
         onEvent: (e) => log("agent", JSON.stringify(e)),
       });
-      j.content = res.answer || "";
+      // In-band failures (max-steps, budget, a Meta error mid-mission) resolve
+      // here instead of throwing: the job still completes, but honestly — a
+      // readable summary as content, the reason and the partial transcript in
+      // agentResult. pump's catch stays for genuinely unexpected errors only.
+      j.content = res.ok ? (res.answer || "") : agentFailureSummary(res);
       j.agentResult = { ok: res.ok, reason: res.reason || null, steps: res.steps,
                         transcript: (res.transcript || []).map((t) => ({
                           role: t.role, step: t.step,
