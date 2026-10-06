@@ -11,8 +11,10 @@ try { canal = existsSync(CANAL) ? JSON.parse(readFileSync(CANAL, "utf8")) : null
 const FRAG = (canal && canal.id) || "";
 
 let TEXTO = readFileSync(process.argv[2], "utf8").trim();
-// REGLA DURA: todo mensaje del agente va SIEMPRE entre corchetes con [DON BOT].
-if (!/^\[don\s?bot\]/i.test(TEXTO)) TEXTO = "[DON BOT] " + TEXTO;
+// REGLA: mensajes del agente en WhatsApp/hilo van SIEMPRE con [DON BOT].
+// Excepcion: los mensajes PARA META no llevan prefijo (SIN_PREFIJO=1), porque
+// contamina sus respuestas (regla de Don Jack).
+if (!process.env.SIN_PREFIJO && !/^\[don\s?bot\]/i.test(TEXTO)) TEXTO = "[DON BOT] " + TEXTO;
 
 const list = await (await fetch("http://127.0.0.1:9233/json")).json();
 let target = list.find((t) => t.type === "page" && (t.url || "").includes(FRAG));
@@ -47,5 +49,12 @@ for (let intento = 0; intento < 4 && !enviado; intento++) {
   }
 }
 console.log(enviado ? "ENVIADO ✓ (composer vacio)" : "NO SE PUDO ENVIAR (texto aun en el composer)");
-if (enviado) { try { appendFileSync(ENVIADOS, TEXTO.replace(/^\[DON BOT\]\s*/i, "") + "\n"); } catch {} }
+if (enviado) {
+  try {
+    // Registro con TURNO (turno|texto): el detector coteja por POSICION.
+    let turno = 0;
+    try { turno = JSON.parse(readFileSync(join(BIN, "turno.json"), "utf8")).n || 0; } catch {}
+    appendFileSync(ENVIADOS, turno + "|" + TEXTO.replace(/^\[DON BOT\]\s*/i, "") + "\n");
+  } catch {}
+}
 process.exit(enviado ? 0 : 1);

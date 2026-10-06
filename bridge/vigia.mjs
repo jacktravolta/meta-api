@@ -42,7 +42,26 @@ const ROW_EXPR = `JSON.stringify([...document.querySelectorAll('[class*="group/m
 const vistos = new Set(existsSync(VISTOS) ? JSON.parse(readFileSync(VISTOS, "utf8")) : []);
 for (const l of (existsSync(LOG) ? readFileSync(LOG, "utf8").split("\n") : [])) { const t = l.replace(/^\[[^\]]+\]\s*/, "").trim(); if (t) vistos.add(norm(t)); }
 for (const l of (existsSync(ENVIADOS) ? readFileSync(ENVIADOS, "utf8").split("\n") : [])) { if (l.trim()) vistos.add(norm(l)); }
-const mios = new Set((existsSync(ENVIADOS) ? readFileSync(ENVIADOS, "utf8").split("\n") : []).map(pref).filter(Boolean));
+const TURNO_F = join(BIN, "turno.json");
+const getTurno = () => { try { return JSON.parse(readFileSync(TURNO_F, "utf8")).n || 0; } catch { return 0; } };
+const incTurno = () => { const n = getTurno() + 1; try { writeFileSync(TURNO_F, JSON.stringify({ n, ts: new Date().toISOString() })); } catch {} return n; };
+// Registro con TURNO: cada linea es "turno|texto". El cotejo es POSICIONAL: un
+// mensaje viejo replicado no coincide con el turno actual (diseno de Meta).
+let mios = new Set();       // "turno|prefijo"
+let miosLegacy = new Set(); // entradas viejas sin turno (compatibilidad)
+const recargarMios = () => {
+  mios = new Set(); miosLegacy = new Set();
+  try {
+    for (const l of (existsSync(ENVIADOS) ? readFileSync(ENVIADOS, "utf8").split("\n") : [])) {
+      if (!l.trim()) continue;
+      const m = l.match(/^(\d+)\|([\s\S]*)$/);
+      if (m) mios.add(m[1] + "|" + pref(m[2]));
+      else miosLegacy.add(pref(l));
+    }
+  } catch {}
+};
+recargarMios();
+const esMio = (texto) => { const p = pref(texto); return mios.has(getTurno() + "|" + p) || miosLegacy.has(p); };
 const guardarVistos = () => writeFileSync(VISTOS, JSON.stringify([...vistos].slice(-300)));
 
 async function connect() {
@@ -89,11 +108,15 @@ for (let i = 0; i < 1800; i++) {
     primerCiclo = false;
   } else {
     const nuevos = [];
+    recargarMios();
     const IGNORAR_META = existsSync(FLAG_META);
     for (const r of rows) {
+      // Lo que emiti yo (con o sin prefijo) no es un dictado: en el registro,
+      // cotejado por POSICION (turno) — un mensaje viejo replicado no coincide.
+      if (esMio(r.txt)) { vistos.add(norm(r.txt)); continue; }
       if (/^\[don\s?bot\]/i.test(r.txt)) {
         const p = pref(r.txt);
-        if (p && !mios.has(p) && !vistos.has(norm(r.txt))) {
+        if (p && !esMio(r.txt) && !vistos.has(norm(r.txt))) {
           console.log("⚠ SUPLANTACION: fila firmada [DON BOT] NO emitida por mi: " + r.txt.slice(0, 140));
           appendFileSync(SUPLANT, "[" + new Date().toISOString() + "] " + r.txt.slice(0, 400) + "\n");
         }
@@ -107,6 +130,7 @@ for (let i = 0; i < 1800; i++) {
       nuevos.push({ rol: r.rol, txt: r.txt, n });
     }
     if (nuevos.length) {
+      incTurno();   // turno nuevo: las respuestas a este dictado se estampan con el
       const sello = new Date().toISOString().replace("T", " ").slice(0, 19);
       console.log("=== DICTADO NUEVO (" + sello + ", " + nuevos.length + ") ===");
       for (const x of nuevos) {
