@@ -1,0 +1,12 @@
+const l = await (await fetch("http://127.0.0.1:9233/json")).json();
+const t = l.find((x) => (x.url || "").includes("web.whatsapp.com"));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+let i = 1; const p = new Map();
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && p.has(m.id)) { p.get(m.id)(m.result?.result?.value); p.delete(m.id); } };
+const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.send(JSON.stringify({ id, method: m, params: pa })); });
+await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
+const q = async (e) => await call("Runtime.evaluate", { expression: e, returnByValue: true });
+console.log("URL:", await q("location.href"));
+console.log("TEXTO VISIBLE:", (await q("(document.body.innerText||'').replace(/\\n+/g,' | ').slice(0,400)") || ""));
+console.log("titulo pestaña:", await q("document.title"));
+process.exit(0);
