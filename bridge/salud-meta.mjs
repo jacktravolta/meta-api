@@ -31,6 +31,42 @@ async function salud() {
   return "ok";
 }
 
+// Recolecta errores de consola + limpia el estado del SPA de Meta (recomendacion
+// 3 de Meta: localStorage + sessionStorage + IndexedDB de su dominio antes de
+// reciclar; el SPA suele quedar con estado corrupto guardado).
+async function limpiarEstado() {
+  const l = await (await fetch(CDP + "/json")).json();
+  const t = l.find((x) => (x.url || "").includes("meta.ai"));
+  if (!t) return;
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  let i = 1; const p = new Map(); const errores = [];
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.id && p.has(m.id)) { p.get(m.id)(m.result?.result?.value); p.delete(m.id); return; }
+    if (m.method === "Log.entryAdded") errores.push(m.params.entry.text);
+    if (m.method === "Runtime.exceptionThrown") errores.push(m.params.exceptionDetails?.exception?.description || m.params.exceptionDetails?.text || "");
+  };
+  const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.send(JSON.stringify({ id, method: m, params: pa })); setTimeout(() => r(undefined), 12000); });
+  await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 4000); });
+  try { await call("Log.enable", {}); } catch {}
+  try { await call("Runtime.enable", {}); } catch {}
+  await sleep(1500);
+  if (errores.length) log("errores de consola de Meta: " + errores.slice(0, 4).join(" | ").slice(0, 500));
+  else log("sin errores de consola capturados");
+  const r = await call("Runtime.evaluate", {
+    expression: `(async () => {
+      try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}
+      try {
+        if (indexedDB.databases) { const dbs = await indexedDB.databases(); for (const d of dbs) { try { indexedDB.deleteDatabase(d.name); } catch (e) {} } }
+      } catch (e) {}
+      return 'limpio';
+    })()`,
+    returnByValue: true, awaitPromise: true,
+  });
+  log("estado del SPA limpiado: " + r);
+  try { ws.close(); } catch {}
+}
+
 log("== salud-meta activo (chequeo cada 5 min, como recomendo Meta) ==");
 for (let k = 0; k < 1440; k++) {
   try {
@@ -52,6 +88,7 @@ for (let k = 0; k < 1440; k++) {
     const s = await salud();
     if ((s === "degradada" || s === "sin-respuesta" || s === "sin-pestana") && !envioReciente) {
       log(`Meta ${s}: reinicio el broker (Chrome fresco) + reabro WhatsApp + relay`);
+      try { await limpiarEstado(); } catch (e) { log("no se pudo limpiar el estado: " + String(e).slice(0, 80)); }
       sh("export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user restart meta-api.service");
       await sleep(8000);
       sh("curl -s --max-time 90 http://127.0.0.1:8055/warmup >/dev/null 2>&1"); await sleep(14);
@@ -61,7 +98,7 @@ for (let k = 0; k < 1440; k++) {
       log("recuperacion completa");
     } else if (s !== "ok" && envioReciente) {
       log("Meta " + s + " pero hubo envio reciente: espero a que re-monte (no reinicio)");
-    } else if (k % 10 === 0) log("Meta ok");
+    } else if (s === "ok") { sh("NODE_BIN=$(command -v node); \"$NODE_BIN\" /home/test/test/meta-api/bridge/podar-meta.mjs 30 >/dev/null 2>&1"); if (k % 10 === 0) log("Meta ok + poda de historial"); }
   } catch (e) { log("error en el chequeo: " + String(e).slice(0, 80)); }
   await sleep(300000);
 }
