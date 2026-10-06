@@ -1,0 +1,18 @@
+const l = await (await fetch("http://127.0.0.1:9233/json")).json();
+const t = l.find((x) => (x.url || "").includes("meta.ai"));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+let i=1; const p=new Map();
+ws.onmessage=(e)=>{const m=JSON.parse(e.data); if(m.id&&p.has(m.id)){p.get(m.id)(m.result);p.delete(m.id);}};
+const call=(m,pa)=>new Promise(r=>{const id=i++;p.set(id,r);ws.send(JSON.stringify({id,method:m,params:pa}));setTimeout(()=>r(undefined),15000);});
+await new Promise(r=>{if(ws.readyState===1)return r();ws.onopen=()=>r();setTimeout(r,5000);});
+await call("DOM.enable");
+const doc = await call("DOM.getDocument", { depth: -1, pierce: true });
+const rootId = doc && doc.root ? doc.root.nodeId : null;
+console.log("rootId:", rootId);
+const q = await call("DOM.querySelector", { nodeId: rootId, selector: 'input[type=file]' });
+console.log("querySelector:", JSON.stringify(q));
+const ev = await call("Runtime.evaluate", { expression: `document.querySelectorAll('input[type=file]').length`, returnByValue: true });
+console.log("inputs file (Runtime):", JSON.stringify(ev && ev.result ? ev.result.value : ev));
+const ev2 = await call("Runtime.evaluate", { expression: `document.querySelectorAll('input').length`, returnByValue: true });
+console.log("inputs totales:", JSON.stringify(ev2 && ev2.result ? ev2.result.value : ev2));
+process.exit(0);

@@ -32,15 +32,23 @@ if (TEXTO) {
   await call("Input.insertText", { text: TEXTO });
   await sleep(800);
 }
-// El composer de Meta puede estar en un iframe? Se busca en TODOS los frames.
-const doc = await call("DOM.getDocument", { depth: -1, pierce: true });
-const rootId = doc && doc.root ? doc.root.nodeId : null;
+// Si la pagina de Meta degrado (sin file input), RECARGAR el hilo y reintentar.
 let nodeId = null;
-if (rootId) {
+async function buscarInput() {
+  const doc = await call("DOM.getDocument", { depth: -1, pierce: true });
+  const rootId = doc && doc.root ? doc.root.nodeId : null;
+  if (!rootId) return null;
   const q = await call("DOM.querySelector", { nodeId: rootId, selector: 'input[type=file]' });
-  nodeId = q && q.nodeId ? q.nodeId : null;
+  return q && q.nodeId ? q.nodeId : null;
 }
-if (!nodeId) { console.log("no encontre input[type=file]"); process.exit(1); }
+nodeId = await buscarInput();
+if (!nodeId) {
+  console.log("sin file input: recargo el hilo de Meta y reintento");
+  await call("Page.navigate", { url: "https://www.meta.ai/prompt/" + canal.id });
+  await sleep(16000);
+  nodeId = await buscarInput();
+}
+if (!nodeId) { console.log("no encontre input[type=file] tras recargar"); process.exit(1); }
 
 await call("DOM.setFileInputFiles", { files: [RUTA], nodeId });
 console.log("archivo seteado: " + RUTA);
