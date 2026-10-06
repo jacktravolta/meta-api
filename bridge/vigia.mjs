@@ -72,7 +72,9 @@ const recargarMios = () => {
   } catch {}
 };
 recargarMios();
-const esMio = (texto) => { const p = pref(texto); return mios.has(getTurno() + "|" + p) || miosLegacy.has(p); };
+// Acepta el turno actual o el anterior: una respuesta pertenece al turno en que
+// llego el pedido, y el vigia incrementa el turno al detectarlo.
+const esMio = (texto) => { const p = pref(texto); const t = getTurno(); return mios.has(t + "|" + p) || mios.has((t - 1) + "|" + p) || miosLegacy.has(p); };
 const guardarVistos = () => writeFileSync(VISTOS, JSON.stringify([...vistos].slice(-300)));
 
 async function connect() {
