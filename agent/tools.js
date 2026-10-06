@@ -71,10 +71,17 @@ export function parseToolCall(text) {
     // Strip the prompt marker, not the command: "$ ls -1" is a command, while a
     // bare "$" line is not. The previous filter dropped the whole line and turned
     // a valid command into "bloque vacio".
+    //
+    // Each line keeps its newline. Joining with "; " turned every multi-line
+    // command into one line, which silently breaks heredocs, `python3 -c` blocks
+    // and anything else with structure: the heredoc terminator stops being alone
+    // on its line and sh fails with "Syntax error: redirection unexpected". A
+    // newline already separates commands in a shell, so "\n" is equivalent for
+    // the independent-commands case and correct for the block case.
     const lines = raw.split("\n")
-      .map((l) => l.replace(/^\s*[$#>]\s+/, "").trim())
-      .filter(Boolean);
-    const command = lines.join("; ").trim();
+      .map((l) => l.replace(/^\s*[$#>]\s+/, "").trimEnd())
+      .filter((l) => l.trim());
+    const command = lines.join("\n").trim();
     if (!command) return { error: "bloque de shell vacio", raw };
     if (command.length > MAX_COMMAND) return { error: `comando demasiado largo (max ${MAX_COMMAND} chars)`, raw };
     return { tool: "run", command, shape: "shell" };

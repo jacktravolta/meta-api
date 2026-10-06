@@ -56,9 +56,28 @@ test("the last surviving shell block wins", () => {
 });
 
 test("prompt markers are stripped, not the commands", () => {
-  assert.equal(parseToolCall(fence("sh", "$ cat f\n$ pwd")).command, "cat f; pwd");
+  assert.equal(parseToolCall(fence("sh", "$ cat f\n$ pwd")).command, "cat f\npwd");
   assert.equal(parseToolCall(fence("sh", "# cat g")).command, "cat g");
   assert.equal(parseToolCall(fence("sh", "> tail f")).command, "tail f");
+});
+
+// Regression: joining the lines with "; " collapsed every multi-line command into
+// one, so a heredoc terminator stopped being alone on its line and the shell
+// failed with "Syntax error: redirection unexpected". The target file was left at
+// 0 bytes. Newlines must survive the parse.
+test("a heredoc keeps its line structure", () => {
+  const cmd = parseToolCall(
+    fence("sh", "cat > f.html <<'EOF'\n<h1>hi</h1>\nEOF\nwc -l f.html")).command;
+  assert.match(cmd, /<<'EOF'\n<h1>hi<\/h1>\nEOF\n/);
+  assert.ok(!cmd.includes("; "), "no debe introducir separadores '; '");
+});
+
+// A python block dies without its indentation, and the old per-line .trim()
+// removed it.
+test("indentation survives for block languages", () => {
+  const cmd = parseToolCall(
+    fence("sh", "python3 - <<'EOF'\nfor i in range(2):\n    print(i)\nEOF")).command;
+  assert.match(cmd, /\n {4}print\(i\)/);
 });
 
 // ---- JSON form (legacy path) ------------------------------------------------
