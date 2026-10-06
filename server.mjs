@@ -1353,6 +1353,7 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const HARD_TIMEOUT_MS = Number(process.env.META_JOB_TIMEOUT_MS || 300000);
   const startedAt = Date.now();
   let reply = "";
+  let finalized = false;
   let sawGenerating = false;
   // High-water mark for the answer: if Meta re-renders it SHORTER (virtualization,
   // streaming rewrite, list recycling) a naive read drops text already on screen.
@@ -1408,7 +1409,7 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     //     N is 3 once generation was observed (we know it finished), else 6: fast
     //     answers never show the stop control, and 6 unchanged polls (~5.4s) is
     //     already a strong hint the turn is over without paying the old 20s.
-    if (idle >= 1 && ((await countCopies()) || 0) > preCopies) { log("finalizado por copy-control"); break; }
+    if (idle >= 1 && ((await countCopies()) || 0) > preCopies) { log("finalizado por copy-control"); finalized = true; break; }
     // The stop control vanishing is NOT completion: during Meta's web search
     // the stop button disappears while she is still working, and a search
     // status line ("Buscando imagenes de panaderia") was once returned as a
@@ -1422,16 +1423,33 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     // preamble ("Interpretando solicitud..."). The short limits only apply once
     // generation has actually stopped.
     const idleLimit = idleLimitFor(gen, sawGenerating);
-    // The message is only FINAL when Meta renders its end-of-message icons
-    // (copy control, checked above). While the stop control is gone and no
-    // icons have appeared, Meta may be running an extended reasoning pass
-    // whose status line ("Definiendo identidad visual") stays stable for
-    // minutes — the short idle limits returned that status text as the
-    // answer (garbage "final" observed live, twice). Never finalize by idle
-    // in that state: the poll loop stays bounded by MAX_POLLS and the
-    // absolute hard timeout instead.
-    const waitingIcons = sawGenerating && !gen;
-    if (!waitingIcons && idle >= idleLimit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
+    // A short status/progress line ("Buscando imagenes", "Revisando
+    // directorio para crear landing") is Meta STILL WORKING — her extended
+    // reasoning and web search render these as the message text while the
+    // real answer has not streamed yet. They must never be returned as the
+    // answer. Census of a full day: 74 real turns finalized via the stop
+    // control disappearing; the .msg-copy icon count never fired once.
+    const statusLike = (t) => {
+      const s = String(t || "").trim();
+      return s.length < 120 && /^(buscando|revisando|definiendo|construyendo|guardando|analizando|preparando|pensando|planificando|generando|escribiendo|organizando)\b/i.test(s);
+    };
+    // Completion, in order of trust:
+    //  1. copy control rendered (checked above) — rare/legacy
+    //  2. stop control seen and now gone, with non-status text — the signal
+    //     that finalized every real turn in a day of live use
+    //  3. stalled non-status text (weak)
+    // Status-like text finalizes through NONE of them: keep polling; the
+    // post-loop guard fails honestly if the real answer never arrives.
+    if (idle >= 1 && sawGenerating && !gen && !statusLike(reply)) {
+      log("finalizado por fin de generacion (stop control ausente)");
+      finalized = true;
+      break;
+    }
+    if (idle >= idleLimit && !statusLike(reply)) {
+      log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`);
+      finalized = true;
+      break;
+    }
     if (Date.now() - startedAt > HARD_TIMEOUT_MS) {
       log(`finalizado por timeout absoluto (${Math.round((Date.now() - startedAt) / 1000)}s) con ${idle} polls sin cambio`);
       break;
@@ -1453,6 +1471,10 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     })()`).catch((e) => ({ err: String(e) }));
     log("DIAG sin respuesta:", JSON.stringify(diag));
     throw new Error("Meta no genero respuesta nueva (envio fallido o hilo degenerado)");
+  }
+  if (!finalized) {
+    log(`sin iconos de cierre (${Math.round((Date.now() - startedAt) / 1000)}s): el texto leido era estado/progreso, no una respuesta final`);
+    throw new Error("Meta no finalizo la respuesta (sin iconos de cierre)");
   }
   return reply;
 }
