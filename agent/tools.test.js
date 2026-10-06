@@ -42,8 +42,12 @@ test("an empty shell block is an error", () => {
 });
 
 test("an oversized block is an error, the exact limit is not", () => {
-  assert.equal(parseToolCall(fence("sh", "a".repeat(4001))).error, "comando demasiado largo");
-  assert.equal(parseToolCall(fence("sh", "a".repeat(4000))).command, "a".repeat(4000));
+  // The cap is env-tunable (META_TOOL_MAX_COMMAND, default 20000 since the
+  // file-writing agent needs whole-file commands); the default suite runs
+  // against the default, so pin both sides against the live value.
+  const cap = Number(process.env.META_TOOL_MAX_COMMAND || 20000);
+  assert.equal(parseToolCall(fence("sh", "a".repeat(cap + 1))).error, "comando demasiado largo (max " + cap + " chars)");
+  assert.equal(parseToolCall(fence("sh", "a".repeat(cap))).command, "a".repeat(cap));
 });
 
 test("the last surviving shell block wins", () => {

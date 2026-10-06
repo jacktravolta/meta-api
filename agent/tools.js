@@ -44,6 +44,13 @@ const SHELL_TAGS = new Set([
   "", "sh", "shell", "bash", "zsh", "console", "shellsession", "terminal", "sh-session",
 ]);
 const BLOCK_RE = /```([a-z]*)\s*([\s\S]*?)```/gi;
+// Per-command length cap. The old fixed 4000 was tuned for the read-only
+// inspection use case; a file-writing agent legitimately needs room for a whole
+// source file encoded as base64 in a single `python3 -c` (a ~3KB file becomes
+// ~4KB+ of base64 plus quoting). Chunking below the cap is possible but
+// error-prone for the model (truncated base64 corrupts the target file), so the
+// default sits high enough for real files while still bounding a single job.
+const MAX_COMMAND = Math.max(4000, Number(process.env.META_TOOL_MAX_COMMAND || 20000));
 
 export const ALLOWED_TOOLS = new Set(["run"]);
 
@@ -69,7 +76,7 @@ export function parseToolCall(text) {
       .filter(Boolean);
     const command = lines.join("; ").trim();
     if (!command) return { error: "bloque de shell vacio", raw };
-    if (command.length > 4000) return { error: "comando demasiado largo", raw };
+    if (command.length > MAX_COMMAND) return { error: `comando demasiado largo (max ${MAX_COMMAND} chars)`, raw };
     return { tool: "run", command, shape: "shell" };
   }
 
@@ -90,8 +97,8 @@ export function parseToolCall(text) {
   if (typeof command !== "string" || !command.trim()) {
     return { error: "falta el campo command", raw };
   }
-  if (command.length > 4000) {
-    return { error: "comando demasiado largo", raw };
+  if (command.length > MAX_COMMAND) {
+    return { error: `comando demasiado largo (max ${MAX_COMMAND} chars)`, raw };
   }
   return { tool: name, command: command.trim(), shape: "json" };
 }
