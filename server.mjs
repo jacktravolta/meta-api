@@ -1551,6 +1551,9 @@ function submitAgent(task, opts = {}) {
     // recovered replay of it) carries a bounded step budget: 1..32, default 8.
     agent: true, maxSteps: Math.min(32, Math.max(1, Math.round(Number(opts.maxSteps) || 8))),
     budgetMs: opts.budgetMs ?? null,
+    // Per-command sandbox timeout, clamped 5s..10min (default 30s). Installing
+    // packages (apt) inside an ephemeral container legitimately needs minutes.
+    sandboxTimeoutMs: Math.min(600000, Math.max(5000, Math.round(Number(opts.sandboxTimeoutMs) || 30000))),
     allowWrite: !!opts.allowWrite, allowNetwork: !!opts.allowNetwork,
     workdir: opts.workdir || null, mode: MODE_DEFAULT,
     created: new Date().toISOString(),
@@ -1592,6 +1595,7 @@ function persistPending() {
         // to replay through the loop + sandbox, not as a plain chat completion
         // (raw task to Meta, no protocol, no isolation).
         ...(j.agent ? { agent: true, maxSteps: j.maxSteps, budgetMs: j.budgetMs ?? null,
+                        sandboxTimeoutMs: j.sandboxTimeoutMs ?? 30000,
                         allowWrite: !!j.allowWrite, allowNetwork: !!j.allowNetwork,
                         workdir: j.workdir || null } : {}) }));
     writeFileSync(JOBS_FILE, JSON.stringify(pending, null, 2));
@@ -1616,6 +1620,7 @@ function loadPending() {
       // Mirror of persistPending's agent block: pump's agent branch keys off
       // j.agent, so the recovered job replays as an agent job end to end.
       ...(p.agent ? { agent: true, maxSteps: p.maxSteps, budgetMs: p.budgetMs ?? null,
+                      sandboxTimeoutMs: p.sandboxTimeoutMs ?? 30000,
                       allowWrite: !!p.allowWrite, allowNetwork: !!p.allowNetwork,
                       workdir: p.workdir || null } : {}),
     });
@@ -1725,6 +1730,7 @@ async function pump(worker) {
           workdir: j.workdir || undefined,
           allowWrite: !!j.allowWrite,
           allowNetwork: !!j.allowNetwork,
+          timeoutMs: j.sandboxTimeoutMs ?? 30000,
         },
         onEvent: (e) => log("agent", JSON.stringify(e)),
       });
@@ -1890,6 +1896,7 @@ async function route(req, res) {
     const jobId = submitAgent(task, {
       maxSteps: payload.maxSteps,
       budgetMs: agentBudgetMs(payload.budgetMs),
+      sandboxTimeoutMs: payload.sandboxTimeoutMs,
       allowWrite: !!payload.allowWrite,
       allowNetwork: !!payload.allowNetwork,
       workdir: workdirRes.path,
