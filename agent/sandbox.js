@@ -1,9 +1,14 @@
 // Sandboxed command execution for agent tools.
 //
-// Everything a tool runs executes inside an ephemeral container: no network,
-// read-only root, all capabilities dropped, no new privileges, capped memory,
-// CPUs and PIDs, and a hard timeout. The workspace is mounted read-only unless
-// writes were explicitly enabled, so a chat model cannot rewrite the host.
+// Everything a tool runs executes inside the active sandbox backend, resolved
+// from META_SANDBOX_BACKEND at call time (default `bwrap`): a user-namespace
+// jail wrapped in a systemd user scope with a persistent root, or — when the
+// operator opts in with `META_SANDBOX_BACKEND=docker` — the previous ephemeral
+// container. Both isolate the network, expose the workspace read-only unless
+// writes were explicitly enabled, cap memory, CPUs and PIDs, and enforce a
+// hard timeout, so a chat model cannot rewrite the host. The classify() write
+// gate is shared and unchanged across backends; only the execution stage
+// varies.
 //
 // This module exists because the agent loop feeds text produced by Meta AI into
 // a shell. Without this boundary that is remote code execution with a public web

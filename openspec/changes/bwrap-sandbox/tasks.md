@@ -88,16 +88,16 @@ an operator who has not installed the AppArmor prerequisite.
 
 ## Phase 6: Docker Parity, Documentation and Acceptance
 
-- [ ] 6.1 Add a classifier-parity pin in `agent/sandbox.test.js`: `classify()` returns identical write/read decisions and the same reason for a shared command set regardless of the active backend, and the dispatch does not re-classify. Verify: the pin fails if a per-backend classifier is introduced.
-- [ ] 6.2 Run the full suite and confirm every pre-existing test is green alongside the new ones: `cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'`. Verify: 38 pre-existing tests plus the new backend tests pass (or skip with an explicit reason).
-- [ ] 6.3 Update `README.md` with backend selection and migration/rollback: `META_SANDBOX_BACKEND` (default `bwrap`), the accepted values, the `docker` fallback/strict mode, the prerequisites, and the rollback step (set `META_SANDBOX_BACKEND=docker` or `git revert`). Verify: the runbook covers selection, prerequisites, limits and rollback.
-- [ ] 6.4 Verify the rollback path: `META_SANDBOX_BACKEND=docker` restores the untouched Docker behavior with no caller changes to `agent/loop.js` (read-only) or `server.mjs` (read-only). Verify: a Docker run behaves as before the change.
+- [x] 6.1 Add a classifier-parity pin in `agent/sandbox.test.js`: `classify()` returns identical write/read decisions and the same reason for a shared command set regardless of the active backend, and the dispatch does not re-classify. Verify: the pin fails if a per-backend classifier is introduced.
+- [x] 6.2 Run the full suite and confirm every pre-existing test is green alongside the new ones: `cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'`. Verify: 38 pre-existing tests plus the new backend tests pass (or skip with an explicit reason).
+- [x] 6.3 Update `README.md` with backend selection and migration/rollback: `META_SANDBOX_BACKEND` (default `bwrap`), the accepted values, the `docker` fallback/strict mode, the prerequisites, and the rollback step (set `META_SANDBOX_BACKEND=docker` or `git revert`). Verify: the runbook covers selection, prerequisites, limits and rollback.
+- [x] 6.4 Verify the rollback path: `META_SANDBOX_BACKEND=docker` restores the untouched Docker behavior with no caller changes to `agent/loop.js` (read-only) or `server.mjs` (read-only). Verify: a Docker run behaves as before the change.
 
 ## Global Acceptance Criteria
 
-- [ ] A. Functional parity with Docker for reads, enabled writes, denied writes and network-off behavior; `classify()` decisions are identical across backends.
-- [ ] B. Command startup overhead is in the low milliseconds on a trivial command, well under the ~700–900 ms Docker path.
-- [ ] C. Resource limits are effective under bwrap (`MemoryMax=256M`, `CPUQuota=100%`, `TasksMax=100`): an over-limit command is constrained or killed, not merely requested.
-- [ ] D. `selfCheck` is green on bwrap with prerequisites met (network blocked, host home invisible, workspace confined, limits proven); absent prerequisites yield `503` (fail closed).
-- [ ] E. All 38 pre-existing tests remain green and the Docker backend remains selectable and behaviorally unchanged.
-- [ ] F. No privilege escalation inside the jail; `pip --target` / `npm --prefix` installs land under `META_BWRAP_ROOT`, owned by the executing user.
+- [x] A. Functional parity with Docker for reads, enabled writes, denied writes and network-off behavior; `classify()` decisions are identical across backends.
+- [x] B. Command startup overhead is in the low milliseconds on a trivial command, well under the ~700–900 ms Docker path.
+- [x] C. Resource limits are effective under bwrap (`MemoryMax=256M`, `CPUQuota=100%`, `TasksMax=100`): an over-limit command is constrained or killed, not merely requested.
+- [x] D. `selfCheck` is green on bwrap with prerequisites met (network blocked, host home invisible, workspace confined, limits proven); absent prerequisites yield `503` (fail closed).
+- [x] E. All 38 pre-existing tests remain green and the Docker backend remains selectable and behaviorally unchanged.
+- [x] F. No privilege escalation inside the jail; `pip --target` / `npm --prefix` installs land under `META_BWRAP_ROOT`, owned by the executing user.

@@ -70,7 +70,8 @@ the profile, so this is a one-time action.
 | `META_AGENT_BUDGET_MS` | `900000` | default wall-clock budget of an agent job; the per-request `budgetMs` is clamped to 30s..1h |
 | `META_SANDBOX_WORKDIR_ROOTS` | `/home/test/test` | colon-separated roots; an agent `workdir` must realpath inside one of them or the request is refused |
 | `META_SANDBOX_WORKDIR` | `/home/test/test` | workspace mounted at `/workspace` when the request carries no `workdir`; validated against the roots too |
-| `META_SANDBOX_IMAGE` | `meta-sandbox:1` | Docker image for agent commands. Build: `docker build -f agent/Dockerfile.sandbox -t meta-sandbox:1 agent/` |
+| `META_SANDBOX_BACKEND` | `bwrap` | agent command backend: `bwrap` (user-namespace jail, default) or `docker` (previous container path); any other value fails closed (see *Sandbox backends* below) |
+| `META_SANDBOX_IMAGE` | `meta-sandbox:1` | Docker image for agent commands (docker backend only). Build: `docker build -f agent/Dockerfile.sandbox -t meta-sandbox:1 agent/` |
 
 ## Session continuity
 
@@ -127,8 +128,9 @@ on a summary the loop never reads and delete the thread mid-mission.
 ## Agent: POST /v1/agent
 
 Meta AI plans, the broker executes. The model is framed to answer with a shell
-command in a code block tagged `sh`; the broker runs it in an ephemeral sandbox
-and feeds the output back, repeating until the model answers in plain text.
+command in a code block tagged `sh`; the broker runs it inside the active
+sandbox backend and feeds the output back, repeating until the model answers in
+plain text.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8055/v1/agent -d '{
@@ -147,7 +149,7 @@ Request fields:
 | `maxSteps` | `8` | step budget, clamped to 1..32 |
 | `budgetMs` | `META_AGENT_BUDGET_MS` (900000) | wall-clock budget, clamped to 30000..3600000 |
 | `allowWrite` | `false` | mount the workspace read-write; requires `allowWriteAck:true` as an explicit confirmation |
-| `allowNetwork` | `false` | give the container network access (`bridge` instead of `none`) |
+| `allowNetwork` | `false` | grant network egress (docker: `bridge` instead of `none`; bwrap: the host network namespace) |
 | `workdir` | `META_SANDBOX_WORKDIR` | host directory mounted at `/workspace`; must `realpath` inside `META_SANDBOX_WORKDIR_ROOTS` or the route answers **400** |
 
 The poll response carries the mission result:
@@ -177,10 +179,12 @@ agent jobs, never as raw chat.
 Execution is **deny-by-default**: commands are classified against a read-only
 whitelist (every pipe segment must pass; substitution, backticks, `find
 -exec`/`-delete`, `xargs` and `awk/sed system(...)` all classify as writes),
-and the container runs `--network none`, `--read-only`, `--cap-drop=ALL`,
-`--security-opt=no-new-privileges`, with capped memory/CPU/PIDs and a hard
-timeout on both sides. Writes inside the container require the explicit
-`allowWrite` + `allowWriteAck` pair.
+and the active backend isolates the network by default (`--network none` for
+docker, `--unshare-all` for bwrap), exposes the workspace read-only, and caps
+memory/CPU/PIDs behind a hard timeout on both sides; the docker container
+additionally runs `--read-only`, `--cap-drop=ALL` and
+`--security-opt=no-new-privileges`. Writes require the explicit `allowWrite` +
+`allowWriteAck` pair.
 
 The agent modules carry their own regression suite (zero dependencies):
 
@@ -192,6 +196,41 @@ The suite pins the parser, the classifier, the loop and the sandbox
 self-check; the self-check test skips itself when the Docker daemon is
 unreachable. Note that this Node's runner rejects directory arguments
 (`node --test agent/`), so pass files or a glob.
+
+## Sandbox backends: selection, limits and rollback
+
+Agent commands run under the backend selected by `META_SANDBOX_BACKEND`:
+
+| Value | Backend | Posture |
+|---|---|---|
+| unset or `bwrap` (default) | user-namespace jail | `bwrap` inside a `systemd-run --user --scope` resource envelope, with a persistent root (see below) |
+| `docker` | ephemeral container | the previous Docker path: `docker run --rm` with the `meta-sandbox:1` image |
+| anything else | — | fails closed: no command runs, and the self-check reports the rejected value plus the accepted set |
+
+Selection is an explicit operator decision with **no silent fallback**: an
+invalid value refuses to execute instead of running model-authored text under a
+backend the operator never chose. Callers (`agent/loop.js`, `server.mjs`) are
+backend-agnostic, so switching backends needs no code change.
+
+**Prerequisites** (bwrap): the `bwrap` binary, a usable systemd user session
+for `systemd-run --user --scope`, and the AppArmor profile under *AppArmor
+host prerequisite* below. Any missing prerequisite fails the self-check
+closed, so `POST /v1/agent` answers **503** — commands never run unconstrained.
+The docker backend needs only a reachable Docker daemon and never requires the
+bwrap prerequisites.
+
+**Limits** (bwrap): the systemd user scope enforces `MemoryMax=256M`,
+`CPUQuota=100%` (one CPU) and `TasksMax=100` — the equivalents of Docker's
+`--memory 256m --cpus 1 --pids-limit 100` — plus the same double timeout brake
+(inner `timeout` inside the jail, host-side backstop killing the transient
+scope). Without `systemd-run` or the user session the run is refused rather
+than executed unlimited.
+
+**Rollback**: set `META_SANDBOX_BACKEND=docker` and restart the broker to get
+the previous container behavior back — no code or caller change. For a
+code-level rollback, `git revert` the bwrap change set; the Docker path was
+extracted intact. The AppArmor profile is optional in docker mode (leave it or
+remove it) and the global sysctl was never modified.
 
 ## bwrap sandbox: persistent root, host prerequisites, installs
 

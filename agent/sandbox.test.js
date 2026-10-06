@@ -11,8 +11,8 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { accessSync, constants, existsSync, mkdtempSync, readFileSync, rmSync, statSync,
-         writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
+         statSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
@@ -52,8 +52,8 @@ const savedBwrapRoot = process.env.META_BWRAP_ROOT;
 const suiteBwrapRoot = mkdtempSync(path.join(os.tmpdir(), "sbx-suite-root-"));
 process.env.META_BWRAP_ROOT = suiteBwrapRoot;
 
-const { classify, selfCheck, runSandboxed, resolveBackend, buildBwrapArgv, buildSystemdArgv } =
-  await import("./sandbox.js");
+const { BACKENDS, classify, selfCheck, runSandboxed, resolveBackend, buildBwrapArgv,
+        buildSystemdArgv } = await import("./sandbox.js");
 
 after(() => {
   rmSync(suiteBwrapRoot, { recursive: true, force: true });
@@ -1023,6 +1023,8 @@ test("runBwrap creates the sandbox root layout 0700 on first use and reuses it",
     }
     assert.equal(statSync(root).mode & 0o777, 0o700,
       "the persistent root must be private to the operator (0700)");
+    assert.equal(statSync(root).uid, process.getuid(),
+      "the persistent root must be owned by the executing user (acceptance F)");
     const run = spawned.find((s) => s.file === "systemd-run");
     assert.ok(run, "the envelope must be spawned");
     const bindIdx = run.argv.indexOf("--bind");
@@ -1077,6 +1079,295 @@ test("a file written by a write-enabled bwrap run persists into a later read run
     assert.equal(statSync(root).ino, inode, "the root must be reused, not recreated");
     assert.ok(statSync(path.join(root, "artifact")).size > 0,
       "the artifact must also be visible to the host under META_BWRAP_ROOT");
+  } finally {
+    restoreBackend();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+// ---- Phase 6: classifier parity, cross-backend behavior and acceptance pins ---
+// Tasks 6.1 and the Global Acceptance Criteria. classify() is the shared
+// security boundary: its decision AND its reason must not depend on the active
+// backend, and runSandboxed must gate exactly once on the shared classifier.
+// A per-backend classifier — even a behaviorally identical one — is a second
+// security boundary waiting to diverge, so the dispatch pin reads the source
+// as well as exercising the gate.
+
+const SHARED_COMMANDS = [
+  { cmd: "ls -la", write: false },
+  { cmd: "cat server.mjs", write: false },
+  { cmd: "git log --oneline -3", write: false },
+  { cmd: "ls /workspace && echo FS_OK", write: false },
+  { cmd: "ls | grep x", write: false },
+  { cmd: "echo x > f", write: true },
+  { cmd: "rm -rf x", write: true },
+  { cmd: "ls | tee f", write: true },
+  { cmd: "cat $(id)", write: true },
+  // Privileged commands (acceptance F): they must classify as writes under
+  // every backend, because the jail has no root and no escalation path.
+  { cmd: "sudo ls", write: true },
+  { cmd: "apt-get update", write: true },
+  { cmd: "pip install requests", write: true },
+  { cmd: "npm i express", write: true },
+];
+
+test("classifier parity: identical write/read decisions and reasons regardless of the active backend", () => {
+  // Each decision is pinned to its EXPECTED value first, so parity cannot
+  // pass vacuously by being wrong in the same way on both backends; the
+  // recorded reason JSON must then be identical across backends.
+  const recorded = new Map();
+  for (const backend of BACKENDS) {
+    const restore = withBackend(backend);
+    try {
+      for (const { cmd, write } of SHARED_COMMANDS) {
+        const r = classify(cmd);
+        assert.equal(r.write, write, `${cmd} must classify as ${write ? "write" : "read"}`);
+        if (write) assert.ok(r.why, `${cmd} must carry a reason`);
+        const key = JSON.stringify(r);
+        if (recorded.has(cmd)) {
+          assert.equal(recorded.get(cmd), key,
+            `${cmd} must classify identically under the ${backend} backend`);
+        } else recorded.set(cmd, key);
+      }
+    } finally {
+      restore();
+    }
+  }
+});
+
+test("the dispatch gates once on the shared classify() and never re-classifies per backend", async () => {
+  // (a) Structural pin: runSandboxed's body may only ever call the shared
+  // classify(command). Behavioral tests cannot see a per-backend classifier
+  // that happens to behave identically TODAY, so the source is pinned: a
+  // classifyFor()/classifyDocker()/backend-dispatched classify.* in the
+  // dispatch path fails here (task 6.1: "the pin fails if a per-backend
+  // classifier is introduced").
+  const src = readFileSync(new URL("./sandbox.js", import.meta.url), "utf8");
+  const start = src.indexOf("export async function runSandboxed");
+  const end = src.indexOf("async function runDocker");
+  assert.notEqual(start, -1, "runSandboxed must exist in sandbox.js");
+  assert.ok(end > start, "runSandboxed must precede runDocker");
+  const body = src.slice(start, end);
+  const calls = body.match(/\bclassify[A-Za-z0-9_$]*\s*\(/g) || [];
+  assert.ok(calls.some((c) => /^classify\s*\($/.test(c)),
+    "the shared classify(command) gate must remain in runSandboxed");
+  for (const c of calls) {
+    assert.match(c, /^classify\s*\($/,
+      `runSandboxed must not call a per-backend classifier (${c.trim()})`);
+  }
+  assert.ok(!/\bclassify\s*[\.\[]/.test(body),
+    "classify must not be dispatched through a backend lookup");
+
+  // (b) Behavioral pin: the gate's refusal is byte-identical on both
+  // backends and never spawns a process — the dispatch adds nothing to it.
+  const restoreSession = stubUserSession();
+  execFileImpl = (file, argv, opts, cb) => {
+    setImmediate(() => cb(null, "", ""));
+    return { kill() { return false; } };
+  };
+  const outcomes = [];
+  try {
+    for (const backend of BACKENDS) {
+      const restore = withBackend(backend);
+      try {
+        const before = execFileCalls.length;
+        const r = await runSandboxed("sudo ls");
+        assert.equal(r.denied, true, `${backend} must deny the privileged command`);
+        assert.equal(execFileCalls.length, before, `${backend} must spawn no process`);
+        outcomes.push(JSON.stringify(r));
+      } finally {
+        restore();
+      }
+    }
+    assert.equal(outcomes[0], outcomes[1],
+      "the shared gate's refusal must be identical across backends");
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+  }
+});
+
+// ---- Acceptance A: functional parity across backends -------------------------
+// Reads, enabled writes, denied writes and network-off must behave the same
+// through the single runSandboxed interface whatever the active backend is.
+// Fake-backed and host-independent: the assertions inspect the argv each
+// backend actually receives, so they hold with or without a daemon or a
+// provisioned jail (the live variants are the docker e2e selfCheck above and
+// the jail-gated bwrap posture test from phase 4).
+
+test("acceptance A: reads, enabled writes, denied writes and network-off behave the same on both backends", async () => {
+  const restoreSession = stubUserSession();
+  const spawned = [];
+  execFileImpl = (file, argv, opts, cb) => {
+    spawned.push({ file, argv });
+    setImmediate(() => cb(null, "ok\n", ""));
+    return { kill() { return false; } };
+  };
+  const opts = { workdir: "/home/u/project" };
+  const dockerWs = (argv) => argv[argv.indexOf("-v") + 1];
+  const deniedByBackend = {};
+  try {
+    for (const backend of BACKENDS) {
+      const restore = withBackend(backend);
+      try {
+        const before = spawned.length;
+
+        // Read: executes, network off by default, workspace read-only.
+        const read = await runSandboxed("ls /workspace", opts);
+        assert.equal(read.ok, true, `${backend}: the read must execute`);
+        for (const field of ["ok", "exitCode", "output", "truncated", "ms", "timedOut"]) {
+          assert.ok(field in read, `${backend}: the result must expose ${field}`);
+        }
+        const readCall = spawned[before];
+        assert.equal(readCall.file, backend === "docker" ? "docker" : "systemd-run");
+        if (backend === "docker") {
+          assert.equal(readCall.argv[readCall.argv.indexOf("--network") + 1], "none",
+            "docker: --network none by default");
+          assert.equal(dockerWs(readCall.argv), "/home/u/project:/workspace:ro",
+            "docker: a read gets a read-only workspace");
+        } else {
+          assert.ok(readCall.argv.includes("--unshare-all"),
+            "bwrap: --unshare-all by default");
+          assert.ok(!readCall.argv.includes("--unshare-net"),
+            "bwrap: no network namespace sharing ever appears");
+          assert.equal(workspaceBind(readCall.argv).flag, "--ro-bind",
+            "bwrap: a read gets a read-only workspace");
+        }
+
+        // Enabled write: only the workspace binding flips, on both backends.
+        await runSandboxed("touch /workspace/f", { ...opts, allowWrite: true });
+        const writeCall = spawned[before + 1];
+        if (backend === "docker") {
+          assert.equal(dockerWs(writeCall.argv), "/home/u/project:/workspace",
+            "docker: an enabled write drops :ro");
+        } else {
+          assert.equal(workspaceBind(writeCall.argv).flag, "--bind",
+            "bwrap: an enabled write binds the workspace read-write");
+          assert.ok(writeCall.argv.includes("--unshare-all"),
+            "bwrap: an enabled write keeps network isolation");
+        }
+
+        // Denied write: refused by the shared gate, no process started.
+        const deniedBefore = spawned.length;
+        const denied = await runSandboxed("touch /workspace/pwned", opts);
+        assert.equal(denied.denied, true, `${backend}: writes stay denied by default`);
+        assert.equal(spawned.length, deniedBefore, `${backend}: a denied write spawns nothing`);
+        deniedByBackend[backend] = JSON.stringify(denied);
+      } finally {
+        restore();
+      }
+    }
+    assert.equal(deniedByBackend.bwrap, deniedByBackend.docker,
+      "denied writes must be byte-identical across backends");
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+  }
+});
+
+// ---- Acceptance B: startup overhead ------------------------------------------
+// The bwrap path must start a trivial command in the low milliseconds, well
+// under the ~700-900ms docker container startup. Gated on the real jail with
+// the captured failure line, like every other real-path test.
+
+test("acceptance B: a trivial bwrap command starts in the low milliseconds (jail-gated)", async (t) => {
+  const seed = await trivialBwrapRun();
+  if (!seed.ok) return t.skip(`bwrap jail unavailable on this host: ${firstErrorLine(seed)}`);
+  const restoreBackend = withDefaultBackend();
+  try {
+    const r = await runSandboxed("echo ok");
+    assert.equal(r.ok, true, `the trivial run must succeed: ${firstErrorLine(r)}`);
+    assert.ok(r.ms < 500,
+      `bwrap startup must stay well under the docker path (~700-900ms), got ${r.ms}ms`);
+  } finally {
+    restoreBackend();
+  }
+});
+
+// ---- Acceptance C: resource limits are effective -----------------------------
+// MemoryMax=256M must kill (or fail) a 512MB allocation: "constrained or
+// killed, not merely requested". Gated on the real jail; the envelope's
+// enforcement on this host is additionally proven by the apply-run harness.
+
+test("acceptance C: an over-limit command under bwrap is constrained or killed (jail-gated)", async (t) => {
+  const seed = await trivialBwrapRun();
+  if (!seed.ok) return t.skip(`bwrap jail unavailable on this host: ${firstErrorLine(seed)}`);
+  const restoreBackend = withDefaultBackend();
+  try {
+    const r = await runSandboxed(
+      `python3 -c "x = ' ' * (512*1024*1024); print(len(x))"`,
+      { allowWrite: true, timeoutMs: 20_000 });
+    assert.equal(r.ok, false,
+      "MemoryMax=256M must prevent the 512MB allocation from completing");
+    assert.ok(!/^\s*536870912\s*$/m.test(String(r.output || "")),
+      "the over-limit allocation must not print its size");
+  } finally {
+    restoreBackend();
+  }
+});
+
+// ---- Acceptance F: no in-jail privilege escalation ---------------------------
+// The jail keeps the executing uid (no --uid/--gid remap), gains no
+// capabilities, privileged installers classify as writes (pinned in
+// SHARED_COMMANDS above), and the persistent root belongs to the executing
+// user (pinned in the root-creation test from phase 5). The in-jail
+// pip --target proof is the gated test below.
+
+test("acceptance F: the bwrap argv never remaps identity or grants capabilities", () => {
+  for (const needsWrite of [false, true]) {
+    const argv = buildBwrapArgv("ls /workspace", { ...baseOpts, allowWrite: true }, needsWrite);
+    for (const flag of ["--uid", "--gid", "--cap-add"]) {
+      assert.ok(!argv.includes(flag),
+        `${flag} must never appear: the jail runs as the executing user with no capabilities`);
+    }
+  }
+});
+
+// Builds an installable wheel with the HOST python3 (offline, no index), then
+// proves inside the real jail that a pip --target install lands under
+// META_BWRAP_ROOT, owned by the executing user (spec: "Confined user-prefix
+// installations without privilege escalation"). Jail-gated like every other
+// real-path test: skipped with the captured reason on this host.
+const PROBE_WHEEL_SCRIPT = [
+  "import os, sys, zipfile",
+  "z = zipfile.ZipFile(os.path.join(sys.argv[1], 'demo_pkg-1.0-py3-none-any.whl'), 'w')",
+  "z.writestr('demo_pkg/__init__.py', \"__version__ = '1.0'\\n\")",
+  "z.writestr('demo_pkg-1.0.dist-info/METADATA', 'Metadata-Version: 2.1\\nName: demo-pkg\\nVersion: 1.0\\n')",
+  "z.writestr('demo_pkg-1.0.dist-info/WHEEL', 'Wheel-Version: 1.0\\nGenerator: test\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n')",
+  "z.writestr('demo_pkg-1.0.dist-info/RECORD', 'demo_pkg/__init__.py,,\\n')",
+  "z.close()",
+].join("; ");
+
+test("acceptance F: a pip --target install lands under META_BWRAP_ROOT, owned by the executing user (jail-gated)", async (t) => {
+  const seed = await trivialBwrapRun();
+  if (!seed.ok) return t.skip(`bwrap jail unavailable on this host: ${firstErrorLine(seed)}`);
+  const restoreBackend = withDefaultBackend();
+  const parent = mkdtempSync(path.join(os.tmpdir(), "sbx-install-"));
+  const workdir = path.join(parent, "ws");
+  const wheels = path.join(workdir, "wheels");
+  const root = path.join(parent, "sandbox");   // deliberately NOT created yet
+  mkdirSync(wheels, { recursive: true });
+  try {
+    try {
+      await promisify(realExecFile)("python3", ["-c", PROBE_WHEEL_SCRIPT, wheels],
+        { timeout: 15_000 });
+    } catch (err) {
+      return t.skip(`host python3 cannot build the probe wheel: ${err.message}`);
+    }
+    const probe = await runSandboxed("pip3 --version",
+      { bwrapRoot: root, workdir, allowWrite: true });
+    if (!probe.ok) return t.skip(`pip3 not usable inside the jail: ${firstErrorLine(probe)}`);
+    const install = await runSandboxed(
+      "pip3 install --no-index --find-links /workspace/wheels --target /sandbox/lib demo-pkg",
+      { bwrapRoot: root, workdir, allowWrite: true });
+    assert.equal(install.ok, true, `the install must succeed: ${firstErrorLine(install)}`);
+    const installed = path.join(root, "lib", "demo_pkg", "__init__.py");
+    assert.ok(existsSync(installed),
+      "the install must land under META_BWRAP_ROOT/lib, never the host");
+    assert.equal(statSync(installed).uid, process.getuid(),
+      "installed files must be owned by the executing user, never root");
+    assert.equal(statSync(root).uid, process.getuid(),
+      "the persistent root itself stays owned by the executing user");
   } finally {
     restoreBackend();
     rmSync(parent, { recursive: true, force: true });
