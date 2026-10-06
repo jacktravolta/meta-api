@@ -11,9 +11,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import os from "node:os";
+import path from "node:path";
 
 // ---- execFile spy seam -------------------------------------------------------
 // `sandbox.js` imports `execFile` as a named ESM import, and Node snapshots a
@@ -25,12 +26,18 @@ import os from "node:os";
 // are unaffected; the positive-control test fails if this seam ever stops
 // intercepting. Design's Testing Strategy: "an injected execFile seam or a
 // stubbed module".
+//
+// The wrapper delegates to `execFileImpl`, so a test may temporarily swap in a
+// FAKE implementation to pin argv/timeout/result wiring without spawning: the
+// spy still records every call, and each test restores the real function in a
+// `finally` so no fake leaks into a later test.
 const childProcess = createRequire(import.meta.url)("node:child_process");
 const realExecFile = childProcess.execFile;
 const execFileCalls = [];
+let execFileImpl = realExecFile;
 childProcess.execFile = (...args) => {
   execFileCalls.push(args);
-  return realExecFile(...args);
+  return execFileImpl(...args);
 };
 
 const { classify, selfCheck, runSandboxed, resolveBackend, buildBwrapArgv, buildSystemdArgv } =
@@ -175,10 +182,20 @@ test("a policy-denied write returns denied:true and starts no process", async ()
 test("the spy seam intercepts sandbox spawns (positive control)", async () => {
   // Without this, the two tests above would pass vacuously if the seam broke:
   // a spy that never fires always sees zero calls.
-  const before = execFileCalls.length;
-  await runSandboxed("ls /workspace");
-  assert.ok(execFileCalls.length > before, "the execFile spy must observe a real run");
-  assert.equal(execFileCalls[before][0], "docker", "the recorded spawn must be the sandbox");
+  // Phase 3 landed the bwrap dispatch, so the default arm is now `bwrap`; this
+  // control pins the docker arm explicitly to keep proving the seam sees a
+  // real spawn. The bwrap arm gets its own (fake-backed) pin in phase 3 below.
+  const saved = process.env.META_SANDBOX_BACKEND;
+  process.env.META_SANDBOX_BACKEND = "docker";
+  try {
+    const before = execFileCalls.length;
+    await runSandboxed("ls /workspace");
+    assert.ok(execFileCalls.length > before, "the execFile spy must observe a real run");
+    assert.equal(execFileCalls[before][0], "docker", "the recorded spawn must be the sandbox");
+  } finally {
+    if (saved === undefined) delete process.env.META_SANDBOX_BACKEND;
+    else process.env.META_SANDBOX_BACKEND = saved;
+  }
 });
 
 // ---- End-to-end selfCheck (docker) -------------------------------------------
@@ -192,15 +209,26 @@ async function dockerReachable() {
 
 test("selfCheck enforces the whole default posture", async (t) => {
   if (!(await dockerReachable())) return t.skip("docker no disponible");
-  const r = await selfCheck();
-  assert.equal(r.writeBlocked, true);       // the write attempt was refused by policy
-  assert.equal(r.fsRead, true);             // the workspace mounted and is readable
-  assert.equal(r.networkBlocked, true);     // --network none: the fetch cannot leave
-  assert.equal(r.hostHomeInvisible, true);  // container hostname, never the host's
-  assert.equal(r.ok, true);
-  // The denied write probe never executed, so the host workspace stays clean.
-  const defaultWorkdir = process.env.META_SANDBOX_WORKDIR || "/home/test/test";
-  assert.equal(existsSync(defaultWorkdir + "/.sandbox-probe"), false);
+  // selfCheck only becomes backend-aware in phase 4; until then its probes
+  // dispatch through the active backend, and the default is bwrap since the
+  // phase-3 dispatch landed. Pin `docker` so this docker-posture e2e keeps
+  // exercising docker (and stays valid after phase 4 delegates by backend).
+  const saved = process.env.META_SANDBOX_BACKEND;
+  process.env.META_SANDBOX_BACKEND = "docker";
+  try {
+    const r = await selfCheck();
+    assert.equal(r.writeBlocked, true);       // the write attempt was refused by policy
+    assert.equal(r.fsRead, true);             // the workspace mounted and is readable
+    assert.equal(r.networkBlocked, true);     // --network none: the fetch cannot leave
+    assert.equal(r.hostHomeInvisible, true);  // container hostname, never the host's
+    assert.equal(r.ok, true);
+    // The denied write probe never executed, so the host workspace stays clean.
+    const defaultWorkdir = process.env.META_SANDBOX_WORKDIR || "/home/test/test";
+    assert.equal(existsSync(defaultWorkdir + "/.sandbox-probe"), false);
+  } finally {
+    if (saved === undefined) delete process.env.META_SANDBOX_BACKEND;
+    else process.env.META_SANDBOX_BACKEND = saved;
+  }
 });
 
 // ---- Pure argv builders: bwrap jail ------------------------------------------
@@ -382,8 +410,11 @@ test("bwrap argv follows the design's build-time sequence exactly", () => {
 test("buildSystemdArgv wraps the bwrap argv in the default resource envelope", () => {
   const bwrapArgv = ["bwrap", "--die-with-parent", "--unshare-all"];
   const argv = buildSystemdArgv(bwrapArgv, baseOpts, "meta-sbx-0badc0de");
+  // Flags only: execFile("systemd-run", argv) supplies the program name as
+  // argv[0], so a leading "systemd-run" here would double it and the child
+  // would swallow the unit/scope options as its command operand.
   assert.deepEqual(argv, [
-    "systemd-run", "--user", "--scope", "-q",
+    "--user", "--scope", "-q",
     "--unit", "meta-sbx-0badc0de",
     "-p", "MemoryMax=256M",
     "-p", "CPUQuota=100%",
@@ -413,5 +444,6 @@ test("buildSystemdArgv keeps the bwrap argv verbatim behind the -- separator", (
   assert.equal(sep, argv.length - bwrapArgv.length - 1,
     "-- must sit immediately before the bwrap argv");
   assert.deepEqual(argv.slice(sep + 1), bwrapArgv);
-  assert.equal(argv[0], "systemd-run");
+  assert.equal(argv[0], "--user",
+    "the builder returns flags only; execFile prepends the program name");
 });

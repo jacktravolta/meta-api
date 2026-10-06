@@ -172,8 +172,11 @@ export function buildSystemdArgv(bwrapArgv, opts = {}, unit) {
   const cpus = String(o.cpus).includes("%")
     ? String(o.cpus)
     : `${Math.round(Number(o.cpus) * 100)}%`;
+  // NOTE: the program name is NOT part of this array — execFile prepends
+  // `file` as argv[0], so a leading "systemd-run" here would make the child
+  // treat it as the command operand and drop the unit/scope options.
   return [
-    "systemd-run", "--user", "--scope", "-q",
+    "--user", "--scope", "-q",
     "--unit", unit,
     "-p", `MemoryMax=${memory}`,
     "-p", `CPUQuota=${cpus}`,
