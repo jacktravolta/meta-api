@@ -1,0 +1,14 @@
+const l = await (await fetch("http://127.0.0.1:9233/json")).json();
+const t = l.find((x) => (x.url || "").includes("web.whatsapp.com"));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+let i = 1; const p = new Map();
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && p.has(m.id)) { p.get(m.id)(m.result?.result?.value); p.delete(m.id); } };
+const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.send(JSON.stringify({ id, method: m, params: pa })); });
+await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
+const q = async (e) => await call("Runtime.evaluate", { expression: e, returnByValue: true });
+console.log("audios en el chat:", await q(`document.querySelectorAll('#main audio').length`));
+console.log("blobs en el chat:", await q(`document.querySelectorAll('#main [src^="blob:"], #main [href^="blob:"]').length`));
+console.log("botones play/audio:", await q(`JSON.stringify([...document.querySelectorAll('#main [aria-label]')].map(e=>e.getAttribute('aria-label')).filter(a=>/audio|play|reproduc|voz/i.test(a)).slice(0,8))`));
+console.log("ultimas 3 filas - HTML resumido:");
+console.log(await q(`JSON.stringify([...document.querySelectorAll('[role=row]')].slice(-3).map(f => ({ txt:(f.innerText||'').replace(/\\n/g,' | ').slice(0,60), tags:[...f.querySelectorAll('*')].map(e=>e.tagName+ (e.getAttribute('data-testid')?'#dt='+e.getAttribute('data-testid'):'') + (e.getAttribute('aria-label')?'#al='+e.getAttribute('aria-label').slice(0,25):'')).filter(s=>/audio|AUDIO|PLAY|BUTTON|SPAN/i.test(s)).slice(0,6) })))`));
+process.exit(0);
