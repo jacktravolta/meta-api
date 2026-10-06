@@ -15,8 +15,9 @@
    (en cualquier forma: `donbot`, `Don Bot`, `DON BOT`, `[don bot]`).
 5. Toda respuesta del agente se antepone con **`[LALO]`** y luego va la respuesta.
 6. **Canal válido** = el chat de transcripción **más reciente**.
-7. **PERSISTENCIA**: si el usuario abre otro chat, el agente descubre el canal nuevo automáticamente
-   y vuelve a declarar estas reglas.
+7. **PERSISTENCIA**: el canal actual se guarda en `relay/state/canal.json`; si el usuario abre otro
+   chat de transcripción, ejecutar `./relay/operar.sh channel` para descubrirlo y volver a declarar
+   estas reglas.
 
 **Instrucciones guardadas en**: `docs/prompt-inicial.md` + Engram de Don Bot
 (topic `protocol/meta-dictation-don-bot`).
@@ -31,9 +32,9 @@
 |---|---|
 | `canal.mjs` | Descubre el chat de transcripción más reciente → `canal.json` |
 | Bootstrap | Al entrar a un canal nuevo, publica estas reglas una vez (`bootstrapped`) |
-| `vigia-v7.mjs` | Detecta dictados (modo "Meta callada" opcional: solo filas del usuario) |
-| `enviar-hilo.mjs` | Antepone `[LALO]` a cada respuesta y la publica en el hilo |
-| `es-donbot.mjs` | Detección robusta de la invocación |
+| `relay/vigia-v7.mjs` | Detecta dictados (modo "Meta callada" opcional: solo filas del usuario) |
+| `relay/enviar-hilo.mjs` | Antepone `[LALO]` a cada respuesta y la publica en el hilo |
+| `relay/es-donbot.mjs` | Detección robusta de la invocación |
 | Detector de suplantación | Marca prefijos `[LALO]` no emitidos por el agente |
-| `leer-todo.mjs` | Verifica cuántas firmas `[LALO]` son reales y cuántas falsas |
+| `relay/tools/verify-signatures.mjs` | Verifica cuántas firmas `[LALO]` son reales y cuántas falsas |
 | `docs/meta-dictation-bridge.md` | Documentación técnica completa del puente |

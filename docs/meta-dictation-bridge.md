@@ -1,117 +1,91 @@
-# Meta dictation bridge ("Don Bot")
+# Meta dictation bridge (Don Bot)
 
-Status: working as of 2026-10-06.
+Status: operational toolchain is versioned in `relay/`; scraping is **stopped by
+default after maintenance** and must be started explicitly.
 
-## Purpose
+## Quick start
 
-Turn a Meta AI chat thread into a **bidirectional voice channel**:
+From any terminal on this machine:
 
-1. The user dictates with voice into the thread.
-2. Meta AI is instructed to **transcribe only** — it must not answer.
-3. The bridge watches the thread DOM, lifts each new user dictation, and wakes the
-   console agent.
-4. The agent answers (in the console, and/or back into the thread).
+```bash
+cd /home/test/test/meta-api
+./relay/operar.sh start       # starts the broker, opens Meta and starts the watcher
+./relay/operar.sh watch       # follows the watcher logs in this terminal
+```
 
-## Roles
+`start` opens the broker's saved Meta channel and starts the systemd watcher;
+`watch` tails its journal and may be closed without stopping the service. The
+watcher process exits after one unanswered Don Bot invocation or 60 minutes of
+silence, and systemd restarts it after five seconds. To inspect pending
+invocations without starting the watcher, run
+`./relay/operar.sh pending`. To stop all scraping and prevent automatic startup
+at the next login, run `./relay/operar.sh stop`. A later console can run `start`
+again without reinstalling anything.
 
-| Piece | Role |
-|---|---|
-| Meta AI thread `e04189db-43e4-4a44-84a4-389566e00d0a` | Transcribes voice. Must **not** answer. |
-| Broker (`meta-api`, CDP on port `9233`) | Keeps the logged-in Chrome instance that owns the thread tab. |
-| Bridge scripts (`/tmp/opencode/*.mjs`) | Watch the thread and post messages. |
-| Console agent | Reads dictations, answers, and asks follow-up questions. |
+Install or refresh the user services once with `./relay/operar.sh install`. It
+copies the broker/watcher units and tracked drop-ins without enabling or starting
+them. `start` explicitly enables and starts both. The units require Node 22, Chrome Beta, and a logged-in
+profile at `~/.config/google-chrome-beta-debug`. The first login must be completed
+manually in that profile. The unit and service commands are documented in
+[`README.md`](../README.md).
 
-## Protocol
+## Durable state and privacy
 
-- **Keyword `don bot`** (transcription variants: `donbot`, `son bot`, `Don Bot`) marks
-  a dictation as a **direct order for the console agent**; Meta is ignored.
-- **Channel**: the Meta thread. Agent messages are prefixed with `[Don Bot]`.
-- On every answer, the agent reminds Meta **not to intervene** ("no te metas, solo transcribe").
-- The agent answers in the console first, and relays to the thread when the protocol
-  (or the user) requires it.
+- `state.json` remembers the broker's current Meta thread URL across restarts.
+- `relay/state/canal.json` remembers the selected transcription channel;
+  `relay/canal.example.json` seeds the known channel if local state is missing.
+- `relay/state/` is ignored by Git because it contains dictation history,
+  duplicate-detection data, and authenticity logs. Do not commit it.
+- The Chrome profile contains the Meta login and is outside the repository.
+- Image attachments now live under `~/.local/state/meta-api/images` (or the
+  configured `META_IMAGES_DIR`), not `/tmp/opencode`.
+- Raw thread dumps and screenshots can contain private dictations. The diagnostic
+  dump tool writes to stdout only; use a private temporary file and remove it
+  immediately if a command needs a file.
 
-## Bootstrap (primer ingreso al canal)
+## Channel protocol
 
-The first time the watcher enters a channel it posts the **channel rules** to Meta
-(`/tmp/opencode/reglas.txt`), automatically and only once:
-
-1. Meta / Doña Meta: **only transcribe** what the user says; do not answer/opine/interrupt unless
-   the user explicitly says `meta`. Signature: `[DOÑA META]`.
-2. **Single output per turn** — never respond *and* transcribe in the same turn (that duplicated
-   the agent's messages).
-3. **No signature forgery** — never use the `[DON BOT]` signature; it belongs to the agent only.
-4. The agent acts **only** when the user mentions **`Don Bot`** (any form: `donbot`, `Don Bot`,
-   `DON BOT`, `[don bot]`). Signature: `[DON BOT]`.
-5. Valid channel = the most recent transcription chat.
-6. **Persistence** — if the user opens another chat, the agent rediscovers the channel and
-   re-declares these rules.
-7. **Transcriber mode on entry** — on entering the channel the agent tells Meta to switch to
-   transcriber mode.
-8. **`[Meta]`** answers **only when named**, and always as `[Meta] + respuesta`.
-9. **`[Don Bot]`** answers **when invoked**, and always in the channel that was started.
-
-Items 7-9 are the listening prompt added by the user on 2026-10-06; `reglas.txt` carries them as
-`(8)`, `(9)`, `(10)`.
-
-`canal.json` carries `bootstrapped: true|false`; `canal.mjs` resets it to `false` when the
-channel id changes, so a **new channel gets the rules again**. The rules are posted by the
-watcher at startup, before it starts reading.
+- The active thread is the most recent transcription chat, currently seeded as
+  `dfa0f5b7` (full id: `dfa0f5b7-6a4f-4475-bf6d-fcedca96c994`).
+- `./relay/operar.sh channel` rediscovers the newest chat titled for audio/video
+  transcription and updates the local channel state.
+- The user invokes the console agent only by saying **Don Bot**. Voice variants
+  such as `donbot`, `dombot`, and `son bot` are covered by
+  [`relay/es-donbot.mjs`](../relay/es-donbot.mjs).
+- Agent replies posted to Meta use exactly one `[LALO]` prefix. Meta's trailing
+  `ok` and “Mostrar razonamiento” UI text are removed before pending detection.
+- The agent replies only to Don Bot invocations, once per batch; never post
+  credentials or other secrets into the channel.
+- The watcher bootstraps a newly selected channel with
+  [`relay/reglas.txt`](../relay/reglas.txt) once. It filters its own `[LALO]`
+  messages and stores deduplication state locally.
 
 ## Components
 
-| Script | Role |
+| File | Purpose |
 |---|---|
-| `vigia-v6.mjs` | Watches user message rows: 2 s DOM read + 120 s reload safety net. Ignores `[Don Bot]` rows. Duplicate filter against the log. Exits on detection (one notification per dictation). |
-| `enviar-hilo.mjs` | Posts arbitrary text into the thread (composer + send button). |
-| `canal.mjs` | Discovers the **valid channel**: the most recent chat whose title matches transcription (`Transcribir audio o video`). Opens the sidebar if needed and writes `/tmp/opencode/canal.json` (`{id,url,title,index,ts}`). Watcher and sender read the id from there — nothing is hardcoded. |
-| `recargar-leer.mjs` | Reloads the thread and reads the last rows (manual "lee"). |
-| `leer-filas.mjs` / `leer-cola.mjs` | Row dump / last message + composer state. |
-| `dictado-log.txt` | Append-only log of every detected dictation, with timestamp. |
+| `relay/operar.sh` | Install, start/stop/status, channel discovery, pending check, watcher and sender commands |
+| `relay/vigia-v7.mjs` | DOM-event watcher with polling and reload safety nets; exits on an unanswered invocation |
+| `relay/canal.mjs` | Finds the newest transcription thread and persists its id locally |
+| `relay/read-thread.mjs` | Reads thread rows through CDP and emits JSON including user/assistant role |
+| `relay/pendientes.py` | Detects unanswered Don Bot invocations in a thread dump |
+| `relay/enviar-hilo.mjs` | Posts one message, adds `[LALO]` when absent, records the sent text locally |
+| `relay/tools/dump-rows.mjs` | Prints current DOM rows to stdout for diagnostics; does not save transcripts |
+| `relay/tools/verify-signatures.mjs` | Compares `[LALO]` rows with the local send log to detect forged signatures |
+| `relay/tools/open-tetris.mjs` | Opens and probes the local Tetris page in the CDP browser |
 
-## DOM contract
-
-- Message rows: `[class*="group/message-row"]`
-- Assistant rows: contain `[data-testid="assistant-message"]`
-- **User dictation rows: do NOT contain it**
-- Composer (the real, visible one): `[data-testid="composer-input"][contenteditable="true"]`
-  - Decoy: a hidden `textarea` shares the same `data-testid="composer-input"`.
-- Send button: `[data-testid="composer-send-button"]` (disabled until the composer has text)
-
-## Known quirks and mitigations
-
-1. **Frozen SPA (was the main issue).** In a background/headless tab, Chrome throttled the
-   page and the thread stopped receiving live updates, so a plain DOM read returned a
-   **stale snapshot**. **Fixed 2026-10-06** by launching Chrome with the anti-throttling
-   flags (see quirk 4) and by `Emulation.setFocusEmulationEnabled(true)` +
-   `Page.setWebLifecycleState('active')`. Verified: a posted message shows up in the DOM
-   within seconds **without reloading**.
-2. **Virtualized list.** Only the last ~10 rows live in the DOM, so an old row can
-   re-enter the window and look "new". Mitigation: duplicate filter against `dictado-log.txt`.
-3. **Self-echo.** The agent posts as the user, so its messages appear as user rows.
-   Mitigation: the `[Don Bot]` prefix is filtered out by the watcher.
-4. **Anti-throttling flags (APPLIED 2026-10-06).** `server.mjs` now launches Chrome with
-   `--disable-background-timer-throttling`, `--disable-backgrounding-occluded-windows`
-   and `--disable-renderer-backgrounding`. This removes the SPA freeze entirely, so the
-   watcher reads live and reloads are only a 120 s safety net (was 10 s). Detection
-   latency ≈ 2 s.
-
-5. **Network capture (evaluated, rejected).** Meta's thread WebSocket carries **binary**
-   (protobuf-like) frames — CDP `Network.webSocketFrameReceived` yields opaque payloads.
-   Reverse-engineering them is fragile. A JSON alternative exists: the page talks to
-   `POST https://www.meta.ai/api/graphql` (not yet wired).
-
-## Operation
+## Verification and recovery
 
 ```bash
-# The broker must be up (headless, long idle close):
-curl -s http://127.0.0.1:8055/warmup
-
-# Watch for new dictations (exits with the text when one arrives):
-node /tmp/opencode/vigia-v6.mjs
-
-# Post a message into the thread:
-node /tmp/opencode/enviar-hilo.mjs /tmp/opencode/msg-meta.txt
-
-# Read what is there right now (with reload):
-node /tmp/opencode/recargar-leer.mjs
+./relay/operar.sh status
+curl --fail http://127.0.0.1:8055/health
+curl --fail http://127.0.0.1:9233/json/version
+python3 -m unittest discover -s relay -p 'test_*.py'
 ```
+
+If the broker is active but the watcher cannot connect, run
+`./relay/operar.sh warmup` and then start `watch` again. If Meta has logged out,
+stop the service, open the configured Chrome profile manually, sign in, close
+that browser, then start the service and warm up. A closed CDP port is expected
+while the broker is stopped; it is not an instruction to start scraping
+automatically.
