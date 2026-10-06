@@ -1596,6 +1596,7 @@ function submitAgent(task, opts = {}) {
     sandboxTimeoutMs: Math.min(600000, Math.max(5000, Math.round(Number(opts.sandboxTimeoutMs) || 30000))),
     allowWrite: !!opts.allowWrite, allowNetwork: !!opts.allowNetwork,
     workdir: opts.workdir || null, mode: MODE_DEFAULT,
+    images: Array.isArray(opts.images) ? opts.images.slice(0, 4) : [],
     created: new Date().toISOString(),
   });
   persistPending();
@@ -1762,7 +1763,11 @@ async function pump(worker) {
       // Meta plans, the broker executes. ask() is one full Meta turn on this
       // worker's thread, so the whole loop lives in one conversation.
       const res = await runAgentLoop({
-        ask: (p) => askMeta(worker, p, j, j.mode || MODE_DEFAULT, []),
+        ask: (p, m) => askMeta(worker, p, j, j.mode || MODE_DEFAULT,
+          // Screenshots/multimodal input ride the FIRST turn only: after that
+          // the conversation carries them as context (the Meta thread keeps
+          // the attachments visible to the model).
+          (m && m.step === 1 && Array.isArray(j.images) ? j.images : [])),
         task: j._input,
         maxSteps: Number(j.maxSteps) || 8,
         budgetMs: Number(j.budgetMs) || undefined,   // absent -> loop default (env)
@@ -1937,6 +1942,11 @@ async function route(req, res) {
       maxSteps: payload.maxSteps,
       budgetMs: agentBudgetMs(payload.budgetMs),
       sandboxTimeoutMs: payload.sandboxTimeoutMs,
+      // Multimodal: data-URL images (screenshots) attached to the first turn so
+      // Meta can see the current state of the artifact she is fixing.
+      images: (Array.isArray(payload.images) ? payload.images : [])
+        .filter((u) => typeof u === "string" && u.startsWith("data:image/"))
+        .slice(0, 4),
       allowWrite: !!payload.allowWrite,
       allowNetwork: !!payload.allowNetwork,
       workdir: workdirRes.path,

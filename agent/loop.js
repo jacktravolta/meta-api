@@ -61,7 +61,7 @@ export async function runAgentLoop({ ask, task, ...opts }) {
     // job reports how far it got and the caller keeps the evidence.
     let answer;
     try {
-      answer = await ask(prompt);
+      answer = await ask(prompt, { step });
     } catch (e) {
       const msg = String(e?.message || e);
       emit({ type: "meta-error", step, error: msg });
