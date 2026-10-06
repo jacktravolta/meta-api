@@ -14,7 +14,7 @@ let TEXTO = readFileSync(process.argv[2], "utf8").trim();
 // REGLA: mensajes del agente en WhatsApp/hilo van SIEMPRE con [DON BOT].
 // Excepcion: los mensajes PARA META no llevan prefijo (SIN_PREFIJO=1), porque
 // contamina sus respuestas (regla de Don Jack).
-if (!process.env.SIN_PREFIJO && !/^\[don\s?bot\]/i.test(TEXTO)) TEXTO = "[DON BOT] " + TEXTO;
+if (!process.env.SIN_PREFIJO && !/^(\S{1,4}\s*)?\[don\s?bot\]/i.test(TEXTO)) TEXTO = "🤖 [DON BOT] " + TEXTO;
 
 const list = await (await fetch("http://127.0.0.1:9233/json")).json();
 let target = list.find((t) => t.type === "page" && (t.url || "").includes(FRAG));

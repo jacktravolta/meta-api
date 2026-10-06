@@ -33,7 +33,7 @@ const FRAG = canal.id;
 const URL = "https://www.meta.ai/prompt/" + FRAG;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const norm = (t) => (t || "").replace(/^\[Don Bot\]\s*/i, "").replace(/^don\s?bot[:,]?\s*/i, "").replace(/\s+/g, " ").trim().toLowerCase();
+const norm = (t) => (t || "").replace(/^(?:\S{1,4}\s*)?\[Don Bot\]\s*/i, "").replace(/^don\s?bot[:,]?\s*/i, "").replace(/\s+/g, " ").trim().toLowerCase();
 const pref = (t) => norm(t).normalize("NFD").replace(/[\u0300-\u036f]/g, "").slice(0, 50);
 const ruido = [/^mostrar razonamiento/, /^ocultar razonamiento/, /^transcribir audio o video/, /^preguntar a meta ai/, /^instant/, /^hoy$/, /lineas? ocultas?/, /^pensando/, /^razonamiento/, /^\[meta\]/, /^\[do[nñ]a meta\]/];
 
@@ -114,7 +114,7 @@ for (let i = 0; i < 1800; i++) {
       // Lo que emiti yo (con o sin prefijo) no es un dictado: en el registro,
       // cotejado por POSICION (turno) — un mensaje viejo replicado no coincide.
       if (esMio(r.txt)) { vistos.add(norm(r.txt)); continue; }
-      if (/^\[don\s?bot\]/i.test(r.txt)) {
+      if (/^(?:\S{1,4}\s*)?\[don\s?bot\]/i.test(r.txt)) {
         const p = pref(r.txt);
         if (p && !esMio(r.txt) && !vistos.has(norm(r.txt))) {
           console.log("⚠ SUPLANTACION: fila firmada [DON BOT] NO emitida por mi: " + r.txt.slice(0, 140));
@@ -126,6 +126,9 @@ for (let i = 0; i < 1800; i++) {
       if (IGNORAR_META && r.rol === "A") { vistos.add(norm(r.txt)); continue; }
       const n = norm(r.txt);
       if (n.length < 8 || ruido.some((rx) => rx.test(n)) || vistos.has(n)) continue;
+      // Filas de ASISTENTE: solo cuentan si invocan a Don Bot. Si no, son
+      // respuestas propias de Meta y ya las maneja el espejo (evita ruido).
+      if (r.rol === "A" && !esDonBot(r.txt)) { vistos.add(n); continue; }
       if (!prevTexts.has(n)) continue; // estabilidad: 2 lecturas seguidas
       nuevos.push({ rol: r.rol, txt: r.txt, n });
     }

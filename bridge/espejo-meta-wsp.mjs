@@ -66,10 +66,10 @@ for (let k = 0; k < 86400; k++) {
       const n = norm(t);
       if (vistos.has(n)) continue;
       vistos.add(n);
-      if (/^\[(don\s?bot|donbot|meta)\]/i.test(t.trim())) { continue; }   // nuestro
+      if (/^\s*(?:[^\[A-Za-z0-9]{1,4}\s*)?\[(don\s?bot|donbot|meta)\]/i.test(t.trim())) { continue; }   // nuestro
       if (ruido.some((rx) => rx.test(n))) { continue; }
       if (t.length < 12) { continue; }
-      const texto = "[META] " + t.replace(/\s+/g, " ").trim().slice(0, 900);
+      const texto = "🧠 [META] " + t.replace(/\s+/g, " ").trim().slice(0, 900);
       const ok = enviarWsp(texto);
       appendFileSync(LOG, `[${new Date().toISOString()}] ${ok ? "relayado" : "FALLO"}: ${texto.slice(0, 90)}\n`);
       console.log((ok ? "→ WhatsApp: " : "FALLO al relayar: ") + texto.slice(0, 90));
