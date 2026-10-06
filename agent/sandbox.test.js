@@ -447,3 +447,321 @@ test("buildSystemdArgv keeps the bwrap argv verbatim behind the -- separator", (
   assert.equal(argv[0], "--user",
     "the builder returns flags only; execFile prepends the program name");
 });
+
+// ---- bwrap execution: envelope, double brake, fail-closed (phase 3) ------------
+// Tasks 3.1-3.5. Two layers, matching design's Testing Strategy: fake-backed
+// unit pins assert the systemd delegation, the backstop wiring, the result
+// contract and the refusal WITHOUT spawning anything (host-independent), and
+// real-path tests exercise the actual jail, `t.skip`-ing with the captured
+// failure line when this host cannot provision it (the design's "must skip,
+// not fail" rule — same pattern as the docker-daemon skip above).
+//
+// Session stubs: a usable systemd user session is observable spawn-free as a
+// bus socket file, so a temp dir with a `bus` entry stands in for one, and
+// deleting both session variables stands in for its absence. Every stub and
+// fake is restored in `finally` so nothing leaks into a later test.
+
+function stubUserSession() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "sbx-session-"));
+  writeFileSync(path.join(dir, "bus"), "");
+  const savedXdg = process.env.XDG_RUNTIME_DIR;
+  const savedDbus = process.env.DBUS_SESSION_BUS_ADDRESS;
+  process.env.XDG_RUNTIME_DIR = dir;
+  process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${path.join(dir, "bus")}`;
+  return () => {
+    if (savedXdg === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = savedXdg;
+    if (savedDbus === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS;
+    else process.env.DBUS_SESSION_BUS_ADDRESS = savedDbus;
+    rmSync(dir, { recursive: true, force: true });
+  };
+}
+
+function stubNoUserSession() {
+  const savedXdg = process.env.XDG_RUNTIME_DIR;
+  const savedDbus = process.env.DBUS_SESSION_BUS_ADDRESS;
+  delete process.env.XDG_RUNTIME_DIR;
+  delete process.env.DBUS_SESSION_BUS_ADDRESS;
+  return () => {
+    if (savedXdg === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = savedXdg;
+    if (savedDbus === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS;
+    else process.env.DBUS_SESSION_BUS_ADDRESS = savedDbus;
+  };
+}
+
+function withDefaultBackend() {
+  const saved = process.env.META_SANDBOX_BACKEND;
+  delete process.env.META_SANDBOX_BACKEND;
+  return () => {
+    if (saved === undefined) delete process.env.META_SANDBOX_BACKEND;
+    else process.env.META_SANDBOX_BACKEND = saved;
+  };
+}
+
+// The fail-closed refusal and the fail-closed jail failure both come back as
+// results; this pulls the first informative line for a skip reason.
+function firstErrorLine(r) {
+  const text = String(r.error || r.output || "").trim();
+  return text.split("\n").find((l) => l.trim()) || "unknown failure";
+}
+
+test("runBwrap delegates to the systemd envelope and returns the shared contract", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  const spawned = [];
+  execFileImpl = (file, argv, opts, cb) => {
+    spawned.push({ file, argv, opts });
+    // Like the real execFile, the callback must arrive asynchronously.
+    setImmediate(() => cb(null, "hello", "warn"));
+    return { kill() { return false; } };
+  };
+  try {
+    const before = execFileCalls.length;
+    const r = await runSandboxed("ls /workspace", { timeoutMs: 7_000 });
+    assert.equal(spawned.length, 1, "exactly one envelope spawn");
+    assert.ok(execFileCalls.length > before, "the spy must record the spawn");
+    const { file, argv, opts } = spawned[0];
+    assert.equal(file, "systemd-run", "the bwrap arm runs through systemd-run");
+    assert.equal(opts.timeout, 15_000, "outer brake = timeoutMs + 8000");
+    const unitIdx = argv.indexOf("--unit");
+    assert.notEqual(unitIdx, -1, "the transient unit must be named");
+    const unit = argv[unitIdx + 1];
+    assert.match(unit, /^meta-sbx-[0-9a-f]{8}$/, "unit = meta-sbx-<uuid8>");
+    // Full delegation: exactly buildSystemdArgv(buildBwrapArgv(...), opts, unit).
+    assert.deepEqual(argv, buildSystemdArgv(
+      buildBwrapArgv("ls /workspace", { timeoutMs: 7_000 }, false),
+      { timeoutMs: 7_000 }, unit,
+    ));
+    // Shared result contract plus the backend tag.
+    assert.equal(r.backend, "bwrap");
+    assert.equal(r.ok, true);
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.output, "hello\nwarn", "stdout and stderr merged like runDocker");
+    assert.equal(r.truncated, false);
+    assert.equal(r.timedOut, false);
+    assert.equal(typeof r.ms, "number");
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+test("the host backstop kills the scope and the child at the budget", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  const spawned = [];
+  execFileImpl = (file, argv, opts, cb) => {
+    spawned.push({ file, argv });
+    // Mirror execFile's optional-opts form: the backstop spawns
+    // `systemctl --user kill ...` with no opts object (3-arg call).
+    const done = typeof opts === "function" ? opts : cb;
+    if (file === "systemctl") {     // the scope kill issued by the backstop
+      setImmediate(() => done(null, "", ""));
+      return { kill() { return false; } };
+    }
+    if (file === "systemd-run") {   // hangs until the backstop kills the child
+      return {
+        kill(signal) {
+          setImmediate(() => done(
+            Object.assign(new Error(`killed by ${signal}`),
+              { killed: true, signal, code: null }), "", ""));
+        },
+      };
+    }
+    // Any other spawn (a regression to the docker arm) resolves at once, so a
+    // red run fails on its assertions instead of hanging.
+    setImmediate(() => done(null, "", ""));
+    return { kill() { return false; } };
+  };
+  try {
+    const r = await runSandboxed("ls /workspace", { timeoutMs: 150 });
+    const runCall = spawned.find((s) => s.file === "systemd-run");
+    const killCall = spawned.find((s) => s.file === "systemctl");
+    assert.ok(runCall, "the envelope must be spawned");
+    assert.ok(killCall, "the backstop must kill the scope");
+    const unit = runCall.argv[runCall.argv.indexOf("--unit") + 1];
+    assert.deepEqual(killCall.argv,
+      ["--user", "kill", "--signal=SIGKILL", `${unit}.scope`],
+      "the backstop kills exactly the transient scope it spawned");
+    assert.equal(r.ok, false);
+    assert.equal(r.timedOut, true, "the backstop cut must set timedOut");
+    assert.equal(r.exitCode, 137, "a SIGKILL surfaces as 128+9");
+    assert.ok(r.ms < 10_000, `the budget must hold (ms=${r.ms})`);
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+test("runBwrap refuses before spawning anything without a systemd user session", async () => {
+  const restoreSession = stubNoUserSession();
+  const restoreBackend = withDefaultBackend();
+  execFileImpl = (file, argv, opts, cb) => {
+    setImmediate(() => cb(null, "", ""));
+    return { kill() { return false; } };
+  };
+  try {
+    const before = execFileCalls.length;
+    const r = await runSandboxed("ls /workspace");
+    assert.equal(r.ok, false);
+    assert.equal(r.backend, "bwrap");
+    assert.ok(r.error, "a refusal must carry an error");
+    assert.match(r.error, /systemd user session/,
+      "the error must name the missing prerequisite");
+    assert.equal(execFileCalls.length, before, "no process may be started");
+    assert.equal(r.output, `${r.error}\n`);
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+test("runBwrap refuses when the systemd-run binary is not on PATH", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  const savedPath = process.env.PATH;
+  const emptyDir = mkdtempSync(path.join(os.tmpdir(), "sbx-no-bin-"));
+  process.env.PATH = emptyDir;
+  execFileImpl = (file, argv, opts, cb) => {
+    setImmediate(() => cb(null, "", ""));
+    return { kill() { return false; } };
+  };
+  try {
+    const before = execFileCalls.length;
+    const r = await runSandboxed("ls /workspace");
+    assert.equal(r.ok, false);
+    assert.match(String(r.error), /systemd-run not found on PATH/);
+    assert.equal(execFileCalls.length, before, "no process may be started");
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    rmSync(emptyDir, { recursive: true, force: true });
+  }
+});
+
+test("timedOut comes from exit codes and kill signals, never from stderr wording", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  const cases = [
+    { why: "stderr wording alone must not mark a timeout",
+      err: null, stderr: "Error: request timed out after 30s", want: false },
+    { why: "GNU timeout exit 124",
+      err: Object.assign(new Error("failed"), { code: 124 }), want: true, exit: 124 },
+    { why: "scope kill exit 137",
+      err: Object.assign(new Error("failed"), { code: 137 }), want: true, exit: 137 },
+    { why: "killed child with no numeric code",
+      err: Object.assign(new Error("failed"),
+        { code: null, killed: true, signal: "SIGKILL" }), want: true, exit: 137 },
+  ];
+  try {
+    for (const c of cases) {
+      execFileImpl = (file, argv, opts, cb) => {
+        setImmediate(() => cb(c.err, "", c.stderr));
+        return { kill() { return false; } };
+      };
+      const r = await runSandboxed("ls /workspace");
+      assert.equal(r.timedOut, c.want, c.why);
+      if (c.exit !== undefined) assert.equal(r.exitCode, c.exit, c.why);
+    }
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+test("bwrap output is capped at maxOutputBytes with the shared marker (fake)", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  execFileImpl = (file, argv, opts, cb) => {
+    setImmediate(() => cb(null, "x".repeat(9000), ""));
+    return { kill() { return false; } };
+  };
+  try {
+    const r = await runSandboxed("ls /workspace");
+    const marker = "\n[salida truncada]";
+    assert.equal(r.backend, "bwrap");
+    assert.equal(r.truncated, true);
+    assert.ok(r.output.endsWith(marker), "the shared truncation marker must be appended");
+    assert.equal(Buffer.byteLength(r.output), 8192 + Buffer.byteLength(marker));
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+// ---- Real-path bwrap execution (jail-gated) ------------------------------------
+// One cached trivial run answers whether THIS host can provision the jail. On a
+// non-provisioned host it comes back fail-closed (design's verified host facts:
+// AppArmor blocks the jail), and the gated tests below skip with its first
+// error line instead of failing — the docker-daemon-skip pattern.
+
+let trivialRun = null;
+function trivialBwrapRun() {
+  if (!trivialRun) trivialRun = runSandboxed("ls /workspace");
+  return trivialRun;
+}
+
+test("a trivial run through the real bwrap path succeeds or fails closed with an explanation", async () => {
+  const restoreBackend = withDefaultBackend();
+  try {
+    const r = await trivialBwrapRun();
+    assert.equal(r.backend, "bwrap", "the default backend must be bwrap");
+    if (r.ok) {
+      // Provisioned host: the jail ran and the contract holds.
+      assert.equal(r.exitCode, 0);
+      assert.equal(r.timedOut, false);
+      assert.equal(r.truncated, false);
+    } else {
+      // Non-provisioned host: the refusal or the jail failure must explain
+      // itself — never a silent success, never a bare `ok:false`. `error` is
+      // the contract's explanation field and names the failing envelope.
+      assert.ok(r.error || r.output, "a failed run must explain itself");
+      assert.match(String(r.error || r.output), /bwrap|systemd|session/i);
+    }
+  } finally {
+    restoreBackend();
+  }
+});
+
+test("double brake: sleep 30 under a 5s budget stops in seconds and reports timedOut", async (t) => {
+  const seed = await trivialBwrapRun();
+  if (!seed.ok) return t.skip(`bwrap jail unavailable on this host: ${firstErrorLine(seed)}`);
+  const restoreBackend = withDefaultBackend();
+  try {
+    const r = await runSandboxed("sleep 30", { allowWrite: true, timeoutMs: 5_000 });
+    assert.equal(r.backend, "bwrap");
+    assert.equal(r.timedOut, true, "an over-budget command must be marked timedOut");
+    assert.ok([124, 137].includes(r.exitCode),
+      `exit code must reflect the timeout or kill status, got ${r.exitCode}`);
+    assert.ok(r.ms < 10_000, `the command must stop in seconds, not 30 (ms=${r.ms})`);
+  } finally {
+    restoreBackend();
+  }
+});
+
+test("a real over-cap output is truncated at maxOutputBytes (jail-gated)", async (t) => {
+  const seed = await trivialBwrapRun();
+  if (!seed.ok) return t.skip(`bwrap jail unavailable on this host: ${firstErrorLine(seed)}`);
+  const restoreBackend = withDefaultBackend();
+  try {
+    // `seq` is whitelisted: a read-classified command, no allowWrite needed.
+    const r = await runSandboxed("seq 1 4000");
+    assert.equal(r.backend, "bwrap");
+    assert.equal(r.ok, true);
+    assert.equal(r.truncated, true);
+    const marker = "\n[salida truncada]";
+    assert.ok(r.output.endsWith(marker), "the shared truncation marker must be appended");
+    assert.equal(Buffer.byteLength(r.output), 8192 + Buffer.byteLength(marker));
+  } finally {
+    restoreBackend();
+  }
+});

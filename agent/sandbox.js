@@ -10,6 +10,7 @@
 // UI as the attacker.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { accessSync, constants, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -206,10 +207,9 @@ export async function runSandboxed(command, opts = {}) {
   }
 
   // Backend dispatch. The policy layer above is shared and unchanged; only
-  // the execution stage varies. Phase-1 routing: both accepted backends run
-  // through the extracted Docker path — the bwrap arm is wired to runBwrap
-  // when the bwrap execution stage lands.
-  return runDocker(command, o, needsWrite);
+  // the execution stage varies.
+  if (resolved.backend === "docker") return runDocker(command, o, needsWrite);
+  return runBwrap(command, o, needsWrite);
 }
 
 // The Docker execution path: the original runSandboxed body, extracted
@@ -278,6 +278,119 @@ async function runDocker(command, opts, needsWrite) {
     // by name rather than only the CLI process.
     hostTimer = setTimeout(() => {
       try { execFile("docker", ["kill", name], () => {}); } catch {}
+    }, o.timeoutMs);
+  });
+}
+
+// Fail-closed preflight for the resource envelope (design: "Resource limits
+// via systemd-run --user --scope, fail closed if absent"). Without systemd-run
+// or a usable user session the scope would be silently missing and the command
+// would run unlimited — which the spec forbids ("never run unlimited
+// silently"). Both checks are spawn-free, so the refusal happens BEFORE any
+// process exists, and both read the live environment so a test can stub a
+// session in or out.
+function systemdRunOnPath() {
+  const dirs = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  return dirs.some((dir) => {
+    try { accessSync(path.join(dir, "systemd-run"), constants.X_OK); return true; }
+    catch { return false; }
+  });
+}
+
+// The user manager is reachable when its bus socket file exists: the
+// canonical $XDG_RUNTIME_DIR/bus, or an explicit unix:path= from
+// DBUS_SESSION_BUS_ADDRESS when XDG_RUNTIME_DIR is not set.
+function userBusSocket() {
+  if (process.env.XDG_RUNTIME_DIR) return path.join(process.env.XDG_RUNTIME_DIR, "bus");
+  const m = String(process.env.DBUS_SESSION_BUS_ADDRESS || "").match(/(?:^|,)unix:path=([^,]+)/);
+  return m ? m[1] : null;
+}
+
+function userScopeRefusal() {
+  if (!systemdRunOnPath()) {
+    return "systemd-run not found on PATH: the bwrap backend requires the " +
+           "systemd user scope and will not run unlimited";
+  }
+  const bus = userBusSocket();
+  if (!bus || !existsSync(bus)) {
+    return "no usable systemd user session (bus socket missing under " +
+           "XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS): the bwrap backend will not run unlimited";
+  }
+  return null;
+}
+
+// A signalled death carries no numeric err.code (Node reports code:null plus
+// err.signal), so derive the shell convention 128+signo: this is how the
+// design's "a scope SIGKILL surfaces as 137" reaches the result's exitCode.
+function exitCodeFor(err) {
+  if (typeof err?.code === "number") return err.code;
+  if (err?.signal) return 128 + (os.constants.signals[err.signal] ?? 0);
+  return err ? 1 : 0;
+}
+
+// The bwrap execution path: one execFile of systemd-run wrapping the whole
+// jail, a host-side backstop, and the shared result contract plus `backend`.
+// The argv comes from the two pure builders (unit-tested above); command text
+// travels JSON-quoted inside it and is never interpolated into flags.
+//
+// Double brake (design: "Limits, Timeouts and Exit Codes"): the inner
+// `timeout <secs>` inside the jail kills the command's process group first;
+// if we are still here at the budget, the host timer SIGKILLs the transient
+// scope (killing only the systemd-run client would NOT stop the scoped
+// processes) and then the client itself. `--die-with-parent` covers the
+// residue when the broker dies.
+async function runBwrap(command, opts, needsWrite) {
+  const o = opts;
+
+  // Fail closed before anything spawns: no session, no envelope, no run.
+  const refusal = userScopeRefusal();
+  if (refusal) {
+    return { ok: false, backend: "bwrap", error: refusal, output: `${refusal}\n` };
+  }
+
+  const unit = `meta-sbx-${randomUUID().slice(0, 8)}`;
+  const argv = buildSystemdArgv(buildBwrapArgv(command, o, needsWrite), o, unit);
+
+  const started = Date.now();
+  let hostTimer = null;
+  return await new Promise((resolve) => {
+    const child = execFile("systemd-run", argv,
+      { timeout: o.timeoutMs + 8000, maxBuffer: o.maxOutputBytes * 4 },
+      (err, stdout, stderr) => {
+        clearTimeout(hostTimer);
+        const out = String(stdout || "") + (stderr ? `\n${stderr}` : "");
+        const truncated = Buffer.byteLength(out) > o.maxOutputBytes;
+        const exitCode = exitCodeFor(err);
+        // Fail-closed explanation: name the envelope so a host-level failure
+        // ("Failed to start transient service unit: ...") says where it broke.
+        // Spawn failures (ENOENT & co.) carry no stderr, hence the fallback.
+        const detail = String(stderr || err?.stderr || "").trim();
+        const error = err
+          ? (detail ? `systemd-run failed: ${detail}` : String(err?.message || err))
+          : "";
+        resolve({
+          ok: !err || err.code === 0,
+          exitCode,
+          error,
+          output: truncated ? out.slice(0, o.maxOutputBytes) + "\n[salida truncada]" : out,
+          truncated,
+          ms: Date.now() - started,
+          // GNU timeout exits 124; a SIGKILLed scope/client surfaces as 137
+          // (128+9) or via err.killed/err.signal. All are sandbox-initiated
+          // cuts. Wording in stderr NEVER counts: the command could print
+          // "timed out" and exit 0.
+          timedOut: [124, 137].includes(exitCode) || err?.killed === true ||
+                    err?.signal === "SIGTERM" || err?.signal === "SIGKILL",
+          backend: "bwrap",
+        });
+      });
+    // Host-side backstop: SIGKILL the transient scope (the command keeps
+    // running if only the client dies), then the client itself.
+    hostTimer = setTimeout(() => {
+      try {
+        execFile("systemctl", ["--user", "kill", "--signal=SIGKILL", `${unit}.scope`], () => {});
+      } catch {}
+      child.kill("SIGKILL");
     }, o.timeoutMs);
   });
 }
