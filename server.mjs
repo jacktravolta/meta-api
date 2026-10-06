@@ -779,6 +779,9 @@ async function ensureChromeInner() {
     // Permitir reproduccion sin gesto: WhatsApp baja el audio de las notas de voz
     // recien al reproducirlas. Sin esto, en headless el media nunca se descarga.
     "--autoplay-policy=no-user-gesture-required",
+    // Silenciar la salida: para bajar la nota de voz hay que REPRODUCIRLA (WhatsApp
+    // la descarga al reproducir). Sin esto suena en los parlantes del usuario.
+    "--mute-audio",
     "--disable-blink-features=AutomationControlled",
     // Minimal chrome: no restore/crash bubbles, no infobar, no "choose your
     // search engine" screen, no background apps. Without these Chrome opens its
