@@ -1,0 +1,16 @@
+const l = await (await fetch("http://127.0.0.1:9233/json")).json();
+const t = l.find((x) => (x.url || "").includes("web.whatsapp.com"));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+let i = 1; const p = new Map();
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && p.has(m.id)) { p.get(m.id)(m.result?.result?.value); p.delete(m.id); } };
+const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.send(JSON.stringify({ id, method: m, params: pa })); setTimeout(()=>r(undefined),15000); });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
+const q = async (e) => await call("Runtime.evaluate", { expression: e, returnByValue: true });
+console.log("play:", await q(`(() => { const b=[...document.querySelectorAll('#main [aria-label*="eproducir"]')][0]; if(!b) return 'sin boton'; b.click(); return 'ok'; })()`));
+await sleep(6000);
+console.log("audios (dom normal):", await q(`document.querySelectorAll('audio').length`));
+console.log("audios (con shadow DOM):", await q(`(() => { let n=0; const walk=(root)=>{ root.querySelectorAll('*').forEach(e=>{ if(e.tagName==='AUDIO') n++; if(e.shadowRoot) walk(e.shadowRoot); }); }; walk(document); return n; })()`));
+console.log("blobs de audio?", await q(`(() => { const els=[...document.querySelectorAll('[src^="blob:"]')]; return JSON.stringify(els.map(e=>e.tagName).reduce((a,t)=>(a[t]=(a[t]||0)+1,a),{})); })()`));
+console.log("estado de reproduccion:", await q(`(() => { const b=document.querySelector('#main [aria-label*="ausa"]'); return b ? 'pausa disponible (esta reproduciendo)' : 'no reproduce'; })()`));
+process.exit(0);

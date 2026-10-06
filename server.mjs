@@ -776,6 +776,9 @@ async function ensureChromeInner() {
     "--no-first-run", "--no-default-browser-check",
     "--disable-component-update", "--disable-background-networking",
     "--disable-gpu", "--no-sandbox", "--disable-sync",
+    // Permitir reproduccion sin gesto: WhatsApp baja el audio de las notas de voz
+    // recien al reproducirlas. Sin esto, en headless el media nunca se descarga.
+    "--autoplay-policy=no-user-gesture-required",
     "--disable-blink-features=AutomationControlled",
     // Minimal chrome: no restore/crash bubbles, no infobar, no "choose your
     // search engine" screen, no background apps. Without these Chrome opens its

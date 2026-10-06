@@ -1,0 +1,12 @@
+const l = await (await fetch("http://127.0.0.1:9233/json")).json();
+const t = l.find((x) => (x.url || "").includes("web.whatsapp.com"));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+let i = 1; const p = new Map();
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && p.has(m.id)) { p.get(m.id)(m.result?.result?.value); p.delete(m.id); } };
+const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.send(JSON.stringify({ id, method: m, params: pa })); setTimeout(()=>r(undefined),15000); });
+await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
+const q = async (e) => await call("Runtime.evaluate", { expression: e, returnByValue: true });
+console.log("elementos con blob:", await q(`JSON.stringify([...document.querySelectorAll('[src^="blob:"], [href^="blob:"]')].map(e=>({tag:e.tagName, tipo:e.getAttribute('type')||'', src:(e.getAttribute('src')||e.getAttribute('href')||'').slice(0,40), w:e.naturalWidth||0, h:e.naturalHeight||0})).slice(0,20))`));
+console.log("---");
+console.log("total en #main:", await q(`document.querySelectorAll('#main [src^="blob:"], #main [href^="blob:"]').length`));
+process.exit(0);
