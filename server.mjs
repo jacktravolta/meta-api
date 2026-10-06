@@ -769,6 +769,12 @@ async function ensureChromeInner() {
     "--remote-debugging-port=" + CDP_PORT,
     "--no-first-run", "--no-default-browser-check",
     "--disable-component-update", "--disable-background-networking",
+    // Keep the SPA's timers/WebSocket alive while the tab is backgrounded:
+    // without these, the Meta thread page stops receiving live updates and any
+    // read returns a frozen snapshot until a manual reload.
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
     "--disable-gpu", "--no-sandbox", "--disable-sync",
     "--disable-blink-features=AutomationControlled",
     // Minimal chrome: no restore/crash bubbles, no infobar, no "choose your
