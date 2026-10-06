@@ -81,7 +81,7 @@ and regression tests so the next change can't silently reopen a hole.
 - [x] T8 docker verification (parent): docker version/images/ps, sandbox-only smoke via direct
   import (no broker).
 - [x] T9 document: README endpoint list + /v1/agent contract; fix .gitignore L8.
-- [ ] T10 (gated on round 3 completion) live smoke: single-step then multi-step via
+- [x] T10 (gated on round 3 completion) live smoke: single-step then multi-step via
   POST /v1/agent, watching journal agent events.
 
 ## Acceptance criteria
@@ -107,4 +107,4 @@ and regression tests so the next change can't silently reopen a hole.
 ## Ejecución (2026-10-05)
 - T1-T7+T9: delegados y completados, 8 commits db4a1e8..31de051, 35/35 tests.
 - T8: verificación parent: suite re-ejecutada 35/35 (~1.4s), 0 archivos systemd/ tocados, selfCheck docker vivo sin leak.
-- T10: pendiente (live smoke post-restart del broker).
+- T10: VERIFICADO EN VIVO (05-oct, job-39368622): tarea de conteo de lineas resuelta en 7 steps con adaptacion a error (wc fallo -> find -> respuesta correcta '2067 lineas'), fences sin tag, transcript completo, budget ok (~150s de 900s). Broker en produccion (budget 150K, idle 30s) corriendo el codigo del branch.
