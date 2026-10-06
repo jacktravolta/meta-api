@@ -33,6 +33,17 @@ const FRAG = canal.id;
 const URL = "https://www.meta.ai/prompt/" + FRAG;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// LOCK (consejo de Meta): sin esto cada rearme dejaba vigias zombis. Si ya hay
+// una instancia viva, salir.
+const LOCK = join(BIN, "vigia.lock");
+try {
+  if (existsSync(LOCK)) {
+    const pid = Number(readFileSync(LOCK, "utf8").trim());
+    if (pid && pid !== process.pid) { process.kill(pid, 0); console.log("ya hay un vigia vivo (pid " + pid + "); salgo"); process.exit(0); }
+  }
+} catch { /* no hay instancia viva: seguir */ }
+try { writeFileSync(LOCK, String(process.pid)); } catch {}
+
 const norm = (t) => (t || "").replace(/^(?:\S{1,4}\s*)?\[Don Bot\]\s*/i, "").replace(/^don\s?bot[:,]?\s*/i, "").replace(/\s+/g, " ").trim().toLowerCase();
 const pref = (t) => norm(t).normalize("NFD").replace(/[\u0300-\u036f]/g, "").slice(0, 50);
 const ruido = [/^mostrar razonamiento/, /^ocultar razonamiento/, /^transcribir audio o video/, /^preguntar a meta ai/, /^instant/, /^hoy$/, /lineas? ocultas?/, /^pensando/, /^razonamiento/, /^\[meta\]/, /^\[do[nñ]a meta\]/];

@@ -46,6 +46,7 @@ if (!ws) { console.log("no hay pestaña del canal"); process.exit(1); }
 console.log("== espejo Meta->WhatsApp activo ==");
 
 let primerCiclo = true;
+let prevRows = new Set();   // estabilidad: evita relayer mientras el texto crece
 for (let k = 0; k < 86400; k++) {
   if (!ws || ws.readyState !== 1) { const c = await conectar().catch(() => null); if (c) ({ ws, call } = c); await sleep(5000); continue; }
   let rows = [];
@@ -65,6 +66,9 @@ for (let k = 0; k < 86400; k++) {
     for (const t of rows) {
       const n = norm(t);
       if (vistos.has(n)) continue;
+      // ESTABILIDAD: solo relayar si el texto YA estaba en la lectura anterior
+      // (WhatsApp/Meta lo escriben creciendo: sin esto se relayaba 3 veces).
+      if (!prevRows.has(n)) continue;
       vistos.add(n);
       if (/^\s*(?:[^\[A-Za-z0-9]{1,4}\s*)?\[(don\s?bot|donbot|meta)\]/i.test(t.trim())) { continue; }   // nuestro
       if (ruido.some((rx) => rx.test(n))) { continue; }
@@ -76,5 +80,6 @@ for (let k = 0; k < 86400; k++) {
     }
     guardar();
   }
+  prevRows = new Set(rows.map(norm));
   await sleep(3000);
 }

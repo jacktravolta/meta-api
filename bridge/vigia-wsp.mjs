@@ -12,6 +12,16 @@ const COLA = join(BIN, "..", "relay", "state", "wsp-pendientes.txt");
 const MARCA = join(BIN, "wsp-vigia-marca.json");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// LOCK: evita vigias duplicados (cada rearme dejaba zombis).
+const LOCK = join(BIN, "vigia-wsp.lock");
+try {
+  if (existsSync(LOCK)) {
+    const pid = Number(readFileSync(LOCK, "utf8").trim());
+    if (pid && pid !== process.pid) { process.kill(pid, 0); console.log("ya hay un vigia-wsp vivo (pid " + pid + "); salgo"); process.exit(0); }
+  }
+} catch { /* libre */ }
+try { writeFileSync(LOCK, String(process.pid)); } catch {}
+
 const lineas = () => (existsSync(COLA) ? readFileSync(COLA, "utf8").split("\n").filter((l) => l.trim()) : []);
 let marca = existsSync(MARCA) ? JSON.parse(readFileSync(MARCA, "utf8")) : null;
 
