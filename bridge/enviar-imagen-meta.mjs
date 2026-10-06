@@ -23,6 +23,15 @@ await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () =
 
 await call("DOM.enable");
 await call("Page.enable");
+// ORDEN IMPORTANTE (diagnostico de Meta): el TEXTO se escribe ANTES de setear el
+// archivo. Si se sube primero el archivo, Meta lo ve y responde al toque, sin
+// contexto. Con el texto ya puesto, salen juntos en un solo mensaje.
+if (TEXTO) {
+  await call("Runtime.evaluate", { expression: `(() => { const el=document.querySelector('[data-testid="composer-input"][contenteditable="true"]'); if(!el) return false; el.focus(); return true; })()`, returnByValue: true });
+  await sleep(500);
+  await call("Input.insertText", { text: TEXTO });
+  await sleep(800);
+}
 // El composer de Meta puede estar en un iframe? Se busca en TODOS los frames.
 const doc = await call("DOM.getDocument", { depth: -1, pierce: true });
 const rootId = doc && doc.root ? doc.root.nodeId : null;
@@ -35,15 +44,7 @@ if (!nodeId) { console.log("no encontre input[type=file]"); process.exit(1); }
 
 await call("DOM.setFileInputFiles", { files: [RUTA], nodeId });
 console.log("archivo seteado: " + RUTA);
-await sleep(6000);   // esperar que suba y aparezca el preview
-
-// Texto opcional + enviar
-if (TEXTO) {
-  await call("Runtime.evaluate", { expression: `(() => { const el=document.querySelector('[data-testid="composer-input"][contenteditable="true"]'); if(!el) return false; el.focus(); return true; })()`, returnByValue: true });
-  await sleep(400);
-  await call("Input.insertText", { text: TEXTO });
-  await sleep(800);
-}
+await sleep(3000);   // debounce corto: que el adjunto se registre antes de enviar
 let enviado = false;
 for (let k = 0; k < 4 && !enviado; k++) {
   await call("Runtime.evaluate", { expression: `(() => { const b=document.querySelector('[data-testid="composer-send-button"]'); if(b && !b.disabled){ b.click(); return true; } return false; })()`, returnByValue: true });
