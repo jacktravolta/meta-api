@@ -50,7 +50,7 @@ const BLOCK_RE = /```([a-z]*)\s*([\s\S]*?)```/gi;
 // ~4KB+ of base64 plus quoting). Chunking below the cap is possible but
 // error-prone for the model (truncated base64 corrupts the target file), so the
 // default sits high enough for real files while still bounding a single job.
-const MAX_COMMAND = Math.max(4000, Number(process.env.META_TOOL_MAX_COMMAND || 20000));
+const MAX_COMMAND = Math.max(4000, Number(process.env.META_TOOL_MAX_COMMAND || 50000));
 
 export const ALLOWED_TOOLS = new Set(["run"]);
 

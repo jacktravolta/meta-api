@@ -1431,7 +1431,7 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     // control disappearing; the .msg-copy icon count never fired once.
     const statusLike = (t) => {
       const s = String(t || "").trim();
-      return s.length < 120 && /^(buscando|revisando|definiendo|construyendo|guardando|analizando|preparando|pensando|planificando|generando|escribiendo|organizando)\b/i.test(s);
+      return s.length < 120 && /^(buscando|revisando|definiendo|construyendo|guardando|analizando|preparando|pensando|planificando|generando|escribiendo|organizando|dividiendo|partiendo|completando)\b/i.test(s);
     };
     // Completion, in order of trust:
     //  1. copy control rendered (checked above) — rare/legacy

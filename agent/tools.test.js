@@ -45,7 +45,7 @@ test("an oversized block is an error, the exact limit is not", () => {
   // The cap is env-tunable (META_TOOL_MAX_COMMAND, default 20000 since the
   // file-writing agent needs whole-file commands); the default suite runs
   // against the default, so pin both sides against the live value.
-  const cap = Number(process.env.META_TOOL_MAX_COMMAND || 20000);
+  const cap = Number(process.env.META_TOOL_MAX_COMMAND || 50000);
   assert.equal(parseToolCall(fence("sh", "a".repeat(cap + 1))).error, "comando demasiado largo (max " + cap + " chars)");
   assert.equal(parseToolCall(fence("sh", "a".repeat(cap))).command, "a".repeat(cap));
 });
