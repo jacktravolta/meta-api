@@ -193,6 +193,73 @@ self-check; the self-check test skips itself when the Docker daemon is
 unreachable. Note that this Node's runner rejects directory arguments
 (`node --test agent/`), so pass files or a glob.
 
+## bwrap sandbox: persistent root, host prerequisites, installs
+
+### Persistent root
+
+The bwrap backend keeps one persistent sandbox root at `META_BWRAP_ROOT`
+(default `~/sandbox`), created on first use with mode `0700` and laid out as:
+
+```
+~/sandbox/
+├── bin/     # user-prefix binaries; first entry on PATH inside the jail
+├── lib/     # pip --target / npm --prefix destination
+├── home/    # jail HOME (HOME=/sandbox/home)
+└── tmp/     # operator scratch (the jail itself uses a tmpfs /tmp)
+```
+
+The root is **operator-managed** and isolated from the workspace: only the
+workspace is exposed at `/workspace` (read-only unless writes are enabled),
+while the root is bound read-write at `/sandbox` because it is the sandbox's
+own directory, never host-sensitive state. The root **survives every
+command** — installs and files under it are visible to later commands — and it
+is **disposable**: delete stale directories or the whole root to reset it; the
+layout is recreated on the next run.
+
+Disk budget: nothing prunes the root automatically. Watch it with
+`du -sh ~/sandbox`, and when it outgrows the budget you allow, remove the
+stale installs (or the whole root — it comes back intact on the next command).
+
+### AppArmor host prerequisite
+
+On hosts with `kernel.apparmor_restrict_unprivileged_userns=1` (the Ubuntu
+24.04 default), an unprivileged `bwrap` cannot create a user namespace until
+the host carries the profile `/etc/apparmor.d/bwrap`. Provisioning is a
+manual, host-side step — the agent performs **no** automatic installation and
+never weakens the global sysctl:
+
+1. Create the root-owned, read-only, host-managed profile
+   `/etc/apparmor.d/bwrap` with exactly this text:
+
+   ```text
+   abi <abi/4.0>,
+   profile bwrap /usr/bin/bwrap flags=(unconfined) {
+     userns,
+     include if exists <local/bwrap>
+   }
+   ```
+
+2. Reload it: `sudo apparmor_parser -r /etc/apparmor.d/bwrap`
+
+Until the profile is present, the sandbox self-check fails closed and
+`POST /v1/agent` answers **503** with a reason naming the missing `userns,`
+prerequisite — the intended posture, not a bug.
+
+### Confined installs (user-prefix only)
+
+The jail runs as your own uid: no root, no capabilities, no escalation path.
+Installs must stay inside the sandbox root and use user-prefix modes only:
+
+- `pip --target /sandbox/lib <pkg>`
+- `npm --prefix /sandbox/lib <pkg>`
+- `pip install --user <pkg>` — the jail's default `HOME` is `/sandbox/home`
+
+`PATH` inside the jail starts with `/sandbox/bin`, so entry points installed
+by these commands resolve on later runs. `sudo`, `su`, `apt` and `apt-get`
+classify as **writes**: the policy layer denies them without `allowWrite`, and
+even with writes enabled they gain nothing — there is no root inside the jail.
+Nothing inside the sandbox should ever assume root.
+
 ## Recovery
 
 | Failure | Handling |

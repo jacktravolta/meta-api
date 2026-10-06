@@ -14,13 +14,13 @@ shared and unchanged across backends.
 | Chained PRs recommended | Yes |
 | Suggested split | PR 1 (backend seam + pure builders) → PR 2 (bwrap execution + self-check gate) → PR 3 (persistent root + docs + parity) |
 | Delivery strategy | ask-on-risk (no strategy was supplied with this launch; defaulted) |
-| Chain strategy | pending (user decision required) |
+| Chain strategy | resolved: feature-branch chain on `feat/bwrap-sandbox`, auto-chain (autonomous apply granted) |
 
 ```text
-Decision needed before apply: Yes
+Decision needed before apply: resolved (autonomous apply granted)
 Chained PRs recommended: Yes
-Chain strategy: pending
-400-line budget risk: Medium
+Chain strategy: resolved: feature-branch chain, one commit per phase slice
+400-line budget risk: Medium (several slices carry size:exception)
 ```
 
 Honest note: the central estimate sits on the 400-line boundary. The pure-builder and timeout
@@ -80,11 +80,11 @@ an operator who has not installed the AppArmor prerequisite.
 
 ## Phase 5: Persistent Root, Host Prerequisites and Install Semantics
 
-- [ ] 5.1 Implement sandbox-root creation in `agent/sandbox.js`: create `META_BWRAP_ROOT` (default `~/sandbox`) with mode `0700` on first use and lay out `bin/`, `lib/`, `home/`, `tmp/` before binding it at `/sandbox`. Verify: running any bwrap command creates the layout once and reuses it.
-- [ ] 5.2 Add a persistence test in `agent/sandbox.test.js` (skip without prerequisites): a file written by a write-enabled bwrap run is visible to a later read run in the same root; assert the root is reused, not recreated. Verify: the earlier artifact is present and non-empty on the second run.
-- [ ] 5.3 Document in `README.md` the persistent-root semantics (`META_BWRAP_ROOT`, layout, `0700`, survives commands, is disposable) and a disk-budget/cleanup note. Verify: README states the root is operator-managed and isolated from the workspace.
-- [ ] 5.4 Document in `README.md` the AppArmor host prerequisite: the path `/etc/apparmor.d/bwrap` (read-only, host-managed), the exact profile text as a fenced example (`abi <abi/4.0>,` + `profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, include if exists <local/bwrap> }`), the `apparmor_parser -r` reload step, and an explicit statement that the agent performs **no** automatic installation and never weakens the global sysctl. Verify: a reader can provision the host from the README alone.
-- [ ] 5.5 Document in `README.md` the confined install semantics: user-prefix only (`pip --target <sandbox-path>`, `npm --prefix <sandbox-path>`, `pip install --user` with `HOME` inside the root), `PATH` starting with `/sandbox/bin`, and that `sudo`/`su`/`apt`/`apt-get` classify as writes and have no escalation path. Verify: no instruction implies root inside the jail.
+- [x] 5.1 Implement sandbox-root creation in `agent/sandbox.js`: create `META_BWRAP_ROOT` (default `~/sandbox`) with mode `0700` on first use and lay out `bin/`, `lib/`, `home/`, `tmp/` before binding it at `/sandbox`. Verify: running any bwrap command creates the layout once and reuses it.
+- [x] 5.2 Add a persistence test in `agent/sandbox.test.js` (skip without prerequisites): a file written by a write-enabled bwrap run is visible to a later read run in the same root; assert the root is reused, not recreated. Verify: the earlier artifact is present and non-empty on the second run.
+- [x] 5.3 Document in `README.md` the persistent-root semantics (`META_BWRAP_ROOT`, layout, `0700`, survives commands, is disposable) and a disk-budget/cleanup note. Verify: README states the root is operator-managed and isolated from the workspace.
+- [x] 5.4 Document in `README.md` the AppArmor host prerequisite: the path `/etc/apparmor.d/bwrap` (read-only, host-managed), the exact profile text as a fenced example (`abi <abi/4.0>,` + `profile bwrap /usr/bin/bwrap flags=(unconfined) { userns, include if exists <local/bwrap> }`), the `apparmor_parser -r` reload step, and an explicit statement that the agent performs **no** automatic installation and never weakens the global sysctl. Verify: a reader can provision the host from the README alone.
+- [x] 5.5 Document in `README.md` the confined install semantics: user-prefix only (`pip --target <sandbox-path>`, `npm --prefix <sandbox-path>`, `pip install --user` with `HOME` inside the root), `PATH` starting with `/sandbox/bin`, and that `sudo`/`su`/`apt`/`apt-get` classify as writes and have no escalation path. Verify: no instruction implies root inside the jail.
 
 ## Phase 6: Docker Parity, Documentation and Acceptance
 

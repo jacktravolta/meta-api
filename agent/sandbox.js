@@ -10,7 +10,7 @@
 // UI as the attacker.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -330,6 +330,23 @@ function exitCodeFor(err) {
   return err ? 1 : 0;
 }
 
+// The persistent root (design: "bwrap jail root is a persistent operator-owned
+// directory"): create META_BWRAP_ROOT with mode 0700 and the bin/lib/home/tmp
+// layout ON FIRST USE, before buildBwrapArgv binds it at /sandbox. mkdirSync is
+// idempotent, so later runs reuse the SAME directory instead of recreating it —
+// installs and state under the root survive between commands, the deliberate
+// semantic change from docker's ephemeral filesystem. The chmod keeps the
+// posture when the operator pre-created the root looser than 0700: the root
+// holds installed packages, so it stays private to the operator.
+function ensureBwrapRoot(root) {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  for (const dir of ["bin", "lib", "home", "tmp"]) {
+    mkdirSync(path.join(root, dir), { recursive: true, mode: 0o700 });
+  }
+  if ((statSync(root).mode & 0o777) !== 0o700) chmodSync(root, 0o700);
+  return root;
+}
+
 // The bwrap execution path: one execFile of systemd-run wrapping the whole
 // jail, a host-side backstop, and the shared result contract plus `backend`.
 // The argv comes from the two pure builders (unit-tested above); command text
@@ -348,6 +365,16 @@ async function runBwrap(command, opts, needsWrite) {
   const refusal = userScopeRefusal();
   if (refusal) {
     return { ok: false, backend: "bwrap", error: refusal, output: `${refusal}\n` };
+  }
+
+  // The persistent root must exist — private, with its layout — BEFORE it is
+  // bound at /sandbox. A root we cannot create would otherwise surface as a
+  // cryptic bwrap bind failure mid-run, so refuse fail-closed naming the path.
+  try {
+    ensureBwrapRoot(o.bwrapRoot);
+  } catch (err) {
+    const reason = `sandbox root ${o.bwrapRoot} is unusable: ${err.message}`;
+    return { ok: false, backend: "bwrap", error: reason, output: `${reason}\n` };
   }
 
   const unit = `meta-sbx-${randomUUID().slice(0, 8)}`;

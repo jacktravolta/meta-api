@@ -8,10 +8,11 @@
 // The same file pins the read-only classifier itself: deny-by-default means
 // the whitelist entries are load-bearing, and every pipe segment and
 // indirection shape is a regression hazard.
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { accessSync, constants, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, readFileSync, rmSync, statSync,
+         writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
@@ -40,8 +41,25 @@ childProcess.execFile = (...args) => {
   return execFileImpl(...args);
 };
 
+// ---- suite sandbox root -------------------------------------------------------
+// sandbox.js snapshots META_BWRAP_ROOT into DEFAULTS when first imported, and
+// phase 5 makes every bwrap run CREATE the root layout before binding it.
+// Without this override the real-path tests below would create the host's
+// ~/sandbox — the suite must never create, write or delete it. Point the
+// default at a temp root BEFORE the import (per-test `bwrapRoot` opts still
+// win), and restore the env plus remove the temp tree in `after`.
+const savedBwrapRoot = process.env.META_BWRAP_ROOT;
+const suiteBwrapRoot = mkdtempSync(path.join(os.tmpdir(), "sbx-suite-root-"));
+process.env.META_BWRAP_ROOT = suiteBwrapRoot;
+
 const { classify, selfCheck, runSandboxed, resolveBackend, buildBwrapArgv, buildSystemdArgv } =
   await import("./sandbox.js");
+
+after(() => {
+  rmSync(suiteBwrapRoot, { recursive: true, force: true });
+  if (savedBwrapRoot === undefined) delete process.env.META_BWRAP_ROOT;
+  else process.env.META_BWRAP_ROOT = savedBwrapRoot;
+});
 
 test("selfCheck write probe classifies as write, so the default policy denies it", () => {
   assert.equal(classify("echo probe > /workspace/.sandbox-probe").write, true);
@@ -972,5 +990,95 @@ test("the docker self-check runs no bwrap prerequisite, so a missing profile can
   } finally {
     execFileImpl = realExecFile;
     restoreBackend();
+  }
+});
+
+// ---- Persistent root (phase 5): creation, layout, reuse ----------------------
+// Task 5.1: a bwrap run creates META_BWRAP_ROOT with mode 0700 and the
+// bin/lib/home/tmp layout on first use, then REUSES the same directory on
+// later runs — persistence is the spec'd semantic change from docker's
+// ephemeral filesystem. Everything runs through mkdtemp paths via the
+// `bwrapRoot` opt: the suite must never create, write or delete the host's
+// real ~/sandbox. Execution is faked through the spy seam, so these pins are
+// host-independent (no AppArmor profile, no real systemd scope needed).
+
+test("runBwrap creates the sandbox root layout 0700 on first use and reuses it", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  const parent = mkdtempSync(path.join(os.tmpdir(), "sbx-root-"));
+  const root = path.join(parent, "sandbox");   // deliberately NOT created yet
+  const spawned = [];
+  execFileImpl = (file, argv, opts, cb) => {
+    spawned.push({ file, argv });
+    setImmediate(() => cb(null, "", ""));
+    return { kill() { return false; } };
+  };
+  try {
+    // First run: the layout must appear from nothing, BEFORE the bind.
+    const first = await runSandboxed("ls /workspace", { bwrapRoot: root });
+    assert.equal(first.ok, true);
+    for (const dir of ["bin", "lib", "home", "tmp"]) {
+      assert.ok(statSync(path.join(root, dir)).isDirectory(),
+        `${dir}/ must be laid out on first use`);
+    }
+    assert.equal(statSync(root).mode & 0o777, 0o700,
+      "the persistent root must be private to the operator (0700)");
+    const run = spawned.find((s) => s.file === "systemd-run");
+    assert.ok(run, "the envelope must be spawned");
+    const bindIdx = run.argv.indexOf("--bind");
+    assert.notEqual(bindIdx, -1, "the sandbox root must be bound");
+    assert.deepEqual([run.argv[bindIdx + 1], run.argv[bindIdx + 2]], [root, "/sandbox"],
+      "the root must be bound at /sandbox");
+    const inode = statSync(root).ino;
+
+    // Second run: the SAME directory is reused — a marker written between
+    // runs must survive, proving the root is not recreated per command.
+    writeFileSync(path.join(root, "home", "marker"), "keep-me");
+    const second = await runSandboxed("ls /workspace", { bwrapRoot: root });
+    assert.equal(second.ok, true);
+    assert.equal(statSync(root).ino, inode, "the root must be reused, not recreated");
+    assert.equal(readFileSync(path.join(root, "home", "marker"), "utf8"), "keep-me",
+      "state written under the root must survive between commands");
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test("a file written by a write-enabled bwrap run persists into a later read run (jail-gated)", async (t) => {
+  // Task 5.2. Gated on the cached real-jail probe: on a host that cannot
+  // provision the jail this SKIPS with the captured first error line — never
+  // fails (design: "must skip, not fail"). The root lives under mkdtemp and
+  // is removed in finally, so the suite never touches the real ~/sandbox.
+  const seed = await trivialBwrapRun();
+  if (!seed.ok) return t.skip(`bwrap jail unavailable on this host: ${firstErrorLine(seed)}`);
+  const restoreBackend = withDefaultBackend();
+  const parent = mkdtempSync(path.join(os.tmpdir(), "sbx-persist-"));
+  const root = path.join(parent, "sandbox");
+  try {
+    // A write-enabled run plants an artifact under the sandbox root.
+    const writeRun = await runSandboxed("echo persisted-artifact > /sandbox/artifact",
+      { bwrapRoot: root, allowWrite: true });
+    assert.equal(writeRun.backend, "bwrap");
+    assert.equal(writeRun.ok, true, `the write run must succeed: ${firstErrorLine(writeRun)}`);
+    const inode = statSync(root).ino;
+
+    // A LATER read run in the same root must see the artifact, non-empty.
+    const readRun = await runSandboxed("cat /sandbox/artifact", { bwrapRoot: root });
+    assert.equal(readRun.ok, true, `the read run must succeed: ${firstErrorLine(readRun)}`);
+    const seen = String(readRun.output || "").trim();
+    assert.ok(seen.length > 0, "the earlier artifact must be present and non-empty");
+    assert.equal(seen, "persisted-artifact",
+      "the artifact written by the earlier command must still be visible");
+
+    // The same root directory was reused, not recreated per command.
+    assert.equal(statSync(root).ino, inode, "the root must be reused, not recreated");
+    assert.ok(statSync(path.join(root, "artifact")).size > 0,
+      "the artifact must also be visible to the host under META_BWRAP_ROOT");
+  } finally {
+    restoreBackend();
+    rmSync(parent, { recursive: true, force: true });
   }
 });
