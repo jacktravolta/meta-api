@@ -18,9 +18,10 @@ cd /home/test/test/meta-api
 watcher process exits after one unanswered Don Bot invocation or 60 minutes of
 silence, and systemd restarts it after five seconds. To inspect pending
 invocations without starting the watcher, run
-`./relay/operar.sh pending`. To stop all scraping and prevent automatic startup
-at the next login, run `./relay/operar.sh stop`. A later console can run `start`
-again without reinstalling anything.
+`./relay/operar.sh pending`. To stop all scraping, prevent automatic startup,
+and block another unit from indirectly restarting the broker, run
+`./relay/operar.sh stop`. A later console can run `start` to remove the runtime
+masks and restore the stack without reinstalling anything.
 
 Install or refresh the user services once with `./relay/operar.sh install`. It
 copies the broker/watcher units and tracked drop-ins without enabling or starting

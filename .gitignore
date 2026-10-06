@@ -12,3 +12,11 @@ state.json
 
 # Backups de estado que deja el propio servicio al arrancar
 state.json.bak-*
+
+# bridge runtime state (no versionar)
+bridge/canal.json
+bridge/vistos.json
+bridge/*.log
+bridge/don-bot-enviados.txt
+bridge/msg-meta.txt
+bridge/ignorar-meta.flag
