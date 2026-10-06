@@ -23,17 +23,17 @@ GET  /v1/models · GET /health
 ## Install
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/meta-api.service ~/.config/systemd/user/
-cp -r systemd/meta-api.service.d ~/.config/systemd/user/   # optional: visible mode
-systemctl --user daemon-reload
-systemctl --user enable --now meta-api.service
+./relay/operar.sh install
+./relay/operar.sh start
 ```
 
-`Linger=no` on this machine, so the user unit starts at login rather than at boot.
-For boot-time start without a login you need `loginctl enable-linger test` (requires
-root). A `@reboot` crontab fallback with a port guard is installed as a second line
-of defence.
+The installer copies the broker and watcher units plus tracked drop-ins, but does
+**not** enable or start them. `start` enables and starts the broker, opens the
+logged-in Meta tab, and starts the watcher. `watch` attaches the current terminal
+to watcher logs. To stop scraping and prevent automatic startup at the next login, run
+`./relay/operar.sh stop`; a later `start` command remains available.
+The unit expects this checkout at `/home/test/test/meta-api` and Node 22 at the path in the
+unit; adjust those two paths in `systemd/meta-api.service` if you relocate it.
 
 ## Login
 
@@ -46,8 +46,9 @@ google-chrome-beta --user-data-dir=/home/test/.config/google-chrome-beta-debug \
   --no-first-run https://www.meta.ai
 ```
 
-Sign in, close Chrome, then `systemctl --user start meta-api`. The session lives in
-the profile, so this is a one-time action.
+Sign in, close Chrome, then run `./relay/operar.sh start` and
+`./relay/operar.sh warmup`. The session lives in the profile, so this is a one-time
+action.
 
 ## Configuration
 
@@ -62,10 +63,11 @@ the profile, so this is a one-time action.
 | `META_VISIBLE` | — | `1` shows the Chrome window on `DISPLAY` |
 | `META_PROFILE` | `~/.config/google-chrome-beta-debug` | Chrome profile (holds the session) |
 | `META_CDP_PORT` | `9233` | Chrome debug port |
-| `META_RESET_TURNS` | `8` | backstop: rotate after N turns on a worker. Same rotation, not a separate reset |
+| `META_IMAGES_DIR` | `~/.local/state/meta-api/images` | Persistent storage for image attachments during a job |
+| `META_RESET_TURNS` | `60` | backstop: rotate after N turns on a worker. Same rotation, not a separate reset |
 | `META_CONTEXT_SOFT_PCT` | `70` | rotate the thread when estimated context reaches this % |
-| `META_CONTEXT_BUDGET_CHARS` | `24000` | character budget the % is measured against |
-| `META_CONTEXT_SEED_CHARS` | `8000` | starting estimate for a thread we resume but never watched being built |
+| `META_CONTEXT_BUDGET_CHARS` | `150000` | character budget the % is measured against |
+| `META_CONTEXT_SEED_CHARS` | `25000` | starting estimate for a thread we resume but never watched being built |
 | `META_RECOVERY_MAX_AGE_MS` | `1800000` | ignore persisted jobs older than this on boot; their caller has given up |
 | `META_AGENT_BUDGET_MS` | `900000` | default wall-clock budget of an agent job; the per-request `budgetMs` is clamped to 30s..1h |
 | `META_SANDBOX_WORKDIR_ROOTS` | `/home/test/test` | colon-separated roots; an agent `workdir` must realpath inside one of them or the request is refused |
@@ -78,6 +80,13 @@ the profile, so this is a one-time action.
 The current thread URL is written to `state.json` right after every successful
 send and reloaded at boot, so a reopen resumes the same conversation instead of
 landing on the home screen. Only real `/prompt/<uuid>` URLs are stored.
+
+Relay channel selection and watcher state live under the ignored local
+`relay/state/` directory. `relay/operar.sh` seeds the current channel from
+`relay/canal.example.json` on first use; channel changes and detector history
+remain local and are never committed. Image attachments are kept under the user
+state directory instead of ephemeral `/tmp`, so a broker restart cannot break a
+queued image job.
 
 ## Concurrency
 

@@ -23,6 +23,7 @@ Environment=META_MODE=speed
 # is only the legacy alias for META_MIN_WORKERS, so do not set it here.
 Environment=META_CDP_PORT=9233
 Environment=META_PROFILE=/home/test/.config/google-chrome-beta-debug
+Environment=META_IMAGES_DIR=%h/.local/state/meta-api/images
 # Close the browser 30s after the last job. The thread URL is persisted in
 # state.json and the cookies live in the profile, so reopening is cheap: the next
 # request lands on the SAME conversation instead of starting a new one.

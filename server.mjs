@@ -37,6 +37,8 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { writeFileSync, mkdirSync, readFileSync, unlinkSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgentLoop } from "./agent/loop.js";
 import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
@@ -121,7 +123,8 @@ const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 25000);
 // OpenAI-style multimodal content: content is an ARRAY of parts, not a string.
 // Stringifying it yields "[object Object],[object Object]", which is what Meta
 // used to receive when a screenshot was pasted into the chat.
-const IMAGES_DIR = process.env.META_IMAGES_DIR || "/tmp/opencode/meta-images";
+const STATE_HOME = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
+const IMAGES_DIR = process.env.META_IMAGES_DIR || join(STATE_HOME, "meta-api", "images");
 const MAX_IMAGE_BYTES = Number(process.env.META_MAX_IMAGE_BYTES || 20 * 1024 * 1024);
 
 function parseUserContent(raw) {

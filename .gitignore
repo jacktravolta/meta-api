@@ -9,3 +9,6 @@ node_modules/
 systemd/meta-api.service.d/medicion.conf
 pending-jobs.json
 state.json
+
+# Backups de estado que deja el propio servicio al arrancar
+state.json.bak-*
