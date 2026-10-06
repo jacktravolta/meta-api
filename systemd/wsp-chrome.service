@@ -1,0 +1,36 @@
+[Unit]
+Description=Chrome con puerto de debug para el puente de WhatsApp Web
+Documentation=file:///home/test/test/meta-api/relay/wsp.mjs
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# OJO con el perfil: Chrome >= 136 IGNORA --remote-debugging-port cuando el
+# user-data-dir es el perfil oficial de ese canal. Con google-chrome-beta el
+# flag estaba puesto y el puerto no abria nunca. Con un directorio propio si
+# abre. Por eso el perfil es google-chrome-wa y NO google-chrome-beta.
+#
+# Ese perfil se armo copiando solo lo que guarda la sesion de WhatsApp
+# (Cookies, Local Storage, Session Storage, IndexedDB) en vez de los 2.3G del
+# perfil completo, que son casi todos extensiones y caches.
+ExecStart=/opt/google/chrome-beta/chrome \
+  --remote-debugging-port=9333 \
+  --user-data-dir=/home/test/.config/google-chrome-wa \
+  --no-first-run --no-default-browser-check \
+  --window-position=0,0 \
+  https://web.whatsapp.com
+
+Environment=DISPLAY=:0.0
+Environment=HOME=/home/test
+
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wsp-chrome
+
+[Install]
+WantedBy=default.target
