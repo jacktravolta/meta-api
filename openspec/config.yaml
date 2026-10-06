@@ -1,0 +1,57 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Node.js 22 (ESM, no package.json). server.mjs (~2100 lines) exposes
+  Meta AI behind an OpenAI-compatible API and wires the agent route POST /v1/agent.
+  Architecture: single-file broker + agent module (agent/loop.js, tools.js, sandbox.js);
+  a real Chrome instance over CDP is the "model"; jobs persist to pending-jobs.json/state.json.
+  Testing: native node:test in agent/*.test.js, run with Node 22 from the repo root
+  (do NOT use `node --test agent/`; this runner rejects directories).
+  Style: ESM, 2-space indent; runtime state files are gitignored.
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    guidelines:
+      - Follow existing code patterns
+    tdd: false
+    test_command: "cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'"
+  verify:
+    test_command: "cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'"
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
+
+strict_tdd: false
+
+testing:
+  strict_tdd: false
+  detected: "2026-10-06"
+  projects:
+    - path: "."
+      stack: "Node.js 22 (ESM, no package.json)"
+      test_command: "cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'"
+      framework: "node:test (native)"
+      baseline: "38 passed / 0 failed / 0 skipped"
+      layers:
+        unit: true
+        integration: false
+        e2e: false
+      coverage:
+        available: false
+        tool: null
+      quality:
+        linter: false
+        type_checker: false
+        formatter: false
