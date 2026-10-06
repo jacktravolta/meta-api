@@ -127,6 +127,8 @@ for (let i = 0; i < 1800; i++) {
       // Lo que emiti yo (con o sin prefijo) no es un dictado: en el registro,
       // cotejado por POSICION (turno) — un mensaje viejo replicado no coincide.
       if (esMio(r.txt)) { vistos.add(norm(r.txt)); continue; }
+      // Mis propias subidas a Meta (audio/imagen) empiezan con este texto.
+      if (/^Nota de voz de Don Jack\. Transcripcion:/i.test(r.txt.trim())) { vistos.add(norm(r.txt)); continue; }
       if (/^(?:\S{1,4}\s*)?\[don\s?bot\]/i.test(r.txt)) {
         const p = pref(r.txt);
         if (p && !esMio(r.txt) && !vistos.has(norm(r.txt))) {
