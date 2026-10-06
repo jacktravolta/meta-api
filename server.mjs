@@ -1343,6 +1343,9 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const GEN_EMPTY_POLLS = Math.max(24, Number(process.env.META_GEN_EMPTY_POLLS || 24));
   const STOP_GONE_MIN_POLLS = Math.max(8, Number(process.env.META_STOP_GONE_MIN_POLLS || 8));
   const MAX_POLLS = Math.max(260, Number(process.env.META_MAX_POLLS || 260));
+  // Patience while waiting for the end-of-message icons after the stop control
+  // vanished (web search / re-render). ~120 polls ≈ 108s at the 900ms cadence.
+  const ICON_WAIT_POLLS = Math.max(10, Number(process.env.META_ICON_WAIT_POLLS || 120));
   // Absolute cap on the whole answer wait. Every other exit is content based, so
   // a pathological case could still keep a job alive indefinitely and, with it,
   // the browser: activeJobs() would never reach 0 and the idle auto-close would
@@ -1406,14 +1409,25 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     //     answers never show the stop control, and 6 unchanged polls (~5.4s) is
     //     already a strong hint the turn is over without paying the old 20s.
     if (idle >= 1 && ((await countCopies()) || 0) > preCopies) { log("finalizado por copy-control"); break; }
-    if (idle >= 1 && sawGenerating && !gen) { log("finalizado por fin de generacion (stop control ausente)"); break; }
+    // The stop control vanishing is NOT completion: during Meta's web search
+    // the stop button disappears while she is still working, and a search
+    // status line ("Buscando imagenes de panaderia") was once returned as a
+    // final answer. The end-of-message ICONS (copy control, checked above)
+    // are the only trusted semaphore once generation started — so this branch
+    // deliberately does NOT break; it falls through and keeps polling.
+    if (idle >= 1 && sawGenerating && !gen && idle % 24 === 0) log("  stop ausente sin iconos finales: sigo esperando el semaforo de iconos");
     // Do NOT give up while Meta still reports "generating". The old limit was
     // 3 polls (~2.7s) and Meta PAUSES while it interprets the prompt before it
     // writes anything, so every longer answer came back truncated to its
     // preamble ("Interpretando solicitud..."). The short limits only apply once
     // generation has actually stopped.
     const idleLimit = idleLimitFor(gen, sawGenerating);
-    if (idle >= idleLimit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
+    // While we wait for the end-of-message icons (stop gone, no copy control
+    // yet) Meta may be searching the web or re-rendering — extend the
+    // patience well past the short stalled-text limits.
+    const waitingIcons = sawGenerating && !gen;
+    const limit = waitingIcons ? Math.max(idleLimit, ICON_WAIT_POLLS) : idleLimit;
+    if (idle >= limit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
     if (Date.now() - startedAt > HARD_TIMEOUT_MS) {
       log(`finalizado por timeout absoluto (${Math.round((Date.now() - startedAt) / 1000)}s) con ${idle} polls sin cambio`);
       break;
