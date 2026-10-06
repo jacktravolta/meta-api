@@ -1422,12 +1422,16 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     // preamble ("Interpretando solicitud..."). The short limits only apply once
     // generation has actually stopped.
     const idleLimit = idleLimitFor(gen, sawGenerating);
-    // While we wait for the end-of-message icons (stop gone, no copy control
-    // yet) Meta may be searching the web or re-rendering — extend the
-    // patience well past the short stalled-text limits.
+    // The message is only FINAL when Meta renders its end-of-message icons
+    // (copy control, checked above). While the stop control is gone and no
+    // icons have appeared, Meta may be running an extended reasoning pass
+    // whose status line ("Definiendo identidad visual") stays stable for
+    // minutes — the short idle limits returned that status text as the
+    // answer (garbage "final" observed live, twice). Never finalize by idle
+    // in that state: the poll loop stays bounded by MAX_POLLS and the
+    // absolute hard timeout instead.
     const waitingIcons = sawGenerating && !gen;
-    const limit = waitingIcons ? Math.max(idleLimit, ICON_WAIT_POLLS) : idleLimit;
-    if (idle >= limit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
+    if (!waitingIcons && idle >= idleLimit) { log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`); break; }
     if (Date.now() - startedAt > HARD_TIMEOUT_MS) {
       log(`finalizado por timeout absoluto (${Math.round((Date.now() - startedAt) / 1000)}s) con ${idle} polls sin cambio`);
       break;
