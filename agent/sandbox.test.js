@@ -11,7 +11,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
@@ -209,10 +209,9 @@ async function dockerReachable() {
 
 test("selfCheck enforces the whole default posture", async (t) => {
   if (!(await dockerReachable())) return t.skip("docker no disponible");
-  // selfCheck only becomes backend-aware in phase 4; until then its probes
-  // dispatch through the active backend, and the default is bwrap since the
-  // phase-3 dispatch landed. Pin `docker` so this docker-posture e2e keeps
-  // exercising docker (and stays valid after phase 4 delegates by backend).
+  // selfCheck delegates by backend since phase 4 and the default is `bwrap`,
+  // so pin `docker` to keep this docker-posture e2e exercising the docker arm
+  // (task 4.1: the docker probes themselves are behaviorally unchanged).
   const saved = process.env.META_SANDBOX_BACKEND;
   process.env.META_SANDBOX_BACKEND = "docker";
   try {
@@ -762,6 +761,216 @@ test("a real over-cap output is truncated at maxOutputBytes (jail-gated)", async
     assert.ok(r.output.endsWith(marker), "the shared truncation marker must be appended");
     assert.equal(Buffer.byteLength(r.output), 8192 + Buffer.byteLength(marker));
   } finally {
+    restoreBackend();
+  }
+});
+
+// ---- Backend-aware selfCheck (phase 4): prereqs, posture, route gate ----------
+// Tasks 4.1-4.6. `server.mjs` turns a failing selfCheck into the route's 503,
+// so every fail-closed path must come back with an actionable `reason`: an
+// invalid backend naming the rejected and accepted values, a missing bwrap
+// prerequisite naming it (this host's actual gap is the AppArmor `userns,`
+// profile), and an unproven posture dimension naming which one. Probe
+// outcomes are faked through the execFile seam so these pins hold on ANY
+// host; the real-host variants run the actual probes and skip — never fail —
+// where the prerequisite under test is not missing.
+
+// PATH lookup for test gates only (mirrors the module's spawn-free check).
+function onPath(bin) {
+  return String(process.env.PATH || "").split(path.delimiter).filter(Boolean)
+    .some((dir) => {
+      try { accessSync(path.join(dir, bin), constants.X_OK); return true; }
+      catch { return false; }
+    });
+}
+
+function withBackend(value) {
+  const saved = process.env.META_SANDBOX_BACKEND;
+  if (value === undefined) delete process.env.META_SANDBOX_BACKEND;
+  else process.env.META_SANDBOX_BACKEND = value;
+  return () => {
+    if (saved === undefined) delete process.env.META_SANDBOX_BACKEND;
+    else process.env.META_SANDBOX_BACKEND = saved;
+  };
+}
+
+// Fake execution for the selfCheck probes. Each response is keyed on the
+// COMMAND TEXT the probe ran (the markers are baked into the probe commands),
+// never on call order, so breaking one dimension in isolation is stable. The
+// userns prereq spawn succeeds unless `broken.userns` is set. Backend-agnostic:
+// the docker and bwrap arms issue the same probe commands.
+function fakeSelfCheckExec(broken = {}) {
+  execFileImpl = (file, argv, opts, cb) => {
+    const cmd = argv.join(" ");
+    if (cmd.includes("/bin/true")) {           // the bwrap userns prereq probe
+      const stderr = broken.userns ? "bwrap: setting up uid map: Permission denied" : "";
+      setImmediate(() => cb(
+        broken.userns
+          ? Object.assign(new Error("Command failed: bwrap"), { code: 1, stderr })
+          : null,
+        "", stderr));
+      return { kill() { return false; } };
+    }
+    let stdout = "";
+    if (cmd.includes("echo FS_OK")) {
+      stdout = broken.fsRead ? "workspace not mounted" : "file.txt\nFS_OK";
+    } else if (cmd.includes("NET_LEAK")) {
+      stdout = broken.networkBlocked
+        ? "NET_LEAK\n1000\nmeta-host"
+        : "NET_BLOCKED\n1000\nabc0123def456";
+    } else if (cmd.includes("HOME_SEEN")) {
+      stdout = broken.hostHomeInvisible
+        ? "file.txt\nHOME_SEEN"
+        : "ls: cannot access: No such file or directory\nHOME_HIDDEN";
+    }
+    setImmediate(() => cb(null, stdout, ""));
+    return { kill() { return false; } };
+  };
+}
+
+test("selfCheck fails closed on an invalid backend, naming the rejected and accepted values", async () => {
+  const restoreBackend = withBackend("podman");
+  try {
+    const before = execFileCalls.length;
+    const r = await selfCheck();
+    assert.equal(r.ok, false);
+    assert.ok(r.reason, "an invalid backend must fail closed with a reason");
+    assert.match(r.reason, /podman/, "the reason must name the rejected value");
+    assert.match(r.reason, /bwrap/, "the reason must name the accepted set");
+    assert.match(r.reason, /docker/, "the reason must name the accepted set");
+    assert.equal(execFileCalls.length, before, "no probe may spawn for an invalid backend");
+  } finally {
+    restoreBackend();
+  }
+});
+
+test("bwrap selfCheck needs all four posture dimensions and names the unproven ones", async () => {
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  try {
+    // All four proven -> ok:true with no reason.
+    fakeSelfCheckExec();
+    let r = await selfCheck();
+    assert.equal(r.ok, true);
+    assert.equal(r.backend, "bwrap");
+    assert.equal(r.reason, null);
+
+    // Each dimension that the fake can break fails ok on its own, and the
+    // reason names exactly it (task 4.3: ok:false whenever one is unproven).
+    for (const dim of ["fsRead", "networkBlocked", "hostHomeInvisible"]) {
+      fakeSelfCheckExec({ [dim]: true });
+      r = await selfCheck();
+      assert.equal(r.ok, false, `${dim} unproven must fail ok`);
+      assert.equal(r.backend, "bwrap");
+      assert.match(String(r.reason), /unproven bwrap posture/);
+      assert.match(String(r.reason), new RegExp(dim));
+    }
+    // writeBlocked can never drop through this fake: the write probe is
+    // refused by the shared policy BEFORE any spawn (pinned at the top of
+    // this file), so there is no execFile call to fake. It feeds `ok` through
+    // the same dimension verdict as the others, proven green above.
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+test("selfCheck on bwrap fails closed naming the AppArmor userns prerequisite when the userns probe fails", async (t) => {
+  if (!onPath("bwrap")) return t.skip("bwrap binary not on PATH");
+  const restoreSession = stubUserSession();
+  const restoreBackend = withDefaultBackend();
+  // This host's captured bwrap denial for the prereq probe, faked so the pin
+  // holds on provisioned hosts too (the real-probe variant is below).
+  const stderr = "bwrap: setting up uid map: Permission denied";
+  execFileImpl = (file, argv, opts, cb) => {
+    setImmediate(() => cb(
+      Object.assign(new Error("Command failed: bwrap"), { code: 1, stderr }), "", stderr));
+    return { kill() { return false; } };
+  };
+  try {
+    const before = execFileCalls.length;
+    const r = await selfCheck();
+    assert.equal(r.ok, false);
+    assert.equal(r.backend, "bwrap");
+    assert.match(String(r.reason), /user-namespace creation failed/);
+    assert.match(String(r.reason), /uid map/, "the reason must carry the captured probe detail");
+    assert.match(String(r.reason), /AppArmor/i, "the reason must name the AppArmor prerequisite");
+    assert.match(String(r.reason), /userns,/, "the reason must name the profile permission");
+    // Fail closed BEFORE any posture probe: only the one prereq spawn ran.
+    assert.deepEqual(execFileCalls.slice(before).map((c) => c[0]), ["bwrap"]);
+    for (const dim of ["writeBlocked", "fsRead", "networkBlocked", "hostHomeInvisible"]) {
+      assert.equal(r[dim], false, `an unproven ${dim} must not claim to be proven`);
+    }
+  } finally {
+    execFileImpl = realExecFile;
+    restoreSession();
+    restoreBackend();
+  }
+});
+
+test("the real bwrap selfCheck fails closed with an AppArmor/userns reason on this host", async (t) => {
+  const restoreBackend = withDefaultBackend();
+  try {
+    const r = await selfCheck();
+    if (!/user-namespace creation failed/i.test(String(r.reason || ""))) {
+      return t.skip(`the userns prerequisite is not failing here: ` +
+                    (r.ok ? "all prerequisites proven" : String(r.reason)));
+    }
+    assert.equal(r.ok, false);
+    assert.equal(r.backend, "bwrap");
+    assert.match(String(r.reason), /AppArmor/i);
+  } finally {
+    restoreBackend();
+  }
+});
+
+test("the full bwrap posture verifies when the host prerequisites are met", async (t) => {
+  // Gate per task 4.5: bwrap, systemd-run --user, and a readable
+  // /etc/apparmor.d/bwrap profile. A missing prerequisite skips with its
+  // captured reason — never fails (design: "must skip, not fail").
+  if (!existsSync("/etc/apparmor.d/bwrap")) {
+    return t.skip("AppArmor profile /etc/apparmor.d/bwrap is absent");
+  }
+  if (!onPath("bwrap") || !onPath("systemd-run")) {
+    return t.skip("bwrap and/or systemd-run missing on PATH");
+  }
+  const bus = process.env.XDG_RUNTIME_DIR
+    ? path.join(process.env.XDG_RUNTIME_DIR, "bus")
+    : (String(process.env.DBUS_SESSION_BUS_ADDRESS || "").match(/(?:^|,)unix:path=([^,]+)/) || [])[1];
+  if (!bus || !existsSync(bus)) return t.skip("no usable systemd user session (bus socket)");
+  const restoreBackend = withDefaultBackend();
+  try {
+    const r = await selfCheck();
+    assert.equal(r.backend, "bwrap");
+    assert.equal(r.writeBlocked, true);       // refused by policy, never executed
+    assert.equal(r.fsRead, true);             // workspace mounted and readable
+    assert.equal(r.networkBlocked, true);     // --unshare-all: the fetch cannot leave
+    assert.equal(r.hostHomeInvisible, true);  // the host home path does not resolve
+    assert.equal(r.ok, true);
+    // The denied write probe never executed, so the workspace stays clean.
+    const defaultWorkdir = process.env.META_SANDBOX_WORKDIR || "/home/test/test";
+    assert.equal(existsSync(defaultWorkdir + "/.sandbox-probe"), false);
+  } finally {
+    restoreBackend();
+  }
+});
+
+test("the docker self-check runs no bwrap prerequisite, so a missing profile cannot gate it", async () => {
+  const restoreBackend = withBackend("docker");
+  fakeSelfCheckExec();
+  try {
+    const before = execFileCalls.length;
+    const r = await selfCheck();
+    assert.equal(r.ok, true);
+    assert.equal(r.backend, "docker");
+    assert.equal(r.reason, null);
+    const spawns = execFileCalls.slice(before).map((c) => c[0]);
+    assert.ok(spawns.length > 0, "the docker posture must actually probe");
+    assert.ok(spawns.every((f) => f === "docker"),
+      `only docker spawns are allowed on the docker arm, got: ${JSON.stringify(spawns)}`);
+  } finally {
+    execFileImpl = realExecFile;
     restoreBackend();
   }
 });

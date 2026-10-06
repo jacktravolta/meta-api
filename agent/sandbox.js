@@ -10,7 +10,7 @@
 // UI as the attacker.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, constants, existsSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -289,10 +289,12 @@ async function runDocker(command, opts, needsWrite) {
 // silently"). Both checks are spawn-free, so the refusal happens BEFORE any
 // process exists, and both read the live environment so a test can stub a
 // session in or out.
-function systemdRunOnPath() {
+// Spawn-free binary lookup on PATH. Generalized from the systemd-run check so
+// the self-check prerequisite probes share one implementation.
+function binaryOnPath(name) {
   const dirs = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
   return dirs.some((dir) => {
-    try { accessSync(path.join(dir, "systemd-run"), constants.X_OK); return true; }
+    try { accessSync(path.join(dir, name), constants.X_OK); return true; }
     catch { return false; }
   });
 }
@@ -307,7 +309,7 @@ function userBusSocket() {
 }
 
 function userScopeRefusal() {
-  if (!systemdRunOnPath()) {
+  if (!binaryOnPath("systemd-run")) {
     return "systemd-run not found on PATH: the bwrap backend requires the " +
            "systemd user scope and will not run unlimited";
   }
@@ -396,8 +398,12 @@ async function runBwrap(command, opts, needsWrite) {
 }
 
 // Capability probe, so the loop can refuse to start when the sandbox is not
-// actually enforcing anything. Each dimension gets its own sub-probe so each
-// one classifies the way its assertion needs:
+// actually enforcing anything. Backend-aware since phase 4: the active
+// backend is resolved first and each arm proves its OWN prerequisites and
+// posture. Every failure — invalid backend, missing prerequisite, unproven
+// dimension — returns fail-closed with a `reason`, because server.mjs turns
+// exactly that into the route's 503. Each dimension gets its own sub-probe so
+// each one classifies the way its assertion needs:
 //
 //   * write  : the write attempt runs under the DEFAULT policy and must be
 //              DENIED by the policy layer (writeBlocked). It is never
@@ -409,10 +415,43 @@ async function runBwrap(command, opts, needsWrite) {
 //   * network : trusted static code, never model output. It still needs
 //              allowWrite because curl and the >/dev/null redirect classify
 //              as write; what it verifies is the allowNetwork DEFAULT: the
-//              fetch must fail because of --network none, not because we
-//              granted egress. hostHomeInvisible rides along on it for the
-//              same reason: `hostname` is not on the read-only whitelist.
+//              fetch must fail because isolation is on, not because we
+//              granted egress.
+//   * hostHome: backend-specific — see each arm below.
 export async function selfCheck() {
+  // An invalid META_SANDBOX_BACKEND fails closed BEFORE any probe runs:
+  // nothing may execute under a backend the operator did not choose, not
+  // even the probes. The reason names the rejected value and the accepted
+  // set so the 503 is actionable.
+  const resolved = resolveBackend();
+  if (resolved.error) {
+    return {
+      ok: false,
+      reason: resolved.error,
+      writeBlocked: false,
+      fsRead: false,
+      networkBlocked: false,
+      hostHomeInvisible: false,
+      raw: resolved.error,
+    };
+  }
+  if (resolved.backend === "docker") return dockerSelfCheck();
+  return bwrapSelfCheck();
+}
+
+// `ok` requires EVERY dimension; the reason names exactly the ones that did
+// not prove, so an operator reading the 503 body knows which probe to look
+// at instead of only "the sandbox does not verify".
+function postureVerdict(backend, dims) {
+  const missing = Object.entries(dims).filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length === 0) return { ok: true, reason: null };
+  return { ok: false, reason: `unproven ${backend} posture: ${missing.join(", ")}` };
+}
+
+// The original probe set, extracted verbatim when the dispatcher landed
+// (task 4.1: behavior unchanged). hostHomeInvisible leans on the container
+// hostname: it is a fresh hex id, never the host's name.
+async function dockerSelfCheck() {
   // (a) Write policy: denied:true means the policy layer refused the command
   // before any container existed. Anything else (the write running, or a
   // docker failure) means the sandbox is not enforcing the default policy.
@@ -435,12 +474,140 @@ export async function selfCheck() {
   // host's. A shared network namespace would leak it.
   const hostHomeInvisible = !/\btest\b/.test(netOut.split("\n").slice(-1)[0] || "");
 
+  const dims = { writeBlocked, fsRead, networkBlocked, hostHomeInvisible };
+  const { ok, reason } = postureVerdict("docker", dims);
   return {
-    ok: writeBlocked && fsRead && networkBlocked && hostHomeInvisible,
-    writeBlocked,
-    fsRead,
-    networkBlocked,
-    hostHomeInvisible,
+    ok,
+    ...dims,
+    backend: "docker",
+    reason,
     raw: [writeProbe.output, fsProbe.output, netOut].filter(Boolean).join("\n---\n").trim(),
+  };
+}
+
+// Real user-namespace creation probe (design: "bwrap host prerequisites
+// verified by the self-check"). This is the AppArmor-gated operation: with
+// kernel.apparmor_restrict_unprivileged_userns=1 the bwrap binary needs a
+// profile granting `userns,`, and without it the map setup dies at
+// "setting up uid map: Permission denied". The argv mirrors the jail's
+// minimal system view so a provisioned host proves the real path, and it
+// travels through execFile so tests can fake the outcome via the seam.
+function probeUserns() {
+  const argv = [
+    "--unshare-user",
+    "--ro-bind", "/usr", "/usr",
+    "--symlink", "usr/bin", "/bin",
+    "--symlink", "usr/lib", "/lib",
+    "--symlink", "usr/lib64", "/lib64",
+    "--ro-bind-try", "/etc/ld.so.cache", "/etc/ld.so.cache",
+    "--", "/bin/true",
+  ];
+  return new Promise((resolve) => {
+    try {
+      execFile("bwrap", argv, { timeout: 5_000 }, (err, stdout, stderr) => {
+        const detail = String(stderr || "").trim() ||
+                       String(err?.message || err || "").trim() ||
+                       "unknown failure";
+        resolve({ ok: !err, detail });
+      });
+    } catch (err) {
+      resolve({ ok: false, detail: String(err?.message || err) });
+    }
+  });
+}
+
+// The userns failure is reported with the HOST state that decides it: both
+// branches name the AppArmor profile and its `userns,` permission (those are
+// the two knobs either way), and the restricted branch additionally states
+// the observed restriction. The agent reads this state only — it never
+// weakens the sysctl and never installs the profile itself.
+function diagnoseUsernsFailure(detail) {
+  let restrict = null;
+  try {
+    restrict = readFileSync(
+      "/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "utf8").trim();
+  } catch { /* state unknown: fall through to the generic wording */ }
+  const head = `user-namespace creation failed (${detail})`;
+  if (restrict === "1" && !existsSync("/etc/apparmor.d/bwrap")) {
+    return `${head}: kernel.apparmor_restrict_unprivileged_userns=1 and the ` +
+           `AppArmor profile /etc/apparmor.d/bwrap granting \`userns,\` is missing — ` +
+           `the bwrap backend needs it to create a user namespace (the agent never ` +
+           `weakens the sysctl nor installs the profile itself)`;
+  }
+  return `${head}: the bwrap backend needs a user namespace authorized by the ` +
+         `AppArmor profile /etc/apparmor.d/bwrap (\`userns,\`) — check that profile ` +
+         `and kernel.apparmor_restrict_unprivileged_userns (currently ` +
+         `${restrict ?? "unknown"})`;
+}
+
+// Fail closed helper: dimensions stay false until they are actually proven,
+// so a missing prerequisite can never read as a green posture.
+function bwrapFailClosed(reason) {
+  return {
+    ok: false,
+    backend: "bwrap",
+    reason,
+    writeBlocked: false,
+    fsRead: false,
+    networkBlocked: false,
+    hostHomeInvisible: false,
+    raw: reason,
+  };
+}
+
+// The bwrap arm: prerequisites FIRST (design data flow — prereq probes then
+// posture probes), so ok:false always names the first thing to fix. Any
+// missing prerequisite fails closed BEFORE any posture probe runs: no jail
+// process, no partial evidence, never unlimited execution.
+async function bwrapSelfCheck() {
+  // (1) The binary itself.
+  if (!binaryOnPath("bwrap")) {
+    return bwrapFailClosed(
+      "bwrap binary not found on PATH: the bwrap backend will not run unconstrained");
+  }
+
+  // (2) A REAL user namespace — the AppArmor-gated operation.
+  const userns = await probeUserns();
+  if (!userns.ok) return bwrapFailClosed(diagnoseUsernsFailure(userns.detail));
+
+  // (3) The systemd user scope, via the same spawn-free preflight runBwrap
+  // uses, so selfCheck and execution can never disagree about the envelope.
+  const refusal = userScopeRefusal();
+  if (refusal) return bwrapFailClosed(refusal);
+
+  // Prerequisites proven — now the four posture dimensions, dispatched
+  // through the shared runSandboxed so every probe runs under this backend.
+  const writeProbe = await runSandboxed("echo probe > /workspace/.sandbox-probe");
+  const writeBlocked = writeProbe.denied === true;
+
+  const fsProbe = await runSandboxed("ls /workspace && echo FS_OK");
+  const fsRead = fsProbe.ok && /FS_OK/.test(fsProbe.output || "");
+
+  const netProbe = await runSandboxed(
+    "curl -s -m 3 https://example.com >/dev/null 2>&1 && echo NET_LEAK || echo NET_BLOCKED; " +
+    "id -u; hostname",
+    { allowWrite: true },
+  );
+  const networkBlocked = /NET_BLOCKED/.test(netProbe.output || "");
+
+  // hostHomeInvisible for bwrap: --unshare-all gives the jail a NEW UTS
+  // namespace whose hostname is COPIED from the host, so (unlike docker's
+  // fresh container-id hostname) the name can never prove anything. The
+  // proof is that the host home PATH does not resolve inside the jail at
+  // all: /home is never bound, so ls must report HOME_HIDDEN.
+  const homeProbe = await runSandboxed(
+    `ls "${os.homedir()}" && echo HOME_SEEN || echo HOME_HIDDEN`);
+  const homeOut = homeProbe.output || "";
+  const hostHomeInvisible = /HOME_HIDDEN/.test(homeOut) && !/HOME_SEEN/.test(homeOut);
+
+  const dims = { writeBlocked, fsRead, networkBlocked, hostHomeInvisible };
+  const { ok, reason } = postureVerdict("bwrap", dims);
+  return {
+    ok,
+    ...dims,
+    backend: "bwrap",
+    reason,
+    raw: [writeProbe.output, fsProbe.output, netProbe.output, homeOut]
+      .filter(Boolean).join("\n---\n").trim(),
   };
 }
