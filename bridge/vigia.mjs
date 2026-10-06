@@ -137,9 +137,10 @@ for (let i = 0; i < 1800; i++) {
       if (IGNORAR_META && r.rol === "A") { vistos.add(norm(r.txt)); continue; }
       const n = norm(r.txt);
       if (n.length < 8 || ruido.some((rx) => rx.test(n)) || vistos.has(n)) continue;
-      // Filas de ASISTENTE: solo cuentan si invocan a Don Bot. Si no, son
-      // respuestas propias de Meta y ya las maneja el espejo (evita ruido).
-      if (r.rol === "A" && !esDonBot(r.txt)) { vistos.add(n); continue; }
+      // Filas de ASISTENTE: solo cuentan si la invocacion esta AL PRINCIPIO
+      // (un dictado dirigido a mi empieza con "Don Bot"); si Meta HABLA de mi a
+      // mitad del texto, no es un dictado (ya lo maneja el espejo).
+      if (r.rol === "A" && !esDonBot(r.txt.slice(0, 80))) { vistos.add(n); continue; }
       if (!prevTexts.has(n)) continue; // estabilidad: 2 lecturas seguidas
       nuevos.push({ rol: r.rol, txt: r.txt, n });
     }
