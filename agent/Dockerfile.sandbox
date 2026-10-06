@@ -1,8 +1,12 @@
 # Sandbox image for agent tools. The runtime container has NO network, so every
-# tool has to be baked in here at build time.
+# tool has to be baked in here at build time. Even with allowNetwork, the root
+# filesystem is read-only: apt-get install can never work at runtime (it cannot
+# write /var/lib/apt/lists or /var/cache/apt), so web-dev tasks get php-cli and
+# curl preinstalled here.
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ripgrep coreutils findutils jq less procps diffutils \
+      php-cli curl \
  && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 agent || true
 USER agent
