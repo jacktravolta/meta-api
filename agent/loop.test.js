@@ -150,3 +150,34 @@ test("exceeding maxSteps resolves ok:false with reason max-steps", async () => {
   assert.equal(res.reason, "max-steps");
   assert.equal(res.steps, 2);
 });
+
+test("a generic refusal is retried, not accepted as a final answer", async () => {
+  const answers = [
+    "Sorry, I can't help you with this request right now. Is there anything else I can help you with?",
+    "Listo, la tarea está completa.",
+  ];
+  let i = 0;
+  const events = [];
+  const res = await runAgentLoop({ task: "t", ask: async () => answers[i++], onEvent: (e) => events.push(e) });
+  assert.equal(res.ok, true);
+  assert.equal(res.answer, "Listo, la tarea está completa.");
+  assert.equal(res.steps, 2);
+  assert.ok(events.some((e) => e.type === "refusal" && e.attempt === 1));
+});
+
+test("persistent refusals fail honestly as meta-refusal", async () => {
+  const res = await runAgentLoop({
+    task: "t",
+    ask: async () => "Sorry, I can't help you with that.",
+    maxSteps: 10,
+    onEvent: () => {},
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "meta-refusal");
+});
+
+test("a plain non-refusal answer still finalizes at step 1", async () => {
+  const res = await runAgentLoop({ task: "t", ask: async () => "Todo listo, sin comandos.", onEvent: () => {} });
+  assert.equal(res.ok, true);
+  assert.equal(res.steps, 1);
+});

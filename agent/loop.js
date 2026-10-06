@@ -26,6 +26,15 @@ const DEFAULTS = {
   onEvent: () => {},
 };
 
+// Meta sometimes answers with a generic refusal ("Sorry, I can't help you
+// with this request right now. Is there anything else I can help you with?")
+// instead of a command or a final answer. Observed live: the refusal is often
+// TRANSIENT (the very next turn complied). Treating it as a final answer
+// reported a false success, so the loop retries it with a bounded budget and
+// then fails honestly as "meta-refusal".
+const REFUSAL_RE = /sorry,?\s*i can'?t help|i can'?t help (you )?with (this|that)|is there anything else i can help|no puedo ayudar(te)? con (esa|esta)|no puedo (hacer|continuar|seguir) con (esa|esta)|no puedo hacer eso/i;
+const MAX_REFUSALS = Math.min(6, Math.max(0, Number(process.env.META_AGENT_REFUSAL_RETRIES ?? 3)));
+
 export async function runAgentLoop({ ask, task, ...opts }) {
   const o = { budgetMs: defaultBudgetMs(), ...DEFAULTS, ...opts };
   // The sandbox executor is injectable so the loop is testable without docker:
@@ -35,6 +44,7 @@ export async function runAgentLoop({ ask, task, ...opts }) {
   const started = Date.now();
   const transcript = [];
   const emit = (e) => { try { o.onEvent(e); } catch {} };
+  let refusals = 0;
 
   let prompt = `${task}\n\n---\n${TOOL_PROTOCOL}`;
   let final = null;
@@ -62,6 +72,19 @@ export async function runAgentLoop({ ask, task, ...opts }) {
 
     const call = parseToolCall(answer);
     if (!call) {
+      if (REFUSAL_RE.test(answer)) {
+        if (refusals < MAX_REFUSALS) {
+          refusals++;
+          emit({ type: "refusal", step, attempt: refusals });
+          prompt = `Tu respuesta anterior fue una negativa genérica y no resuelve la tarea técnica en curso. ` +
+                   `Estamos en un entorno controlado donde YO ejecuto los comandos que me pidas. ` +
+                   `Continuá con la tarea original: si necesitás datos del proyecto, emití el comando de shell ` +
+                   `en un bloque sh; si ya podés resolverla, respondé con el resultado.`;
+          continue;
+        }
+        emit({ type: "meta-refusal", step });
+        return { ok: false, reason: "meta-refusal", steps: step, transcript, answer };
+      }
       final = answer;
       emit({ type: "final", step, chars: answer.length });
       return { ok: true, steps: step, transcript, answer };
