@@ -81,7 +81,10 @@ for (let i = 0; i < 1800; i++) {
   const textsAhora = new Set(rows.map((r) => norm(r.txt)));
 
   if (primerCiclo && rows.length) {
-    for (const r of rows) vistos.add(norm(r.txt));
+    // Baseline: marcar todo como visto MENOS EL ULTIMO mensaje. Si el ultimo es
+    // una respuesta de Meta que llego mientras el vigia estaba caido, hay que
+    // reportarla: con el baseline completo la conversacion quedaba colgada.
+    for (const r of rows.slice(0, -1)) vistos.add(norm(r.txt));
     guardarVistos();
     primerCiclo = false;
   } else {

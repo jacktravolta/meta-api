@@ -1,21 +1,17 @@
 [Unit]
-Description=Vigía de dictado — escucha invocaciones Don Bot en el hilo de Meta
-Documentation=file:///home/test/test/meta-api/relay/vigia-v7.mjs
-# El vigía depende del broker: no crea Chrome, se conecta por CDP al navegador
-# que levanta meta-api y se reconecta cuando el broker recicla sus pestañas.
+Description=Vigia del hilo de Meta — detecta dictados "Don Bot" y avisa al agente
+Documentation=file:///home/test/test/meta-api/bridge/vigia.mjs
 After=meta-api.service network-online.target
 Wants=meta-api.service network-online.target
 
-# Evita que un crash-loop llene el journal.
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
 [Service]
 Type=simple
-WorkingDirectory=/home/test/test/meta-api/relay
-ExecStart=/home/test/.nvm/versions/node/v22.23.3/bin/node /home/test/test/meta-api/relay/vigia-v7.mjs
+WorkingDirectory=/home/test/test/meta-api/bridge
+ExecStart=/home/test/.nvm/versions/node/v22.23.3/bin/node /home/test/test/meta-api/bridge/vigia.mjs
 Environment=PATH=/home/test/.nvm/versions/node/v22.23.3/bin:/usr/local/bin:/usr/bin:/bin
-# El estado runtime está en relay/state/ (ignorado por Git), nunca en /tmp.
 Environment=HOME=/home/test
 Restart=always
 RestartSec=5

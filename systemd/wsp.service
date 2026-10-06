@@ -1,11 +1,10 @@
 [Unit]
 Description=Puente de WhatsApp — detecta invocaciones Don Bot en WhatsApp Web y responde
 Documentation=file:///home/test/test/meta-api/relay/wsp.mjs
-# Necesita el Chrome con el puerto 9333, no el de meta-api (ese es el hilo de
-# Meta, otro canal). El puente reintenta la conexion si el CDP todavia no esta,
-# asi que un arranque en desorden no lo mata.
-After=wsp-chrome.service network-online.target
-Wants=wsp-chrome.service network-online.target
+# Unificado: usa el MISMO Chrome que meta-api (perfil google-chrome-beta-debug,
+# CDP 9233, headless). Ya no arranca un Chrome propio ni abre ventana.
+After=meta-api.service network-online.target
+Wants=meta-api.service network-online.target
 
 # Un crash-loop no debe llenar el journal: 10 arranques en 5 min y se rinde.
 StartLimitIntervalSec=300
@@ -20,7 +19,10 @@ WorkingDirectory=/home/test/test/meta-api/relay
 ExecStart=/home/test/.nvm/versions/node/v22.23.3/bin/node /home/test/test/meta-api/relay/wsp.mjs --responder
 Environment=PATH=/home/test/.nvm/versions/node/v22.23.3/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/home/test
-Environment=WSP_CDP=http://127.0.0.1:9333
+# Mismo Chrome que el hilo de Meta (pestaña aparte, mismo perfil).
+Environment=WSP_CDP=http://127.0.0.1:9233
+# El cerebro es Meta AI via meta-api (/v1/chat/completions): el relay solo
+# transporta. Modo agente (WSP_AGENTE=1) desactivado a proposito.
 
 Restart=always
 RestartSec=5

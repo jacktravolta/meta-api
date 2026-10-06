@@ -704,6 +704,9 @@ async function closeStrayTabs() {
     let closed = 0;
     for (const target of list) {
       if (target.type !== "page" || keep.has(target.id)) continue;
+      // NO cerrar la pestaña del puente de WhatsApp: comparte este Chrome con
+      // el hilo de Meta a proposito (un solo navegador, sin ventana).
+      if ((target.url || "").includes("web.whatsapp.com")) continue;
       await fetch(`http://127.0.0.1:${CDP_PORT}/json/close/${target.id}`).catch(() => {});
       closed++;
     }
@@ -772,12 +775,6 @@ async function ensureChromeInner() {
     "--remote-debugging-port=" + CDP_PORT,
     "--no-first-run", "--no-default-browser-check",
     "--disable-component-update", "--disable-background-networking",
-    // Keep the SPA's timers/WebSocket alive while the tab is backgrounded:
-    // without these, the Meta thread page stops receiving live updates and any
-    // read returns a frozen snapshot until a manual reload.
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
     "--disable-gpu", "--no-sandbox", "--disable-sync",
     "--disable-blink-features=AutomationControlled",
     // Minimal chrome: no restore/crash bubbles, no infobar, no "choose your
@@ -792,7 +789,7 @@ async function ensureChromeInner() {
     // Launch into a blank page, NOT the NTP, so no search tab is ever created.
     "about:blank",
   ];
-  if (!VISIBLE) args.unshift("--headless=new");
+  if (!VISIBLE) args.unshift("--headless=new", "--window-size=1400,900");
   // Do NOT use stdio:"ignore" for stderr: a failed launch used to log nothing at
   // all, which turned every browser problem into guesswork.
   chromeProc = spawn(CHROME, args, { stdio: ["ignore", "ignore", "pipe"] });

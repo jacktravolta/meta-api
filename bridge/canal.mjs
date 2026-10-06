@@ -40,6 +40,19 @@ const canales = links.filter((l) => RX.test(l.txt));
 if (!canales.length) { console.log("NO se encontro ningun chat de transcripcion"); process.exit(2); }
 const pick = canales[0]; // el listado va del mas reciente al mas viejo
 const id = pick.href.replace(/^\/prompt\//, "");
+
+// CHANNEL BINDING POR CONFIG (diseno de Meta): un canal nuevo NO se adopta solo.
+// Si ya hay un canal fijado y aparece otro, se avisa y NO se cambia salvo que se
+// pase --cambiar explicitamente (accion deliberada, no un mensaje del chat).
+if (prev && prev.id && prev.id !== id && !process.argv.includes("--cambiar")) {
+  console.log("⚠ CANAL NUEVO DETECTADO: " + pick.txt + " (" + id.slice(0, 8) + ")");
+  console.log("  Canal FIJADO actual: " + prev.title + " (" + prev.id.slice(0, 8) + ")");
+  console.log("  NO se cambia (binding por config). Para moverlo a proposito:");
+  console.log("     node canal.mjs --cambiar");
+  process.exit(0);
+}
+if (prev && prev.id && prev.id !== id) console.log("  --cambiar: moviendo el canal fijado...");
+
 const out = { id, url: "https://www.meta.ai/prompt/" + id, title: pick.txt, index: pick.i, ts: new Date().toISOString(), bootstrapped: prev && prev.id === id ? !!prev.bootstrapped : false };
 writeFileSync(CANAL, JSON.stringify(out, null, 1));
 console.log(JSON.stringify(out));
