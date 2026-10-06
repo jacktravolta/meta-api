@@ -10,6 +10,14 @@
 // UI as the attacker.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+
+// Accepted values of META_SANDBOX_BACKEND, in default-first order. Anything
+// outside this list must fail closed instead of falling back silently: a
+// silent fallback would run model-authored text under a backend the operator
+// never chose.
+export const BACKENDS = ["bwrap", "docker"];
 
 const DEFAULTS = {
   image: process.env.META_SANDBOX_IMAGE || "meta-sandbox:1",
@@ -22,6 +30,8 @@ const DEFAULTS = {
   allowNetwork: false,
   allowWrite: false,
   shell: "/bin/sh",
+  backend: undefined,                                  // resolved at call time
+  bwrapRoot: process.env.META_BWRAP_ROOT || path.join(os.homedir(), "sandbox"),
 };
 
 // Classification is DENY BY DEFAULT. An earlier version decided from the leading
@@ -59,6 +69,120 @@ export function classify(command) {
   return { write: false };
 }
 
+// Backend selection is an explicit operator decision, resolved at call time.
+// Only BACKENDS are valid; unset/empty falls back to the `bwrap` default, and
+// any other value returns an error naming the rejected value and the accepted
+// set. Never a silent fallback: running model-authored text under a backend
+// the operator did not choose is the opposite of fail-closed.
+export function resolveBackend(env = process.env.META_SANDBOX_BACKEND) {
+  if (env === undefined || env === "") return { backend: "bwrap" };
+  if (BACKENDS.includes(env)) return { backend: env };
+  return {
+    error: `invalid META_SANDBOX_BACKEND ${JSON.stringify(String(env))}: ` +
+           `accepted values are ${BACKENDS.join(", ")}`,
+  };
+}
+
+// The minimal /etc allowlist: only what dynamic linking, name resolution and
+// TLS need. Binding the host root (or all of /etc) would expose every path
+// unless individually masked — a forgotten mask is a leak. The allowlist
+// inverts that failure mode: a forgotten entry makes a tool fail, not a secret
+// leak. --ro-bind-try tolerates distro variation without aborting the run.
+const BWRAP_ETC = [
+  "/etc/passwd",
+  "/etc/group",
+  "/etc/nsswitch.conf",
+  "/etc/hosts",
+  "/etc/ld.so.cache",
+  "/etc/ssl",
+  "/etc/ca-certificates.conf",
+  "/etc/localtime",
+];
+
+// Network opt-in is namespace OMISSION, not a share flag: bubblewrap has no
+// --share-net, so the only way to expose the host network namespace is to NOT
+// unshare it. This is the explicit namespace set from the design — every
+// other namespace stays isolated on an opt-in run.
+const NET_OPT_IN_UNSHARE = [
+  "--unshare-user", "--unshare-ipc", "--unshare-pid",
+  "--unshare-uts", "--unshare-cgroup",
+];
+
+// Pure argv builder for the bwrap jail (design: "Build-time bwrap sequence").
+// Model-authored command text is DATA: it is JSON.stringify'd into ONE element
+// behind the `--` separator, so `;`, `$()`, backticks and quotes can never be
+// parsed as flags. The workspace is the only gated host path — read-write only
+// when the shared classify() said write AND allowWrite was acked; the sandbox
+// root is always writable because it is the sandbox's own dedicated directory
+// (installs must persist), never host-sensitive state.
+export function buildBwrapArgv(command, opts = {}, needsWrite = false) {
+  const o = { ...DEFAULTS, ...opts };
+  const secs = Math.ceil(o.timeoutMs / 1000);
+  const inner = `timeout ${secs} ${o.shell} -c ${JSON.stringify(command)}`;
+
+  const argv = ["bwrap", "--die-with-parent"];
+  if (o.allowNetwork) argv.push(...NET_OPT_IN_UNSHARE);
+  else argv.push("--unshare-all");
+
+  // Minimal read-only system view: /usr plus the usrmerge symlinks the host
+  // distro already uses, so /bin, /lib, /lib64 and /sbin resolve inside.
+  argv.push("--ro-bind", "/usr", "/usr");
+  argv.push("--symlink", "usr/bin", "/bin");
+  argv.push("--symlink", "usr/lib", "/lib");
+  argv.push("--symlink", "usr/lib64", "/lib64");
+  argv.push("--symlink", "usr/sbin", "/sbin");
+
+  for (const p of BWRAP_ETC) argv.push("--ro-bind-try", p, p);
+
+  // Name resolution only when egress was opted in: /etc/resolv.conf is a
+  // symlink into /run/systemd/resolve on systemd distros, so bind both — and
+  // only then, so a default run never gets a resolver to talk to.
+  if (o.allowNetwork) {
+    argv.push("--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf");
+    argv.push("--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve");
+  }
+
+  argv.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp");
+  argv.push("--bind", o.bwrapRoot, "/sandbox");
+  // rw iff needsWrite && allowWrite — allowNetwork or any other option alone
+  // must never flip this bind.
+  const workspaceFlag = needsWrite && o.allowWrite ? "--bind" : "--ro-bind";
+  argv.push(workspaceFlag, o.workdir, "/workspace");
+  argv.push(
+    "--chdir", "/workspace",
+    "--setenv", "HOME", "/sandbox/home",
+    "--setenv", "PATH", "/sandbox/bin:/usr/local/bin:/usr/bin:/bin",
+    "--setenv", "TMPDIR", "/tmp",
+    // `--` ends the flag list: everything after it is the jail command, so
+    // command text can never be read as a bwrap flag.
+    "--", o.shell, "-c", inner,
+  );
+  return argv;
+}
+
+// Pure argv builder for the systemd resource envelope. bwrap isolates
+// namespaces but has no cgroup support, so without this scope the limits
+// would be silently absent — which the spec forbids ("never run unlimited
+// silently"). Values are normalized to systemd syntax ("256m" -> "256M",
+// cpus "1" -> "100%") so the Docker-parity defaults pass through unchanged,
+// and `--` keeps the bwrap argv verbatim behind it.
+export function buildSystemdArgv(bwrapArgv, opts = {}, unit) {
+  const o = { ...DEFAULTS, ...opts };
+  const memory = String(o.memory).replace(/([0-9])m$/, "$1M");
+  const cpus = String(o.cpus).includes("%")
+    ? String(o.cpus)
+    : `${Math.round(Number(o.cpus) * 100)}%`;
+  return [
+    "systemd-run", "--user", "--scope", "-q",
+    "--unit", unit,
+    "-p", `MemoryMax=${memory}`,
+    "-p", `CPUQuota=${cpus}`,
+    "-p", `TasksMax=${String(o.pids)}`,
+    "--",
+    ...bwrapArgv,
+  ];
+}
+
 export async function runSandboxed(command, opts = {}) {
   const o = { ...DEFAULTS, ...opts };
   const needsWrite = classify(command).write;
@@ -70,6 +194,25 @@ export async function runSandboxed(command, opts = {}) {
     };
   }
 
+  // Fail closed before any process exists: an invalid META_SANDBOX_BACKEND
+  // refuses with an error naming the rejected value and the accepted set
+  // instead of silently falling back to a backend the operator never chose.
+  const resolved = resolveBackend();
+  if (resolved.error) {
+    return { ok: false, error: resolved.error, output: `${resolved.error}\n` };
+  }
+
+  // Backend dispatch. The policy layer above is shared and unchanged; only
+  // the execution stage varies. Phase-1 routing: both accepted backends run
+  // through the extracted Docker path — the bwrap arm is wired to runBwrap
+  // when the bwrap execution stage lands.
+  return runDocker(command, o, needsWrite);
+}
+
+// The Docker execution path: the original runSandboxed body, extracted
+// verbatim when the backend seam was introduced. Behavior is unchanged.
+async function runDocker(command, opts, needsWrite) {
+  const o = opts;
   // Two independent brakes on runaway commands. The inner `timeout` makes the
   // container kill its own process group, because killing the host-side docker
   // CLI does NOT stop the container: with only execFile's timeout, `sleep 30`

@@ -1,6 +1,6 @@
 # Tasks: Local Enslaved-Directory Sandbox (bwrap backend)
 
-Implementation is **not started**: every task below is unchecked. The work lives in
+Apply progress is tracked by the checkboxes below (plan-time state was "not started"). The work lives in
 `agent/sandbox.js` (backend dispatch + pure builders + execution + self-check), `agent/sandbox.test.js`
 (unit/integration pins) and `README.md` (operator runbook). `classify()` and the write gate stay
 shared and unchanged across backends.
@@ -40,25 +40,25 @@ an operator who has not installed the AppArmor prerequisite.
 
 ## Phase 1: Backend Seam and Fail-Closed Dispatch
 
-- [ ] 1.1 Add `BACKENDS = ["bwrap", "docker"]` and extend `DEFAULTS` in `agent/sandbox.js` with `backend: undefined` (resolved at call time) and `bwrapRoot: process.env.META_BWRAP_ROOT || path.join(os.homedir(), "sandbox")`. Import `os` and `path`. Verify: module still imports and existing tests load.
-- [ ] 1.2 Write RED tests for `resolveBackend` in `agent/sandbox.test.js`: unset/empty → `bwrap`; `"docker"` → `docker`; `"podman"` → error object naming the rejected value and the accepted set `bwrap`/`docker`. Verify: tests fail because `resolveBackend` does not exist yet.
-- [ ] 1.3 Implement the pure `resolveBackend(env = process.env.META_SANDBOX_BACKEND)` in `agent/sandbox.js`, returning `{ backend }` or a typed `{ error }` for an invalid value. Verify: 1.2 tests pass.
-- [ ] 1.4 Write a RED test that an invalid `META_SANDBOX_BACKEND` makes `runSandboxed` return an error result and starts no process (spy/stub on `execFile`); and that a denied write still returns `denied:true` with no process. Verify: test fails until dispatch exists.
-- [ ] 1.5 Extract today's `runSandboxed` Docker body verbatim into `runDocker(command, opts, needsWrite)` in `agent/sandbox.js`; rewrite `runSandboxed` to resolve the backend, run the shared `classify()` write gate first, then dispatch to `runDocker`. Invalid backend → error result, no process. Verify: 1.4 passes; behavior identical on the Docker path.
+- [x] 1.1 Add `BACKENDS = ["bwrap", "docker"]` and extend `DEFAULTS` in `agent/sandbox.js` with `backend: undefined` (resolved at call time) and `bwrapRoot: process.env.META_BWRAP_ROOT || path.join(os.homedir(), "sandbox")`. Import `os` and `path`. Verify: module still imports and existing tests load.
+- [x] 1.2 Write RED tests for `resolveBackend` in `agent/sandbox.test.js`: unset/empty → `bwrap`; `"docker"` → `docker`; `"podman"` → error object naming the rejected value and the accepted set `bwrap`/`docker`. Verify: tests fail because `resolveBackend` does not exist yet.
+- [x] 1.3 Implement the pure `resolveBackend(env = process.env.META_SANDBOX_BACKEND)` in `agent/sandbox.js`, returning `{ backend }` or a typed `{ error }` for an invalid value. Verify: 1.2 tests pass.
+- [x] 1.4 Write a RED test that an invalid `META_SANDBOX_BACKEND` makes `runSandboxed` return an error result and starts no process (spy/stub on `execFile`); and that a denied write still returns `denied:true` with no process. Verify: test fails until dispatch exists.
+- [x] 1.5 Extract today's `runSandboxed` Docker body verbatim into `runDocker(command, opts, needsWrite)` in `agent/sandbox.js`; rewrite `runSandboxed` to resolve the backend, run the shared `classify()` write gate first, then dispatch to `runDocker`. Invalid backend → error result, no process. Verify: 1.4 passes; behavior identical on the Docker path.
 
 ## Phase 2: Pure argv Builders (Jail + systemd Envelope)
 
-- [ ] 2.1 Write RED tests for `buildBwrapArgv` in `agent/sandbox.test.js` pinning the threat-matrix cases before implementation:
+- [x] 2.1 Write RED tests for `buildBwrapArgv` in `agent/sandbox.test.js` pinning the threat-matrix cases before implementation:
       (a) the default argv binds `/workspace` read-only and contains no host-home or host-root bind;
       (b) `allowNetwork` alone never makes the workspace writable;
       (c) `allowWrite` alone never re-adds `--unshare-net` / never disables `--unshare-all`;
       (d) a command containing `;`, `$(...)`, backticks or quotes stays a single JSON-quoted argv element and is never interpolated into the bwrap flag list.
       Also pin the bind matrix (`/usr`, `/lib`, `/lib64`, `/bin`, minimal `/etc` allowlist; `--proc /proc`, `--dev /dev`, `--tmpfs /tmp`), `--die-with-parent`, and `HOME=/sandbox/home` / `PATH` starting with `/sandbox/bin`.
       Verify: tests fail because the builder does not exist.
-- [ ] 2.2 Implement `buildBwrapArgv(command, opts, needsWrite)` in `agent/sandbox.js` per `design.md`: allowlisted read-only binds with usrmerge symlinks (`/bin`→`usr/bin`, `/lib`→`usr/lib`, `/lib64`→`usr/lib64`, `/sbin`→`usr/sbin`), minimal `/etc` via `--ro-bind-try`, `--proc /proc`, `--dev /dev`, `--tmpfs /tmp`, `--bind <bwrapRoot> /sandbox`, `/workspace` as `--ro-bind` unless `needsWrite && allowWrite` (then `--bind`), `--chdir /workspace`, `--unshare-all` by default or the explicit namespace set without `--unshare-net` when `allowNetwork`, `--die-with-parent`, and env `HOME`/`PATH`/`TMPDIR`. Verify: 2.1 passes.
-- [ ] 2.3 Write RED tests for `buildSystemdArgv` in `agent/sandbox.test.js`: `MemoryMax=256M`, `CPUQuota=100%`, `TasksMax=100`, unit name `meta-sbx-<id>`, the `--` separator before the bwrap argv, and normalization (`256m` → `256M`, `1` → `100%`). Verify: tests fail.
-- [ ] 2.4 Implement the pure `buildSystemdArgv(bwrapArgv, opts, unit)` in `agent/sandbox.js`. Verify: 2.3 passes.
-- [ ] 2.5 Run the unit tests for phases 1–2 and confirm no regression in the pre-existing 38 tests. Verify: `cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'` is green.
+- [x] 2.2 Implement `buildBwrapArgv(command, opts, needsWrite)` in `agent/sandbox.js` per `design.md`: allowlisted read-only binds with usrmerge symlinks (`/bin`→`usr/bin`, `/lib`→`usr/lib`, `/lib64`→`usr/lib64`, `/sbin`→`usr/sbin`), minimal `/etc` via `--ro-bind-try`, `--proc /proc`, `--dev /dev`, `--tmpfs /tmp`, `--bind <bwrapRoot> /sandbox`, `/workspace` as `--ro-bind` unless `needsWrite && allowWrite` (then `--bind`), `--chdir /workspace`, `--unshare-all` by default or the explicit namespace set without `--unshare-net` when `allowNetwork`, `--die-with-parent`, and env `HOME`/`PATH`/`TMPDIR`. Verify: 2.1 passes.
+- [x] 2.3 Write RED tests for `buildSystemdArgv` in `agent/sandbox.test.js`: `MemoryMax=256M`, `CPUQuota=100%`, `TasksMax=100`, unit name `meta-sbx-<id>`, the `--` separator before the bwrap argv, and normalization (`256m` → `256M`, `1` → `100%`). Verify: tests fail.
+- [x] 2.4 Implement the pure `buildSystemdArgv(bwrapArgv, opts, unit)` in `agent/sandbox.js`. Verify: 2.3 passes.
+- [x] 2.5 Run the unit tests for phases 1–2 and confirm no regression in the pre-existing 38 tests. Verify: `cd /home/test/test/meta-api && /home/test/.nvm/versions/node/v22.23.3/bin/node --test 'agent/*.test.js'` is green.
 
 ## Phase 3: bwrap Execution, Resource Envelope and Double Timeout Brake
 
