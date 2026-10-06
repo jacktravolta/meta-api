@@ -1,7 +1,7 @@
 // enviar-imagen-meta.mjs — sube una imagen AL HILO DE META (no a WhatsApp).
 // Usa el input[type=file] del composer de Meta via CDP DOM.setFileInputFiles.
 // Uso: node enviar-imagen-meta.mjs /ruta/imagen.png ["texto opcional"]
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 const BIN = dirname(fileURLToPath(import.meta.url));
@@ -53,4 +53,13 @@ for (let k = 0; k < 4 && !enviado; k++) {
   if (r && r.result && r.result.value === true) enviado = true;
 }
 console.log(enviado ? "IMAGEN ENVIADA A META ✓" : "no se pudo confirmar el envio");
+// Registrar el envio (con turno) para que el vigia no lo tome como dictado propio.
+if (enviado && TEXTO) {
+  try {
+    const ENVIADOS = join(BIN, "don-bot-enviados.txt");
+    let turno = 0;
+    try { turno = JSON.parse(readFileSync(join(BIN, "turno.json"), "utf8")).n || 0; } catch {}
+    appendFileSync(ENVIADOS, turno + "|" + TEXTO + "\n");
+  } catch {}
+}
 process.exit(enviado ? 0 : 1);
