@@ -31,11 +31,26 @@ async function salud() {
   return "ok";
 }
 
-log("== salud-meta activo (chequeo cada 60s) ==");
+log("== salud-meta activo (chequeo cada 5 min, como recomendo Meta) ==");
 for (let k = 0; k < 1440; k++) {
   try {
+    // No reiniciar si hubo un envio en los ultimos 30s: Meta puede estar
+    // re-montando (recomendacion de Meta: el reinicio rapido empeora el ciclo).
+    let envioReciente = false;
+    try {
+      const LOGW = join(BIN, "..", "relay", "state", "wsp-log.txt");
+      const { readFileSync } = await import("node:fs");
+      const lineas = readFileSync(LOGW, "utf8").trim().split("\n").slice(-6);
+      for (const l of lineas) {
+        const m = l.match(/^\[([^\]]+)\]/);
+        if (m && /enviado:|subido a META|encolado/.test(l)) {
+          const t = Date.parse(m[1]);
+          if (!isNaN(t) && Date.now() - t < 30000) { envioReciente = true; break; }
+        }
+      }
+    } catch {}
     const s = await salud();
-    if (s === "degradada" || s === "sin-respuesta" || s === "sin-pestana") {
+    if ((s === "degradada" || s === "sin-respuesta" || s === "sin-pestana") && !envioReciente) {
       log(`Meta ${s}: reinicio el broker (Chrome fresco) + reabro WhatsApp + relay`);
       sh("export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user restart meta-api.service");
       await sleep(8000);
@@ -44,7 +59,9 @@ for (let k = 0; k < 1440; k++) {
       sh("export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user restart wsp.service");
       await sleep(20);
       log("recuperacion completa");
+    } else if (s !== "ok" && envioReciente) {
+      log("Meta " + s + " pero hubo envio reciente: espero a que re-monte (no reinicio)");
     } else if (k % 10 === 0) log("Meta ok");
   } catch (e) { log("error en el chequeo: " + String(e).slice(0, 80)); }
-  await sleep(60000);
+  await sleep(300000);
 }

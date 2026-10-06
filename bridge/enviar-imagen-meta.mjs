@@ -52,7 +52,7 @@ if (!nodeId) { console.log("no encontre input[type=file] tras recargar"); proces
 
 await call("DOM.setFileInputFiles", { files: [RUTA], nodeId });
 console.log("archivo seteado: " + RUTA);
-await sleep(3000);   // debounce corto: que el adjunto se registre antes de enviar
+await sleep(3000 + Math.floor(Math.random() * 3000));   // jitter (recomendacion de Meta)
 let enviado = false;
 for (let k = 0; k < 4 && !enviado; k++) {
   await call("Runtime.evaluate", { expression: `(() => { const b=document.querySelector('[data-testid="composer-send-button"]'); if(b && !b.disabled){ b.click(); return true; } return false; })()`, returnByValue: true });
