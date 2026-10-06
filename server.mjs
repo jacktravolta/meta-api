@@ -1265,19 +1265,29 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const preHuman = await humanRows();
   log("pre-envio:", JSON.stringify({ url: (urlBefore || "").slice(0, 70), humanRows: preHuman }));
 
-  let human = await evaluate(ws, `(() => {
-    const el = ${PICK_COMPOSER_JS};
-    if (!el) return { sent:false, why:'no composer' };
-    const text = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
-    if (!text.trim()) return { sent:false, why:'empty', tag: el.tagName, chars: text.length };
-    const named = Array.from(document.querySelectorAll('button'))
-      .filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
-    const b = named.find(x => !x.disabled);
-    if (!b) return { sent:false, why:'boton no habilitado todavia', disabledNamed: named.length };
-    const r = b.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) return { sent:false, why:'boton sin tamano' };
-    return { sent:true, x: r.left + r.width/2, y: r.top + r.height/2, named: named.length, tag: el.tagName, chars: text.length };
-  })()`).catch((e) => ({ sent:false, why: String(e) }));
+  // Wait for the send button instead of giving up: with IMAGE attachments the
+  // button takes many seconds to enable after the upload settles (the old
+  // fixed 8s pause clicked too early and failed with 'boton no habilitado
+  // todavia'). Poll up to ~40s for an enabled send button.
+  let human = { sent: false, why: 'boton no habilitado todavia' };
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    human = await evaluate(ws, `(() => {
+      const el = ${PICK_COMPOSER_JS};
+      if (!el) return { sent:false, why:'no composer' };
+      const text = el.tagName === 'TEXTAREA' ? (el.value || '') : (el.textContent || '');
+      if (!text.trim()) return { sent:false, why:'empty', tag: el.tagName, chars: text.length };
+      const named = Array.from(document.querySelectorAll('button'))
+        .filter(x => /enviar|send|submit/i.test((x.getAttribute('aria-label')||'')+' '+(x.textContent||'')));
+      const b = named.find(x => !x.disabled);
+      if (!b) return { sent:false, why:'boton no habilitado todavia', disabledNamed: named.length };
+      const r = b.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return { sent:false, why:'boton sin tamano' };
+      return { sent:true, x: r.left + r.width/2, y: r.top + r.height/2, named: named.length, tag: el.tagName, chars: text.length };
+    })()`).catch((e) => ({ sent:false, why: String(e) }));
+    if (human.sent || human.why !== 'boton no habilitado todavia') break;
+    if (attempt === 1 || attempt % 4 === 0) log(`  espero al boton de enviar (intento ${attempt})`);
+    await sleep(2000);
+  }
 
   if (human.sent) {
     for (const type of ["mousePressed", "mouseReleased"]) {
