@@ -1352,6 +1352,9 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   // Patience while waiting for the end-of-message icons after the stop control
   // vanished (web search / re-render). ~120 polls ≈ 108s at the 900ms cadence.
   const ICON_WAIT_POLLS = Math.max(10, Number(process.env.META_ICON_WAIT_POLLS || 120));
+  // Grace window after the action bar appears: Meta may still be writing a
+  // follow-up message (multi-message answers).
+  const COPY_GRACE_MS = Math.max(2000, Number(process.env.META_COPY_GRACE_MS || 12000));
   // Absolute cap on the whole answer wait. Every other exit is content based, so
   // a pathological case could still keep a job alive indefinitely and, with it,
   // the browser: activeJobs() would never reach 0 and the idle auto-close would
@@ -1360,6 +1363,7 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const startedAt = Date.now();
   let reply = "";
   let finalized = false;
+  let finalizedAt = 0;
   let sawGenerating = false;
   // High-water mark for the answer: if Meta re-renders it SHORTER (virtualization,
   // streaming rewrite, list recycling) a naive read drops text already on screen.
@@ -1415,7 +1419,18 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     //     N is 3 once generation was observed (we know it finished), else 6: fast
     //     answers never show the stop control, and 6 unchanged polls (~5.4s) is
     //     already a strong hint the turn is over without paying the old 20s.
-    if (idle >= 1 && ((await countCopies()) || 0) > preCopies) { log("finalizado por copy-control"); finalized = true; break; }
+    // Completion: the end-of-message action bar (icons). But Meta answers in
+    // SEVERAL messages: a quick status message finalizes first ("Revisando
+    // navegacion movil") and she keeps working in a FOLLOW-UP message
+    // ("Reconstruyendo landing.html"). So seeing the bar starts a grace
+    // window: if she starts generating again, cancel and keep reading; only a
+    // stable, non-generating finalized message closes the turn.
+    const copiesNow = (await countCopies()) || 0;
+    if (copiesNow > preCopies) {
+      if (!finalizedAt) { finalizedAt = Date.now(); log("copy-control visto: gracia por posible mensaje siguiente"); }
+      if (gen) { finalizedAt = 0; log("siguio generando: cancelo el cierre"); }
+      else if (Date.now() - finalizedAt > COPY_GRACE_MS) { log("finalizado por copy-control (estable)"); finalized = true; break; }
+    }
     // The stop control vanishing is NOT completion: during Meta's web search
     // the stop button disappears while she is still working, and a search
     // status line ("Buscando imagenes de panaderia") was once returned as a
