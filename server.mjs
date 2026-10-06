@@ -1206,7 +1206,13 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
   const readAnswer = async () => await evaluate(ws, readAnswerExpr).catch(() => null);
   // Real completion marker: Meta renders the copy control only on a FINALIZED
   // message. Text stability alone means "paused", not "done".
-  const countCopies = async () => await evaluate(ws, `(() => document.querySelectorAll('.msg-copy').length)()`).catch(() => 0);
+  // Real completion marker: the end-of-message ACTION BAR (like / dislike /
+  // copy / share). The old `.msg-copy` selector matched nothing on the current
+  // UI — a full day of live data showed ZERO copy-control hits while every
+  // finalized message carries these aria-labeled buttons and every in-progress
+  // message (reasoning trace / wordFadeIn text) carries none. This is the real
+  // semaphore.
+  const countCopies = async () => await evaluate(ws, `(() => document.querySelectorAll('button[aria-label="Copiar respuesta"], button[aria-label="Compartir"], button[aria-label="Me gusta esta respuesta"]').length)()`).catch(() => 0);
   const preCopies = (await countCopies()) || 0;
   // Stop/generating control. Checked on EVERY poll: sampling it only every 8th
   // poll missed it entirely for fast answers (it appears and vanishes within 2.5s),
@@ -1423,33 +1429,14 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     // preamble ("Interpretando solicitud..."). The short limits only apply once
     // generation has actually stopped.
     const idleLimit = idleLimitFor(gen, sawGenerating);
-    // A short status/progress line ("Buscando imagenes", "Revisando
-    // directorio para crear landing") is Meta STILL WORKING — her extended
-    // reasoning and web search render these as the message text while the
-    // real answer has not streamed yet. They must never be returned as the
-    // answer. Census of a full day: 74 real turns finalized via the stop
-    // control disappearing; the .msg-copy icon count never fired once.
-    const statusLike = (t) => {
-      const s = String(t || "").trim();
-      return s.length < 120 && /^(buscando|revisando|definiendo|construyendo|guardando|analizando|preparando|pensando|planificando|generando|escribiendo|organizando|dividiendo|partiendo|completando)\b/i.test(s);
-    };
-    // Completion, in order of trust:
-    //  1. copy control rendered (checked above) — rare/legacy
-    //  2. stop control seen and now gone, with non-status text — the signal
-    //     that finalized every real turn in a day of live use
-    //  3. stalled non-status text (weak)
-    // Status-like text finalizes through NONE of them: keep polling; the
-    // post-loop guard fails honestly if the real answer never arrives.
-    if (idle >= 1 && sawGenerating && !gen && !statusLike(reply)) {
-      log("finalizado por fin de generacion (stop control ausente)");
-      finalized = true;
-      break;
-    }
-    if (idle >= idleLimit && !statusLike(reply)) {
-      log(`finalizado por inactividad (${idle} polls sin cambio) - senal DEBIL, respuesta posiblemente incompleta`);
-      finalized = true;
-      break;
-    }
+    // The message is only FINAL when the end-of-message action bar renders
+    // (checked above). Meta's reasoning trace and streaming wordFadeIn text
+    // carry NO action bar, so status lines like "Verificando imagenes" used to
+    // be returned as answers by every earlier heuristic (stop-gone, idle).
+    // Icons are the ONLY terminal signal; the loop stays bounded by MAX_POLLS
+    // and the hard timeout, and the post-loop guard reports an unfinalized
+    // turn honestly instead of returning progress text.
+    void idleLimit;
     if (Date.now() - startedAt > HARD_TIMEOUT_MS) {
       log(`finalizado por timeout absoluto (${Math.round((Date.now() - startedAt) / 1000)}s) con ${idle} polls sin cambio`);
       break;
