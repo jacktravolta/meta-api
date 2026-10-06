@@ -704,9 +704,13 @@ async function closeStrayTabs() {
     let closed = 0;
     for (const target of list) {
       if (target.type !== "page" || keep.has(target.id)) continue;
-      // NO cerrar la pestaña del puente de WhatsApp: comparte este Chrome con
-      // el hilo de Meta a proposito (un solo navegador, sin ventana).
-      if ((target.url || "").includes("web.whatsapp.com")) continue;
+      const u = target.url || "";
+      // NUNCA cerrar pestañas utiles del host (puente de WhatsApp, hilo de Meta):
+      // cerrarlas rompe el relay y el usuario ve el chat "cerrado".
+      if (u.includes("web.whatsapp.com") || u.includes("meta.ai") || u.includes("whatsapp")) continue;
+      // Solo cerrar pestañas REALMENTE sobrantes: vacias / nueva pestaña.
+      if (!/^(about:blank|chrome:\/\/new-?tab)/i.test(u)) continue;
+      log(`cerrando pestaña sobrante: ${u.slice(0, 60)}`);
       await fetch(`http://127.0.0.1:${CDP_PORT}/json/close/${target.id}`).catch(() => {});
       closed++;
     }
