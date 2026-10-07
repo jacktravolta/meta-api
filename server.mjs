@@ -143,6 +143,15 @@ function parseUserContent(raw) {
       if (url) images.push(String(url));
       continue;
     }
+    // Video: viaja por el MISMO canal de adjuntos, porque el composer de Meta
+    // usa un unico input[type=file] para imagenes y videos. El nombre `images`
+    // es historico: en realidad es la lista de archivos que se adjuntan.
+    if (type === "video_url" || type === "input_video" || type === "video" || type === "video_file") {
+      const url = typeof part.video_url === "string" ? part.video_url
+        : part.video_url?.url || part.video || part.url || part.file_url;
+      if (url) images.push(String(url));
+      continue;
+    }
     if (part.text) text += part.text;   // unknown part: keep any text it carries
   }
   return { text: text.trim(), images };
