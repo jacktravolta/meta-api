@@ -23,8 +23,14 @@ ExecStart=/home/test/.nvm/versions/node/v22.23.3/bin/node /home/test/test/meta-a
 Environment=PATH=/home/test/.nvm/versions/node/v22.23.3/bin:/home/test/.opencode/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/home/test
 Environment=OPENCODE_BIN=/home/test/.opencode/bin/opencode
-# El Chrome con WhatsApp logueado es el 9233; el default de wsp.mjs (9333) es
-# OTRO Chrome sin sesion, por eso WSP_CDP es obligatorio (R2).
+# Modelo del agente. El free (opencode/mimo-v2.6-flash-free) se satura con 429
+# y las tareas se perdian; se usa el mismo modelo que la consola del operador,
+# que se verifico funcionando con el agente donbot. Se puede cambiar SIN tocar
+# esta unidad: relay/state/donbot.json -> {"modelo": "proveedor/modelo"}.
+Environment=DONBOT_MODELO=opencode-go/deepseek-v4-flash-vision-exp
+# El Chrome con WhatsApp logueado es el 9233, y es el MISMO que usa el broker
+# (todo en pestanas de un solo navegador). Se pasa explicito porque un default
+# distinto fue justo lo que permitio que hubiera dos Chrome con dos sesiones.
 Environment=WSP_CDP=http://127.0.0.1:9233
 
 # El consumidor es un loop infinito: solo debe reiniciarse si el proceso muere.
