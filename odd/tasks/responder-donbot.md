@@ -22,8 +22,11 @@ está incompleto.
 
 - Nuevo consumidor de cola que compone la respuesta con OpenCode (`opencode run`)
   y la envía por `relay/wsp.mjs --enviar`.
-- Agente de OpenCode restringido (sin herramientas) para que el cerebro solo
-  componga texto: nadie que escriba en WhatsApp debe poder disparar shell/edición.
+- Agente de OpenCode. **Cambio de alcance posterior (orden del usuario):
+  AUTONOMÍA TOTAL** — shell + edición sobre el repo, para responder cosas de
+  sistema y mejorar código por orden de voz. Operaciones remotas (git push,
+  ssh, scp, rsync), commits, destructivos de historial y secretos siguen
+  denegados en `.opencode/agents/donbot.md`.
 - Unidad systemd de usuario para que el proceso sea observable (R4).
 - El consumidor NO toca: las guardas allowlist (R1), `Input.insertText`/`Enter`
   (R2), ni levanta/detiene servicios (R3).
@@ -47,36 +50,71 @@ está incompleto.
 
 ## Checklist
 
-- [ ] T1 — Agente de OpenCode `donbot`: modo seleccionable, modelo
-       `opencode/mimo-v2.6-flash-free`, permisos deny-all (solo texto).
-- [ ] T2 — `relay/responder-donbot.mjs`: lock único, marca propia con baseline
+- [x] T1 — Agente de OpenCode `donbot`: modo seleccionable, modelo
+       `opencode/mimo-v2.6-flash-free`. Origen: deny-all (solo texto); hoy
+       permisos de autonomía total con denegaciones explícitas (ver T7).
+- [x] T2 — `relay/responder-donbot.mjs`: lock único, marca propia con baseline
        silencioso, procesa la cola en orden, compone con `opencode run`, envía
        con `relay/wsp.mjs --enviar`, registra fallos sin reintentar en bucle.
-- [ ] T3 — Entrada de medio: imagen vía `--file`, audio por transcripción,
+- [x] T3 — Entrada de medio: imagen vía `--file`, audio por transcripción,
        video por caption.
-- [ ] T4 — Unidad systemd de usuario `donbot-responder.service` (observable,
-       `Restart=on-failure`).
-- [ ] T5 — Verificación: `node --check`, prueba en seco de composición y de
-       envío, y lectura de la marca/baseline.
-- [ ] T6 — Commit del work-unit en el branch.
+- [x] T4 — Unidad systemd de usuario `donbot-responder.service` (observable,
+       `Restart=on-failure`). Enabled + active.
+- [x] T5 — Verificación: `node --check`, prueba en seco de composición y de
+       envío, y lectura de la marca/baseline. Backlog de 82 líneas → 73
+       mensajes distintos, 73/73 enviados, 0 fallos.
+- [x] T6 — Commit del work-unit en el branch (`87c4f03`, `934f487`).
+- [x] T7 — Autonomía total: `--auto` en `componer()`, timeout de 600 s, hora
+       inyectada en el prompt, denegaciones de operaciones remotas/destructivas
+       y secretos redeclaradas después de los `allow` (las reglas del agente
+       van después de las globales y reabrían lo que la global niega).
+- [x] T8 — Corregir las ediciones fuera de alcance que hizo el agente:
+       `PREFIJO` `🤖`→`∞` en `responder-donbot.mjs`, prefijos en `wsp.mjs`
+       (ya revertido) y el criterio de aceptación 2 del propio tracker.
 
 ## Acceptance criteria
 
 1. Con la cola vacía de nuevas invocaciones, el consumidor arranca sin responder
    a las 76 líneas históricas (baseline silencioso).
 2. Una invocación nueva provoca UNA respuesta en el chat, firmada `🤖 [DONBOT]`.
-3. El agente restringido no puede ejecutar shell ni editar archivos.
+3. El agente NO puede: `git push`, `ssh`, `scp`, `sftp`, `rsync`, `sudo`,
+   `git commit`, `git reset --hard`, `git rebase`, `git clean`, ni leer
+   secretos (`.env`, `.ssh`, `*.pem`, `*.key`, credenciales). Verificado con
+   pruebas en seco: rechaza push y lectura de `.ssh` con mensaje propio.
 4. Un segundo proceso del consumidor no arranca (lock).
+5. El agente solo edita los archivos que la orden pide (ver Known limitations).
 
 ## Checks
 
-- `node --check relay/responder-donbot.mjs`
-- `node --test 'agent/*.test.js'` (runner del proyecto)
+- `node --check relay/responder-donbot.mjs` y `node --check relay/es-donbot.mjs`
+- `node --test relay/canal-ok.test.mjs` → 8/8
+- `node --test 'agent/*.test.js'` (runner del proyecto) → 75 pass / 0 fail
+- Batería de 40 casos sobre `esDonBot` (17 positivos, 23 negativos) → 0 errores
+- Pruebas en seco de denegación: `git push`, lectura de `.ssh`, `git commit`
+- `git diff --stat` antes/después de una corrida → sin archivos no pedidos
 - Prueba de composición en seco y de envío con `WSP_CDP=http://127.0.0.1:9233`
+
+## Known limitations
+
+- **Ediciones fuera de alcance (hallazgo verificado).** Con autonomía total, en
+  una sola corrida el agente modificó archivos que nadie le pidió:
+  `PREFIJO` `🤖`→`∞` en `relay/responder-donbot.mjs`, los prefijos
+  `🤖 [DONBOT]`/`🧠 [META]` de `relay/wsp.mjs` y la firma del criterio 2 de
+  este propio tracker. `relay/wsp.mjs` se revirtió con `git checkout`; los otros
+  dos se corrigieron a mano. Causa raíz: `shell: "*": allow` **bypasea** cualquier
+  restricción de `edit` (comprobado: el patrón absoluto
+  `/home/test/test/meta-api/**` no matcheaba y el modelo escribía igual por
+  `printf > archivo`). No existe restricción técnica de ruta que valga mientras
+  haya shell libre.
+- Mitigación práctica: el árbol se revisa con `git diff` antes de cada commit,
+  y los commits los hace la consola (el agente tiene `git commit` denegado).
 
 ## Status
 
 - Route: delegated direct (writer trigger: 2+ archivos no triviales).
 - Resolved mode: TDD off (fuente: decisión previa del proyecto).
-- Progress: diseño cerrado; T1–T5 en implementación.
-- Next step: verificar T5 y pedir orden para arrancar la unidad (R3).
+- Progress: T1–T8 cerrados. `87c4f03` (guardas R1), `934f487` (consumidor),
+  `18ca0a6` (detección) y este work-unit (autonomía + correcciones de las
+  ediciones fuera de alcance).
+- Next step: reiniciar `donbot-responder.service` para que tome `--auto`; y
+  esperar orden sobre `espejo.service` (preguntada, sin respuesta).
