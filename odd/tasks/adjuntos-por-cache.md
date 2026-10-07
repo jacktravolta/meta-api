@@ -50,7 +50,9 @@ que nadie lo tocara.
 - [x] T4 — rama de imagen: cache primero, canvas de respaldo.
 - [x] T5 — rama de audio: cache primero, play de respaldo.
 - [x] T6 — rama de video: cache primero, visor de respaldo.
-- [x] T7 — pruebas, guardas y verificacion en vivo.
+- [x] T8 — rama de DOCUMENTO (PDF y compania): LEER los detecta, se clickea la
+      burbuja para que WhatsApp los descargue y se leen del mismo cache.
+- [x] T9 — `abrirChat` verifica que la conversacion se abrio y prueba tres vias.
 
 ## Progreso
 - Commit 1: `feat(relay): los adjuntos se leen del cache de WhatsApp sin reproducir`.

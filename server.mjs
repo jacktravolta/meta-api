@@ -152,6 +152,13 @@ function parseUserContent(raw) {
       if (url) images.push(String(url));
       continue;
     }
+    // Documentos (PDF y compania): mismo canal de adjuntos otra vez.
+    if (type === "document_url" || type === "input_file" || type === "document" || type === "document_file" || type === "file") {
+      const url = typeof part.document_url === "string" ? part.document_url
+        : part.document_url?.url || part.document || part.file_url || part.url;
+      if (url) images.push(String(url));
+      continue;
+    }
     if (part.text) text += part.text;   // unknown part: keep any text it carries
   }
   return { text: text.trim(), images };
