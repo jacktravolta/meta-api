@@ -88,6 +88,36 @@ remain local and are never committed. Image attachments are kept under the user
 state directory instead of ephemeral `/tmp`, so a broker restart cannot break a
 queued image job.
 
+## Lista blanca de destinos de WhatsApp
+
+**Regla:** todo script que escribe en WhatsApp solo puede actuar sobre un canal
+de la lista blanca (hoy: `BOTEST`). El destino nunca se infiere de "lo que esté
+abierto en la pestaña".
+
+- La lista vive en `relay/canal-ok.mjs` (`CANAL_PERMITIDOS`) y se consulta con
+  `canalPermitido(nombre)`; el rechazo se explica en español con
+  `motivoRechazo(nombre)`.
+- **Cada escritor de WhatsApp** — `relay/wsp.mjs` y los scripts de `bridge/` que
+  disparan eventos sobre la pestaña — tiene que validar `canalPermitido()` con el
+  título real del DOM **antes de cualquier evento `Input.*`**
+  (`Input.dispatchMouseEvent`, `Input.insertText`, `Input.dispatchKeyEvent`).
+  El chequeo va en cada punto de decisión: antes de escribir, antes de hacer
+  click en un resultado de la lista y, si el chat cambió, al reabrirlo.
+- Es **fail-closed**: título vacío, desconocido, que parezca un número de
+  teléfono o que no coincida exactamente ⇒ nada se escribe, nada se hace click y
+  el proceso sale con código distinto de cero.
+- El módulo es puro y sin dependencias; su test unitario es
+  `node --test relay/canal-ok.test.mjs`.
+
+Verificación de solo lectura (no envía nada, no crea pestañas, no hace click):
+
+```bash
+WSP_CDP=http://127.0.0.1:9333 node relay/dryrun-canal.mjs
+```
+
+Sale `0` si el guard dejaría pasar, `2` si bloquearía, `3` si CDP o WhatsApp no
+están disponibles.
+
 ## Concurrency
 
 The pool grows on demand: a request that finds every worker busy opens a new tab,
