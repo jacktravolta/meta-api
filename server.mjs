@@ -1402,6 +1402,15 @@ async function askMeta(worker, content, progress = null, mode = "normal", images
     await sleep(POLL_MS);
     const res = await readAnswer();
     const ans = res && res.found ? (res.text || "") : "";
+    // PLACEHOLDERS (bug del cerebro que contestaba "ok"/"Evaluando..."): las
+    // lineas de estado de Meta no son respuestas. Tratarlas como vacias y seguir
+    // esperando hasta que llegue la respuesta real.
+    if (ans && /^(Evaluando|Interpretando|Pensando|Mostrar razonamiento|Preparando la respuesta|Comprendido)/i.test(ans.trim())) {
+      idle++;
+      lastWhy = "placeholder";
+      if (i % 8 === 0) log("poll", i, "placeholder de estado descartado:", ans.trim().slice(0, 60));
+      continue;
+    }
     // A "stop generating" control present => Meta IS working (long answers need
     // more than the old 120s budget); absent => blocked/dead, fail early.
     const gen = await stopGenerating();
