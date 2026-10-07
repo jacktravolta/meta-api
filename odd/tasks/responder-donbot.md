@@ -71,6 +71,11 @@ está incompleto.
 - [x] T8 — Corregir las ediciones fuera de alcance que hizo el agente:
        `PREFIJO` `🤖`→`∞` en `responder-donbot.mjs`, prefijos en `wsp.mjs`
        (ya revertido) y el criterio de aceptación 2 del propio tracker.
+- [x] T9 — Aviso `🤖 [DONBOT] procesando...` antes de tareas que tardan
+       (orden del usuario, había quedado en `donbot-fallidos.txt` por el
+       timeout de 120 s). Umbral `PREFIJO_PROCESAR_MS = 5000`; si el aviso
+       salió, espera `ENTRE_ENVIOS_MS` antes de la respuesta para respetar el
+       rate limit, y manda un corte si la composición falla después.
 
 ## Acceptance criteria
 
@@ -93,6 +98,8 @@ está incompleto.
 - Pruebas en seco de denegación: `git push`, lectura de `.ssh`, `git commit`
 - `git diff --stat` antes/después de una corrida → sin archivos no pedidos
 - Prueba de composición en seco y de envío con `WSP_CDP=http://127.0.0.1:9233`
+- Latencias de composición medidas en el log: 9–83 s. El umbral de 5 s se
+  cruza casi siempre, así que el aviso funciona como feedback inmediato.
 
 ## Known limitations
 
@@ -113,8 +120,8 @@ está incompleto.
 
 - Route: delegated direct (writer trigger: 2+ archivos no triviales).
 - Resolved mode: TDD off (fuente: decisión previa del proyecto).
-- Progress: T1–T8 cerrados. `87c4f03` (guardas R1), `934f487` (consumidor),
-  `18ca0a6` (detección) y este work-unit (autonomía + correcciones de las
-  ediciones fuera de alcance).
-- Next step: reiniciar `donbot-responder.service` para que tome `--auto`; y
-  esperar orden sobre `espejo.service` (preguntada, sin respuesta).
+- Progress: T1–T9 cerrados. `87c4f03` (guardas R1), `934f487` (consumidor),
+  `18ca0a6` (detección), `360a1d0` (autonomía), `10e72ea` (icono ✨ [META]) y
+  T9 (aviso "procesando...").
+- Next step: reiniciar `donbot-responder.service` para que tome `--auto` y el
+  aviso; y esperar orden sobre `espejo.service` (preguntada, sin respuesta).
