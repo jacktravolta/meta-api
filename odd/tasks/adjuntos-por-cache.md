@@ -70,8 +70,19 @@ ningun visor, no se reprodujo nada, no se clickeo nada**.
 Cada bajada reporto su distancia a la hora de la fila: 50 s, 31 s y 38 s
 respectivamente (dentro del margen de 180 s).
 
+### Hallazgo posterior (corregido en el mismo dia)
+El `timestamp` de la IDB **NO es la hora del mensaje: es cuando WhatsApp lo cacheo.**
+Medido: la imagen de las 3:05 p.m. (id `ACC94ABB…`) no estaba a las 18:05; aparecio
+con timestamp **18:24:59Z**, 19 minutos despues, porque la pestana se recargo y la
+volvio a bajar. Distancia aHash contra el PNG guardado: **0** (misma imagen).
+
+Por eso el emparejamiento ahora puntua con **dos señales** y toma la mejor:
+- distancia a AHORA (el relay procesa segundos despues de llegar), y
+- distancia a la hora de la fila (cubre el cache tardio).
+Se registra cual gano (`por llegada` / `por hora de la fila`).
+
 ### Pendiente
 - Verificar con una nota de voz NUEVA (sin reproducir) que WhatsApp la cachea al
-  recibirla y no solo al reproducirla. Hasta entonces el camino viejo queda como
-  respaldo y no se borra.
-- Los caminos viejos (canvas, play+sniff, visor+fetch) siguen ahi como respaldo.
+  recibirla: HECHO el 2026-10-07 18:46 — salio del cache (4641 B .ogg, 20s por
+  "hora de la fila"), se transcribio y Meta respondio.
+- Los caminos viejos (canvas, play+sniff, visor+fetch) siguen como respaldo.
