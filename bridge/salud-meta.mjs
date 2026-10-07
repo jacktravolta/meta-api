@@ -15,7 +15,17 @@ const log = (s) => { const l = `[${new Date().toISOString()}] ${s}`; appendFileS
 const sh = (cmd) => { try { execFileSync("bash", ["-lc", cmd], { stdio: "ignore", timeout: 180000 }); return true; } catch { return false; } };
 
 async function salud() {
-  const l = await (await fetch(CDP + "/json")).json();
+  // Chrome apagado: sin CDP no hay pestañas que mirar. Se devuelve un ESTADO
+  // en vez de tirar excepcion. Con la version anterior el fetch caia en el
+  // catch del loop, que solo registraba "error en el chequeo" y jamas llegaba
+  // al bloque de recuperacion: el puente estuvo ~6 h caido con 71 chequeos
+  // fallidos y este watchdog mirando sin poder hacer nada.
+  let l;
+  try {
+    l = await (await fetch(CDP + "/json")).json();
+  } catch {
+    return "chrome-caido";
+  }
   const t = l.find((x) => (x.url || "").includes("meta.ai/prompt/"));
   if (!t) return "sin-pestana";
   const ws = new WebSocket(t.webSocketDebuggerUrl);
@@ -86,7 +96,10 @@ for (let k = 0; k < 1440; k++) {
       }
     } catch {}
     const s = await salud();
-    if ((s === "degradada" || s === "sin-respuesta" || s === "sin-pestana") && !envioReciente) {
+    // chrome-caido entra en la misma via de recuperacion: sin navegador no
+    // puede haber envio en curso, y es exactamente el caso que antes se
+    // escapaba por excepcion.
+    if ((s === "degradada" || s === "sin-respuesta" || s === "sin-pestana" || s === "chrome-caido") && !envioReciente) {
       log(`Meta ${s}: reinicio el broker (Chrome fresco) + reabro WhatsApp + relay`);
       try { await limpiarEstado(); } catch (e) { log("no se pudo limpiar el estado: " + String(e).slice(0, 80)); }
       sh("export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user restart meta-api.service");
