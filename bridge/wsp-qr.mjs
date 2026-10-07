@@ -1,6 +1,6 @@
 // wsp-qr.mjs — captura el QR de WhatsApp Web y lo guarda como PNG.
 import { writeFileSync } from "node:fs";
-const CDP = "http://127.0.0.1:9333";
+const CDP = "http://127.0.0.1:9233";
 const OUT = process.argv[2] || "/home/test/test/meta-api/bridge/wsp-qr.png";
 const lista = await (await fetch(CDP + "/json")).json();
 const t = lista.find((x) => (x.url || "").includes("web.whatsapp.com"));

@@ -1,5 +1,13 @@
+# ── RETIRADA (2026-10-07) ────────────────────────────────────────────────────
+# Esta unidad levanta un SEGUNDO Chrome (perfil google-chrome-wa, puerto 9333)
+# solo para el relay. Eso da DOS navegadores con DOS sesiones de WhatsApp
+# peleando la misma cuenta, que es justo lo que rompia las cosas.
+# El relay y el broker comparten UN solo Chrome: el del perfil
+# google-chrome-beta-debug en el puerto 9233, que arranca meta-api on-demand.
+# Queda disabled a proposito. NO habilitar: si hace falta revivirla, primero
+# unificar en un unico Chrome con pestanas.
 [Unit]
-Description=Chrome con puerto de debug para el puente de WhatsApp Web
+Description=Chrome con puerto de debug para el puente de WhatsApp Web (RETIRADA — usar el 9233 de meta-api)
 Documentation=file:///home/test/test/meta-api/relay/wsp.mjs
 After=network-online.target graphical-session.target
 Wants=network-online.target

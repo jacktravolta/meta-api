@@ -1,5 +1,5 @@
 // probe-wsp.mjs — lista los chats visibles en el sidebar de WhatsApp Web.
-const CDP = "http://127.0.0.1:9333";
+const CDP = "http://127.0.0.1:9233";
 const lista = await (await fetch(CDP + "/json")).json();
 const t = lista.find((x) => (x.url || "").includes("web.whatsapp.com"));
 if (!t) { console.log("no hay pestaña de WhatsApp"); process.exit(1); }
