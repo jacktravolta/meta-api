@@ -15,6 +15,9 @@ import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { esDonBot } from "./es-donbot.mjs";
+// HOMOLOGADO cdpAutoCura: el Resolutor es SOLO un fallback. El selector principal
+// se evalúa primero; el Resolutor entra únicamente cuando el principal devuelve null.
+import { Resolutor, Telemetria } from "./lib/resolver.mjs";
 
 const BIN = dirname(fileURLToPath(import.meta.url));
 const CANAL = join(BIN, "canal.json");
@@ -89,6 +92,17 @@ async function connect() {
   return { ws, call };
 }
 
+// ── HOMOLOGADO cdpAutoCura: Resolutor como capa de respaldo (solo fallback) ──
+const teleVigia = new Telemetria("donbot-vigia", join(BIN, "telemetria-vigia.jsonl"));
+let resolVigia = null; // se crea lazy cuando se necesita
+const MAPA_DONBOT_URL = process.env.MAPA_DONBOT_URL || "http://127.0.0.1:8799/donbot-selectors.json";
+const SPEC_FILAS_META = {
+  sel: "[class*='group/message-row'], [data-testid='message-row'], [role='row']",
+  rx: /message|mensaje/i,
+  anclas: ["[class*='group/message-row']", "[data-testid='message-row']", "[role='row']"],
+  masGrande: false,
+};
+
 // Bootstrap: primera vez en este canal -> publicar reglas.
 if (!canal.bootstrapped) {
   try {
@@ -110,6 +124,16 @@ for (let i = 0; i < 1800; i++) {
   let rows = [];
   try { rows = JSON.parse((await call("Runtime.evaluate", { expression: ROW_EXPR, returnByValue: true })) || "[]"); } catch {}
   if (!Array.isArray(rows)) rows = [];
+  // HOMOLOGADO cdpAutoCura: si el selector principal no encontró filas, el Resolutor
+  // intenta resolverlas por anclas. NO destructivo.
+  if (!rows.length) {
+    if (!resolVigia) resolVigia = new Resolutor(call, { app: "donbot-vigia", version: "1", mapaUrl: MAPA_DONBOT_URL, telemetria: teleVigia });
+    const r = await resolVigia.resolver("fila-mensaje-meta", SPEC_FILAS_META);
+    if (r) {
+      const alt = JSON.parse((await call("Runtime.evaluate", { expression: `JSON.stringify([...document.querySelectorAll(${JSON.stringify(r.selector)})].map(x => ({ rol: x.querySelector('[data-testid="assistant-message"]') ? 'A' : 'U', txt: (x.innerText||'').replace(/\\n+/g,' ').replace(/\\s*Hoy\\s*$/,'').trim() })).filter(x => x.txt.length > 0).slice(-12))`, returnByValue: true })) || "[]");
+      if (alt.length) { rows = alt; console.log(`filas de Meta resueltas por el Resolutor (via: ${r.via})`); }
+    }
+  }
   const textsAhora = new Set(rows.map((r) => norm(r.txt)));
 
   if (primerCiclo && rows.length) {

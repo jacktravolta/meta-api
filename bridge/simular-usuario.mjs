@@ -1,5 +1,12 @@
 // simular-usuario.mjs — escribe y envia un mensaje en WhatsApp como si fuera
 // el usuario (sin pasar por el relay, para que NO quede marcado como del bot).
+//
+// Guard de canal: el destino NO se infiere de "lo que este abierto en la
+// pestana". El titulo real del DOM se valida contra la lista blanca ANTES de
+// cualquier evento de raton/teclado; si no esta permitido, se sale sin un solo
+// Input.* (fail-closed).
+import { canalPermitido, motivoRechazo } from "../relay/canal-ok.mjs";
+
 const CDP = process.env.WSP_CDP || "http://127.0.0.1:9233";
 const TEXTO = process.argv[2] || "Don Bot, decime la hora";
 const l = await (await fetch(CDP + "/json")).json();
@@ -12,6 +19,13 @@ const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.se
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
 async function ev(expr) { const r = await call("Runtime.evaluate", { expression: expr, returnByValue: true }); return r && r.result ? r.result.value : null; }
+// (guard) Se lee el titulo del chat ANTES de tocar el composer. Sin canal en
+// la lista blanca no hay click, no hay insertText y no hay Enter.
+const titulo = await ev(`(() => { const s = document.querySelector('#main header span[dir=auto]'); return s ? s.textContent.trim() : null; })()`);
+if (!canalPermitido(titulo)) {
+  console.log(`BLOQUEADO: ${motivoRechazo(titulo)} — no se escribe nada en el composer`);
+  process.exit(1);
+}
 const caja = await ev(`(() => { const e = document.querySelector('#main footer [contenteditable=true]'); if (!e) return null; const r = e.getBoundingClientRect(); return JSON.stringify({x: Math.round(r.x+r.width/2), y: Math.round(r.y+r.height/2)}); })()`);
 if (!caja) { console.log("no encontre la caja de texto"); process.exit(1); }
 const c = JSON.parse(caja);

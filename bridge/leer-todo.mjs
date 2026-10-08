@@ -6,6 +6,9 @@
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// HOMOLOGADO cdpAutoCura: el Resolutor es SOLO un fallback. El selector principal
+// se evalúa primero; el Resolutor entra únicamente cuando el principal devuelve null.
+import { Resolutor, Telemetria } from "./lib/resolver.mjs";
 const BIN = dirname(fileURLToPath(import.meta.url));
 const CANAL = join(BIN, "canal.json");
 const ENVIADOS = join(BIN, "don-bot-enviados.txt");
@@ -25,7 +28,31 @@ ws.onmessage = (m) => { const d = JSON.parse(m.data); if (d.id && pending.has(d.
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
 
-const leer = async () => JSON.parse((await call("Runtime.evaluate", { expression: `JSON.stringify([...document.querySelectorAll('[class*="group/message-row"]')].map(r => (r.innerText||'').replace(/\\n+/g,' ').trim()).filter(Boolean))`, returnByValue: true })) || "[]");
+// ── HOMOLOGADO cdpAutoCura: Resolutor como capa de respaldo (solo fallback) ──
+const teleLeerTodo = new Telemetria("donbot-leer-todo", join(BIN, "telemetria-leer-todo.jsonl"));
+let resolLeerTodo = null;
+const MAPA_DONBOT_URL = process.env.MAPA_DONBOT_URL || "http://127.0.0.1:8799/donbot-selectors.json";
+const SPEC_FILAS_META_LEER = {
+  sel: "[class*='group/message-row'], [data-testid='message-row'], [role='row']",
+  rx: /message|mensaje/i,
+  anclas: ["[class*='group/message-row']", "[data-testid='message-row']", "[role='row']"],
+  masGrande: false,
+};
+
+const leer = async () => {
+  let rows = JSON.parse((await call("Runtime.evaluate", { expression: `JSON.stringify([...document.querySelectorAll('[class*="group/message-row"]')].map(r => (r.innerText||'').replace(/\\n+/g,' ').trim()).filter(Boolean))`, returnByValue: true })) || "[]");
+  // HOMOLOGADO cdpAutoCura: si el selector principal no encontró filas, el Resolutor
+  // intenta resolverlas por anclas. NO destructivo.
+  if (!rows.length) {
+    if (!resolLeerTodo) resolLeerTodo = new Resolutor(call, { app: "donbot-leer-todo", version: "1", mapaUrl: MAPA_DONBOT_URL, telemetria: teleLeerTodo });
+    const r = await resolLeerTodo.resolver("fila-mensaje-meta", SPEC_FILAS_META_LEER);
+    if (r) {
+      const alt = JSON.parse((await call("Runtime.evaluate", { expression: `JSON.stringify([...document.querySelectorAll(${JSON.stringify(r.selector)})].map(x => (x.innerText||'').replace(/\\n+/g,' ').trim()).filter(Boolean))`, returnByValue: true })) || "[]");
+      if (alt.length) { rows = alt; console.log(`filas resueltas por el Resolutor (via: ${r.via})`); }
+    }
+  }
+  return rows;
+};
 const scrollUp = async () => await call("Runtime.evaluate", { expression: `(() => { const els=[...document.querySelectorAll('*')].filter(e=>e.scrollHeight>e.clientHeight+150); els.sort((a,b)=>b.scrollHeight-a.scrollHeight); const c=els[0]; if(!c) return 'no-scroller'; const antes=c.scrollTop; c.scrollTop=Math.max(0, c.scrollTop-c.clientHeight); return antes+'->'+c.scrollTop; })()`, returnByValue: true });
 
 const vistas = new Map();

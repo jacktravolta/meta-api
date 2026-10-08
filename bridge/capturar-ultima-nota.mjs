@@ -12,6 +12,9 @@
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+// HOMOLOGADO cdpAutoCura: el Resolutor es SOLO un fallback. El selector principal
+// se evalúa primero; el Resolutor entra únicamente cuando el principal devuelve null.
+import { Resolutor, Telemetria } from "./lib/resolver.mjs";
 
 const BIN = dirname(fileURLToPath(import.meta.url));
 const MEDIA = join(BIN, "..", "relay", "state", "media");
@@ -49,6 +52,17 @@ const ev = async (expression, awaitPromise) => {
 await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
 paso("ws abierto");
 
+// ── HOMOLOGADO cdpAutoCura: Resolutor como capa de respaldo (solo fallback) ──
+const teleNota = new Telemetria("donbot-capturar-nota", join(BIN, "telemetria-nota.jsonl"));
+let resolNota = null;
+const MAPA_DONBOT_URL = process.env.MAPA_DONBOT_URL || "http://127.0.0.1:8799/donbot-selectors.json";
+const SPEC_NOTA_VOZ_WSP = {
+  sel: "[role=row]",
+  rx: /audio|voz|play/i,
+  anclas: ["[role=row]"],
+  masGrande: false,
+};
+
 // Cache apagada: sin esto no hay petición que observar.
 paso("Network.enable");
 paso(" -> " + JSON.stringify((await call("Network.enable", {}))?.error || "ok"));
@@ -69,6 +83,27 @@ const fila = await ev(`(() => {
   return JSON.stringify({ dataId: id, txt: (f.innerText || '').replace(/\\n/g, ' | ').slice(0, 70) });
 })()`);
 
+// HOMOLOGADO cdpAutoCura: si el selector principal no encontró notas, el Resolutor
+// intenta resolverlas por anclas. NO destructivo.
+if (!fila) {
+  if (!resolNota) resolNota = new Resolutor(call, { app: "donbot-capturar-nota", version: "1", mapaUrl: MAPA_DONBOT_URL, telemetria: teleNota });
+  const r = await resolNota.resolver("nota-voz-wsp", SPEC_NOTA_VOZ_WSP);
+  if (r) {
+    fila = await ev(`(() => {
+      const rows = [...document.querySelectorAll(${JSON.stringify(r.selector)})].filter(x => x.querySelector('[data-id]'));
+      const voz = rows.filter(x => x.querySelector('[aria-label*="eproducir"], [aria-label*="audio"], [data-testid*="audio"]'));
+      if (!voz.length) return null;
+      const f = voz[voz.length - 1];
+      const b = f.querySelector('[aria-label*="eproducir"], [aria-label*="audio"], [data-testid*="audio"]');
+      if (!b) return null;
+      const id = f.querySelector('[data-id]').getAttribute('data-id');
+      b.scrollIntoView({ block: 'center' });
+      b.click();
+      return JSON.stringify({ dataId: id, txt: (f.innerText || '').replace(/\\n/g, ' | ').slice(0, 70) });
+    })()`);
+    if (fila) console.log(`nota de voz resuelta por el Resolutor (via: ${r.via})`);
+  }
+}
 if (!fila) { console.error("no hay notas de voz en el chat"); process.exit(2); }
 const meta = JSON.parse(fila);
 paso(`click hecho — ${meta.dataId} | ${meta.txt}`);

@@ -30,8 +30,9 @@ GET  /v1/models · GET /health
 The installer copies the broker and watcher units plus tracked drop-ins, but does
 **not** enable or start them. `start` enables and starts the broker, opens the
 logged-in Meta tab, and starts the watcher. `watch` attaches the current terminal
-to watcher logs. To stop scraping and prevent automatic startup at the next login, run
-`./relay/operar.sh stop`; a later `start` command remains available.
+to watcher logs. `stop` disables autostart and runtime-masks both units so another
+unit cannot indirectly restart scraping; a later `start` removes the masks and
+starts the stack again.
 The unit expects this checkout at `/home/test/test/meta-api` and Node 22 at the path in the
 unit; adjust those two paths in `systemd/meta-api.service` if you relocate it.
 

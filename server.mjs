@@ -42,6 +42,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgentLoop } from "./agent/loop.js";
 import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
+// HOMOLOGADO cdpAutoCura: el Resolutor es SOLO un fallback. El selector principal
+// se evalúa primero; el Resolutor entra únicamente cuando el principal devuelve null.
+import { Resolutor, Telemetria } from "./bridge/lib/resolver.mjs";
 
 // HARD GUARD: this file needs the GLOBAL WebSocket, which only exists in Node >= 21.
 // The distro node (/usr/bin/node) is 18.x, so anything started OUTSIDE an
@@ -339,6 +342,23 @@ async function evaluate(ws, expression) {
   const r = await cdpCall(ws, ++cdpSeq, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
   return r && r.result ? r.result.value : undefined;
 }
+
+// ── HOMOLOGADO cdpAutoCura: Resolutor como capa de respaldo (solo fallback) ──
+// El selector principal se evalúa primero; el Resolutor entra únicamente cuando
+// el principal devuelve null. Mapa remoto: donbot-selectors.json en cdpAutoCura.
+const teleMeta = new Telemetria("donbot-meta", "/home/test/test/meta-api/state/telemetria-meta.jsonl");
+let resolMeta = null; // se crea lazy cuando se necesita
+const MAPA_DONBOT_URL = process.env.MAPA_DONBOT_URL || "http://127.0.0.1:8799/donbot-selectors.json";
+const SPEC_COMPOSER_META = {
+  sel: "div[data-testid='composer-input'][contenteditable='true'], textarea, [contenteditable='true']",
+  rx: /composer|escribir|message/i,
+  anclas: [
+    "div[data-testid='composer-input'][contenteditable='true']",
+    "div[data-testid='composer-input'][contenteditable='plaintext-only']",
+    "textarea",
+  ],
+  masGrande: true,
+};
 
 async function killStrays() {
   // A lingering Chrome with the SAME profile steals every new launch via its
@@ -957,7 +977,22 @@ async function typeReal(ws, content) {
     pick.focus();
     return true;
   })()`;
-  const focused = await evaluate(ws, FIND_COMPOSER).catch(() => false);
+  let focused = await evaluate(ws, FIND_COMPOSER).catch(() => false);
+  // HOMOLOGADO cdpAutoCura: si PICK_COMPOSER_JS falló, el Resolutor intenta
+  // resolver el composer por anclas. NO destructivo.
+  if (!focused) {
+    if (!resolMeta) resolMeta = new Resolutor(ws, { app: "donbot-meta", version: "1", mapaUrl: MAPA_DONBOT_URL, telemetria: teleMeta });
+    const r = await resolMeta.resolver("composer-meta", SPEC_COMPOSER_META);
+    if (r) {
+      focused = await evaluate(ws, `(() => {
+        const e = document.querySelector(${JSON.stringify(r.selector)});
+        if (!e) return false;
+        e.focus();
+        return true;
+      })()`).catch(() => false);
+      if (focused) log(`composer resuelto por el Resolutor (via: ${r.via})`);
+    }
+  }
   if (!focused) log("aviso: no se encontro composer visible para enfocar");
 
   // Clean slate, WITHOUT synthetic modifier bits. An earlier version sent Ctrl+A
