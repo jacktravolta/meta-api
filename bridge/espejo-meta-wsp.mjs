@@ -9,7 +9,8 @@
 //     pagina) y la manda a WhatsApp. Las filas SIN media se ignoran.
 //     El caption es CLAVE: el relay de WhatsApp descarta por etiqueta propia, y
 //     asi no se contesta a si mismo (evita el bucle).
-import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, renameSync, unlinkSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,13 +29,23 @@ const norm = (t) => (t || "").replace(/\s+/g, " ").trim().slice(0, 300).toLowerC
 const ruido = [/^mostrar razonamiento/, /^ocultar razonamiento/, /^transcribir audio o video/, /^hoy$/, /lineas? ocultas?/, /^pensando/];
 
 let vistos = new Set(existsSync(VISTOS) ? JSON.parse(readFileSync(VISTOS, "utf8")) : []);
-const guardar = () => writeFileSync(VISTOS, JSON.stringify([...vistos].slice(-400)));
+// Escritura ATOMICA (tmp + rename): un corte a mitad de write deja el JSON vacio.
+function guardarAtomico(ruta, valor) {
+  const tmp = ruta + ".tmp";
+  try { writeFileSync(tmp, JSON.stringify(valor)); renameSync(tmp, ruta); } catch { /* no rompe el bucle */ }
+}
+const guardar = () => guardarAtomico(VISTOS, [...vistos].slice(-400));
 // Imagenes ya relayadas (por src): evita mandar la MISMA imagen 2-3 veces cuando
 // el texto de la respuesta de Meta crece por streaming (cada etapa tiene un texto
 // distinto, asi que el dedup por texto no alcanza: se veian 3 fotos iguales).
 const VISTOS_IMG = join(BIN, "espejo-vistos-img.json");
-let vistosImg = new Set(existsSync(VISTOS_IMG) ? JSON.parse(readFileSync(VISTOS_IMG, "utf8")) : []);
-const guardarImg = () => writeFileSync(VISTOS_IMG, JSON.stringify([...vistosImg].slice(-400)));
+// vistosImg guarda el HASH sha256 de los BYTES (no el src): el src blob: cambia en
+// cada reload y los CDN pueden repetirse. Los src viejos se conservan aparte para
+// no re-enviar lo ya mandado antes de este cambio.
+const _imgGuardadas = existsSync(VISTOS_IMG) ? JSON.parse(readFileSync(VISTOS_IMG, "utf8")) : [];
+let vistosImg = new Set(_imgGuardadas.filter((s) => /^[a-f0-9]{64}$/.test(s)));
+const vistosImgSrc = new Set(_imgGuardadas.filter((s) => !/^[a-f0-9]{64}$/.test(s)));
+const guardarImg = () => guardarAtomico(VISTOS_IMG, [...vistosImg, ...vistosImgSrc].slice(-400));
 
 async function conectar() {
   const l = await (await fetch("http://127.0.0.1:9233/json")).json();
@@ -53,9 +64,15 @@ async function conectar() {
   return { ws, call };
 }
 const enviarMediaWsp = (ruta, caption) => {
-  try { execFileSync(process.execPath, [ENVIAR_MEDIA, ruta, caption], { stdio: "ignore", timeout: 150000, env: { ...process.env, WSP_CDP: "http://127.0.0.1:9233" } }); return true; }
+  // Env MINIMO: no se pasa process.env entero al hijo.
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, WSP_CDP: "http://127.0.0.1:9233" };
+  try { execFileSync(process.execPath, [ENVIAR_MEDIA, ruta, caption], { stdio: "ignore", timeout: 150000, env }); return true; }
   catch { return false; }
 };
+// Cola SERIAL (1 envio a la vez): WhatsApp no soporta envios en paralelo y cada
+// spawn abre su propio CDP contra 9233. Sin esto, N imagenes = N CDP pisandose.
+let colaEnvio = Promise.resolve();
+const encolarEnvio = (fn) => { colaEnvio = colaEnvio.then(fn).catch(() => {}); };
 
 let { ws, call } = (await conectar()) || {};
 if (!ws) { console.log("no hay pestaña del canal"); process.exit(1); }
@@ -63,15 +80,17 @@ console.log("== espejo Meta->WhatsApp activo (solo multimedia) ==");
 
 // Rescata una imagen de la respuesta de Meta: fetch DENTRO de la pagina y la
 // escribe a un archivo. Devuelve la ruta o null.
-async function bajarImagen(src) {
+async function bajarImagenConHash(src) {
   const b64 = await call("Runtime.evaluate", {
     expression: `(async () => { try { const r = await fetch(${JSON.stringify(src)}); const b = await r.arrayBuffer(); const u = new Uint8Array(b); let s = ""; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode.apply(null, u.subarray(i, i + 8192)); return btoa(s); } catch (e) { return null; } })()`,
     returnByValue: true, awaitPromise: true,
   });
   if (!b64 || typeof b64 !== "string") return null;
+  const buf = Buffer.from(b64, "base64");
+  const hash = createHash("sha256").update(buf).digest("hex");
   const ext = /\.png(\?|$)/i.test(src) ? "png" : /\.webp(\?|$)/i.test(src) ? "webp" : "jpg";
   const p = join(MEDIA_DIR, `meta-${Date.now()}-${Math.floor(Math.random() * 1e4)}.${ext}`);
-  try { writeFileSync(p, Buffer.from(b64, "base64")); return p; } catch { return null; }
+  try { writeFileSync(p, buf); return { ruta: p, hash, src }; } catch { return null; }
 }
 
 let primerCiclo = true;
@@ -107,9 +126,8 @@ for (let k = 0; k < 86400; k++) {
       if (vistos.has(n)) continue;
       // ESTABILIDAD: solo relayar si el texto YA estaba en la lectura anterior.
       if (!prevRows.has(n)) continue;
-      vistos.add(n);
-      if (/^\s*(?:[^\[A-Za-z0-9]{1,4}\s*)?\[(don\s?bot|donbot|meta)\]/i.test(row.t.trim())) { continue; }   // nuestro
-      if (ruido.some((rx) => rx.test(n))) { continue; }
+      if (/^\s*(?:[^\[A-Za-z0-9]{1,4}\s*)?\[(don\s?bot|donbot|meta)\]/i.test(row.t.trim())) { vistos.add(n); continue; }   // nuestro
+      if (ruido.some((rx) => rx.test(n))) { vistos.add(n); continue; }
       // SOLO MULTIMEDIA: el espejo existe para las imagenes/archivos que Meta
       // genera (el relay NO relaya media). El TEXTO de Meta lo entrega el relay
       // como "🧠 [META]"; si el espejo tambien lo mandaba, cada respuesta llegaba
@@ -117,15 +135,20 @@ for (let k = 0; k < 86400; k++) {
       // Imagen mas grande de la fila (la generada por Meta, no el eco original).
       const imgs = (row.imgs || []).slice().sort((a, b) => (b.w * b.h) - (a.w * a.h));
       const mejor = imgs[0];
-      if (!mejor || !mejor.src) { continue; }        // sin media: no se relaya
-      if (vistosImg.has(mejor.src)) { continue; }    // ya relayada (el texto crece por streaming)
+      if (!mejor || !mejor.src) { vistos.add(n); continue; }        // sin media: no se relaya
+      if (vistosImgSrc.has(mejor.src)) { vistos.add(n); continue; } // src viejo ya enviado
       const texto = "✨ [META] " + row.t.replace(/\s+/g, " ").trim().slice(0, 900);
-      vistosImg.add(mejor.src); guardarImg();
-      const ruta = await bajarImagen(mejor.src);
-      if (!ruta) { continue; }
-      const ok = enviarMediaWsp(ruta, texto);
-      appendFileSync(LOG, `[${new Date().toISOString()}] ${ok ? "media" : "FALLO-media"}: ${ruta} :: ${texto.slice(0, 70)}\n`);
-      console.log((ok ? "→ WhatsApp (imagen): " : "FALLO imagen: ") + texto.slice(0, 70));
+      // Envio SERIALIZADO (1 a la vez). Se marca visto SOLO si el envio salio:
+      // si falla, el proximo ciclo lo reintenta en vez de perderlo.
+      encolarEnvio(async () => {
+        const bajada = await bajarImagenConHash(mejor.src);
+        if (!bajada) return;
+        if (vistosImg.has(bajada.hash)) { vistos.add(n); guardar(); return; } // misma imagen (bytes)
+        const ok = enviarMediaWsp(bajada.ruta, texto);
+        appendFileSync(LOG, `[${new Date().toISOString()}] ${ok ? "media" : "FALLO-media"}: ${bajada.ruta} :: ${texto.slice(0, 70)}\n`);
+        console.log((ok ? "→ WhatsApp (imagen): " : "FALLO imagen: ") + texto.slice(0, 70));
+        if (ok) { vistosImg.add(bajada.hash); vistos.add(n); guardarImg(); guardar(); }
+      });
     }
     guardar();
   }
