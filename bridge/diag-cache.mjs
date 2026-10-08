@@ -1,0 +1,13 @@
+const l = await (await fetch("http://127.0.0.1:9233/json")).json();
+const t = l.find((x) => (x.url || "").includes("web.whatsapp.com"));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+let i = 1; const p = new Map();
+ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && p.has(m.id)) { p.get(m.id)(m.result?.result?.value); p.delete(m.id); } };
+const call = (m, pa) => new Promise((r) => { const id = i++; p.set(id, r); ws.send(JSON.stringify({ id, method: m, params: pa })); setTimeout(() => r(undefined), 30000); });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+await new Promise((r) => { if (ws.readyState === 1) return r(); ws.onopen = () => r(); setTimeout(r, 5000); });
+const q = async (e) => await call("Runtime.evaluate", { expression: e, returnByValue: true }, true);
+console.log("caches disponibles:", await q(`(async () => { try { const ks = await caches.keys(); return JSON.stringify(ks); } catch (e) { return 'no-access: ' + e.message; } })()`));
+console.log("entradas por cache:", await q(`(async () => { try { const ks = await caches.keys(); const out = {}; for (const k of ks) { const c = await caches.open(k); const reqs = await c.keys(); out[k] = reqs.length; } return JSON.stringify(out); } catch (e) { return 'err: ' + e.message; } })()`));
+console.log("media en cache (audio/ogg):", await q(`(async () => { try { const ks = await caches.keys(); const out = []; for (const k of ks) { const c = await caches.open(k); const reqs = await c.keys(); for (const r of reqs.slice(0, 300)) { if (/audio|ogg|opus|\.m4a|media/i.test(r.url)) out.push(r.url.slice(0, 90)); } } return JSON.stringify(out.slice(0, 10)); } catch (e) { return 'err: ' + e.message; } })()`));
+process.exit(0);
