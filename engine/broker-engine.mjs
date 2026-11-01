@@ -39,9 +39,13 @@ const DEFAULT_TTL_MS = 45 * 60_000; // conexion sin uso: se cierra (el hilo se r
 function loadStore() {
 	try { return JSON.parse(fs.readFileSync(STORE, "utf8")); } catch { return {}; }
 }
-function saveStore(store) {
+// Guarda SOLO la clave de este canal, releyendo el archivo: si otro proceso
+// (p.ej. una emulacion) escribio sus canales, no se pisan entre si.
+function saveStoreEntry(key, entry) {
 	try {
-		fs.writeFileSync(STORE, JSON.stringify(store, null, 1), { mode: 0o600 });
+		const disk = loadStore();
+		disk[key] = entry;
+		fs.writeFileSync(STORE, JSON.stringify(disk, null, 1), { mode: 0o600 });
 		fs.chmodSync(STORE, 0o600);
 	} catch { /* el store es opcional */ }
 }
@@ -99,8 +103,9 @@ export class MetaEngine {
 		const entry = this.store[key];
 		if (entry?.convId) return entry.convId;
 		const convId = randomUUID();
-		this.store[key] = { convId, title: null, updatedAt: new Date().toISOString() };
-		saveStore(this.store);
+		const fresh = { convId, title: null, updatedAt: new Date().toISOString() };
+		this.store[key] = fresh;
+		saveStoreEntry(key, fresh);
 		return convId;
 	}
 
@@ -228,7 +233,7 @@ export class MetaEngine {
 			try { await this.gql.rename(entry.convId, entry.title); } catch { /* el titulo no es critico */ }
 		}
 
-		this.store[key] = {
+		const stored = {
 			...(this.store[key] ?? {}),
 			convId: entry.convId,
 			title: entry.title,
@@ -237,7 +242,8 @@ export class MetaEngine {
 			messageIndex: entry.messageIndex ?? 0,
 			updatedAt: new Date().toISOString(),
 		};
-		saveStore(this.store);
+		this.store[key] = stored;
+		saveStoreEntry(key, stored);
 
 		return { text, conversationId: entry.convId, userId: this.creds?.userId ?? null, renewed, reconnect: reconnect || !!entry.reopened };
 	}

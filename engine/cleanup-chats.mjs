@@ -1,8 +1,13 @@
 // cleanup-chats.mjs — borra de la cuenta los chats creados por las pruebas.
 //
-//   node engine/cleanup-chats.mjs              # dry-run: solo lista
-//   node engine/cleanup-chats.mjs --yes        # borra los chats identificados
-//   node engine/cleanup-chats.mjs --all --yes  # borra TODOS los chats de la cuenta
+//   node engine/cleanup-chats.mjs                       # dry-run: solo lista
+//   node engine/cleanup-chats.mjs --yes                 # borra los identificados
+//   node engine/cleanup-chats.mjs --since 2026-11-01T00:00:00Z --yes
+//                                                       # borra los posteriores a esa fecha
+//   node engine/cleanup-chats.mjs --all --yes           # borra TODOS (peligroso)
+//
+// Ejecutar con el servidor detenido: el registro local se reescribe y otro
+// proceso podria tener una copia vieja en memoria.
 //
 // La selección NO es "todo lo que hay": por defecto solo marca
 //   1) los conversation_id registrados en engine/.conversations.json (los que
@@ -22,6 +27,9 @@ const STORE = path.join(HERE, ".conversations.json");
 const args = process.argv.slice(2);
 const YES = args.includes("--yes");
 const ALL = args.includes("--all");
+const sinceArg = args.includes("--since") ? args[args.indexOf("--since") + 1] : null;
+const SINCE = sinceArg ? Date.parse(sinceArg) : null;
+if (sinceArg && Number.isNaN(SINCE)) { console.error("--since: fecha invalida"); process.exit(2); }
 
 const s = session.load();
 if (!s) {
@@ -47,17 +55,25 @@ const idsDelMotor = new Set(Object.values(store).map((v) => v?.convId).filter(Bo
 const chats = await gql.conversations();
 console.log(`chats en la cuenta: ${chats.length}\n`);
 
+// Un chat creado por el motor puede estar en el store; uno creado por las
+// pruebas del navegador no. Para esos, el patron de titulo SOLO cuenta si el
+// chat es de las ultimas 24 h: asi un chat viejo del owner que de casualidad
+// dice "prueba" no se toca nunca.
+const RECIENTE_MS = 24 * 60 * 60_000;
 const propios = [];
 const ajenos = [];
 for (const c of chats) {
 	const titulo = c.title ?? "";
 	const porId = idsDelMotor.has(c.conversationId);
-	const porTitulo = PATRONES.some((r) => r.test(titulo));
+	const reciente = c.lastSendMessageTimestampMs && Date.now() - c.lastSendMessageTimestampMs < RECIENTE_MS;
+	const porTitulo = reciente && PATRONES.some((r) => r.test(titulo));
+	const porFecha = SINCE !== null && c.lastSendMessageTimestampMs && c.lastSendMessageTimestampMs >= SINCE;
 	const ts = c.lastSendMessageTimestampMs ? new Date(c.lastSendMessageTimestampMs).toISOString().slice(0, 16).replace("T", " ") : "-";
 	const linea = `${(c.conversationId || "").slice(0, 8)} | ${ts} | ${titulo.slice(0, 52) || "(sin titulo)"}`;
-	if (ALL || porId || porTitulo) propios.push({ ...c, motivo: porId ? "store" : "titulo" });
+	const marca = ALL || porId || porTitulo || porFecha;
+	if (marca) propios.push({ ...c, motivo: porId ? "store" : porFecha ? "fecha" : "titulo" });
 	else ajenos.push({ ...c, linea });
-	console.log(`  ${ALL || porId || porTitulo ? "BORRAR" : "ajeno "} ${linea}`);
+	console.log(`  ${marca ? "BORRAR" : "ajeno "} ${linea}`);
 }
 
 console.log(`\npropios: ${propios.length} | ajenos (intactos): ${ajenos.length}`);
