@@ -115,6 +115,7 @@ const appSessionId = () =>
 // replaced == 0 => drift de protocolo: mejor fallar que mandar pbs corruptos.
 export function insertSlots(nodes, {
 	prompt, conversationId, turnId, reqId, userId, now = Date.now(), sessionTs = null, depth = null, attachments = [],
+	replyTo = null, messageIndex = null, firstMessage = true,
 }) {
 	let replaced = 0;
 
@@ -194,13 +195,54 @@ export function insertSlots(nodes, {
 		}
 	}
 
-	// 6) profundidad del hilo (f2.1.5): cuantos mensajes lleva la conversacion.
-	//    El front lo incrementa en cada envio; si se queda en 1, el gateway
-	//    trata el mensaje como PRIMER turno de una conversacion nueva y el
-	//    hilo pierde la memoria de lo anterior.
-	if (depth !== null) {
+	// 6) PUNTERO DE HILO (verificado contra el navegador, captura pair2 del
+	//    2026-11-01 con dos mensajes en el MISMO chat):
+	//      f2.1.4 = response_id de la respuesta ANTERIOR ("e.xxxx"). Es lo que
+	//               ata el mensaje a SU conversacion. SIN esto el servidor usa
+	//               el contexto "activo" de la cuenta y los hilos se cruzan.
+	//      f2.1.5 = flag de PRIMER mensaje (varint 1). Solo va en el primero.
+	//      f2.4.1 = indice del mensaje en el hilo ("0", "2", "4", ...).
+	//      f1.1.12.4 = flag de primer mensaje. Solo va en el primero.
+	//      f1.1.1 = superficie de la UI: HOME en el primero, CHAT despues.
+	const msgNode = nodes.find((n) => n.field === 2 && n.wire === 2 && n.kind === "pb");
+	const inner = msgNode?.pb.find((n) => n.field === 1 && n.wire === 2 && n.kind === "pb");
+	if (!inner) throw new Error("template: sin mensaje interno (f2.1)");
+
+	if (messageIndex !== null) {
+		const leaf = leafAt(nodes, [2, 4, 1]);
+		if (leaf?.kind === "str") { leaf.str = String(messageIndex); replaced++; }
+	}
+
+	const surface = leafAt(nodes, [1, 1, 1]);
+	if (surface?.kind === "str" && /KADABRA__(HOME|CHAT)__/.test(surface.str)) {
+		surface.str = firstMessage ? "KADABRA__HOME__UNIFIED_INPUT_BAR" : "KADABRA__CHAT__UNIFIED_INPUT_BAR";
+		replaced++;
+	}
+
+	if (firstMessage) {
 		const leaf = leafAt(nodes, [2, 1, 5]);
-		if (leaf && leaf.wire === 0) { leaf.varint = BigInt(depth); replaced++; }
+		if (leaf && leaf.wire === 0) { leaf.varint = 1n; replaced++; }
+	} else {
+		// los flags de "primer mensaje" se OMITEN (asi lo hace el front)
+		const i5 = inner.pb.findIndex((n) => n.field === 5);
+		if (i5 >= 0) { inner.pb.splice(i5, 1); replaced++; }
+		const ux = leafAt(nodes, [1, 1, 12]);
+		if (ux?.kind === "pb") {
+			const i4 = ux.pb.findIndex((n) => n.field === 4);
+			if (i4 >= 0) { ux.pb.splice(i4, 1); replaced++; }
+		}
+	}
+
+	// f2.1.4 = id de la respuesta anterior: el eslabon del hilo.
+	if (replyTo) {
+		const hit = inner.pb.find((n) => n.field === 4);
+		if (hit) {
+			hit.wire = 2; hit.kind = "str"; hit.str = replyTo;
+			delete hit.pb; delete hit.bytes; delete hit.varint;
+		} else {
+			inner.pb.push({ field: 4, wire: 2, kind: "str", str: replyTo });
+		}
+		replaced++;
 	}
 
 	// 7) adjuntos (f2.3): cada adjunto es un submensaje con
@@ -231,6 +273,7 @@ export function insertSlots(nodes, {
 
 export function buildRequestPayload({
 	prompt, conversationId, turnId = randomUUID(), reqId = randomUUID(), userId, now = Date.now(), sessionTs = null, depth = null, attachments = [],
+	replyTo = null, messageIndex = null, firstMessage = true,
 }) {
 	const { payload } = loadTemplate();
 	// clon profundo (bigint es inmutable; solo clono el arbol de nodos)
@@ -246,7 +289,7 @@ export function buildRequestPayload({
 		return c;
 	});
 	const nodes = deepClone(payload);
-	const { replaced } = insertSlots(nodes, { prompt, conversationId, turnId, reqId, userId, now, sessionTs, depth, attachments });
+	const { replaced } = insertSlots(nodes, { prompt, conversationId, turnId, reqId, userId, now, sessionTs, depth, attachments, replyTo, messageIndex, firstMessage });
 	return { payload: encodePb(nodes), replaced, reqId };
 }
 
@@ -304,6 +347,10 @@ export class MetaGateway {
 		this.sessionTs = { start: Date.now(), end: Date.now() - 1000 };
 		// profundidad del hilo: cuantos mensajes lleva esta conversacion
 		this.depth = 0;
+		// puntero de hilo: response_id de la respuesta anterior (f2.1.4) e
+		// indice del mensaje (f2.4.1). Se persisten fuera de la conexion.
+		this.replyTo = null;
+		this.messageIndex = 0;
 		this.pingMs = pingMs;
 		this.debug = debug;
 		this.ws = null;
@@ -459,6 +506,7 @@ export class MetaGateway {
 		if (!this.ws || this.ws.readyState !== 1 || this.#closed)
 			throw new Error("chat: gateway no conectado");
 		const reqId = randomUUID();
+		const firstMessage = this.messageIndex === 0;
 		const { payload, replaced } = buildRequestPayload({
 			prompt,
 			conversationId: this.conversationId,
@@ -467,6 +515,9 @@ export class MetaGateway {
 			sessionTs: this.sessionTs,
 			depth: this.depth + 1,
 			attachments,
+			replyTo: this.replyTo,
+			messageIndex: this.messageIndex,
+			firstMessage,
 		});
 		this.depth += 1;
 		if (replaced < 2) throw new Error(`template: ${replaced} slots — drift de protocolo probable`);
@@ -513,7 +564,7 @@ export class MetaGateway {
 						onText?.(t);
 					}
 					this.#lastRid = rid ?? curRid;
-					return { text: textOf(acc), reqId };
+					return this.#finish(acc, reqId, rid ?? curRid);
 				}
 
 				if (isFull) {
@@ -544,7 +595,7 @@ export class MetaGateway {
 						// antes del texto son heartbeats de la fase de thinking
 						if (sawText) {
 							this.#lastRid = curRid;
-							return { text: textOf(acc), reqId };
+							return this.#finish(acc, reqId, curRid);
 						}
 						continue;
 					}
@@ -555,6 +606,16 @@ export class MetaGateway {
 				}
 			}
 		}
+	}
+
+	// Cierra el turno y fija el puntero del SIGUIENTE mensaje:
+	//   replyTo = response_id de ESTA respuesta (f2.1.4)
+	//   messageIndex += 2 (un mensaje de usuario + uno del asistente)
+	// Si el turno falla no se llama: el hilo no avanza.
+	#finish(acc, reqId, responseId) {
+		if (responseId) this.replyTo = responseId;
+		this.messageIndex += 2;
+		return { text: textOf(acc), reqId, responseId: responseId ?? null };
 	}
 
 	close() {

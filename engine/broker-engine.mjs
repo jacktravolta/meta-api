@@ -131,8 +131,15 @@ export class MetaEngine {
 		// 1 al reconectar, el gateway trataria el mensaje como el primero de una
 		// conversacion nueva y el hilo perderia la memoria.
 		gw.depth = this.store[key]?.depth ?? 0;
+		// Puntero de hilo: sin el, al reconectar el servidor usaria el contexto
+		// "activo" de la cuenta y los hilos se cruzarian.
+		gw.replyTo = this.store[key]?.replyTo ?? null;
+		gw.messageIndex = this.store[key]?.messageIndex ?? 0;
 		await gw.connect();
-		const entry = { convId, gw, title: this.store[key]?.title ?? null, depth: gw.depth, lastUsed: Date.now() };
+		const entry = {
+			convId, gw, title: this.store[key]?.title ?? null, depth: gw.depth,
+			replyTo: gw.replyTo, messageIndex: gw.messageIndex, lastUsed: Date.now(),
+		};
 		this.channels.set(key, entry);
 		return entry;
 	}
@@ -209,9 +216,11 @@ export class MetaEngine {
 			const creds = this.creds ?? await this.#credentials();
 			uploaded = await uploadAll(attachments, { token: creds.token, cookies: creds.cookies });
 		}
-		const { text, reqId } = await entry.gw.chat(prompt, { onText, attachments: uploaded, idleMs: this.idleMs });
+		const { text, reqId, responseId } = await entry.gw.chat(prompt, { onText, attachments: uploaded, idleMs: this.idleMs });
 		entry.lastUsed = Date.now();
 		entry.depth = entry.gw.depth;
+		entry.replyTo = entry.gw.replyTo;
+		entry.messageIndex = entry.gw.messageIndex;
 
 		// titulo del chat = primer mensaje (como hace el front)
 		if (!entry.title && text && this.mode === "session" && this.gql) {
@@ -224,6 +233,8 @@ export class MetaEngine {
 			convId: entry.convId,
 			title: entry.title,
 			depth: entry.depth,
+			replyTo: entry.replyTo ?? null,
+			messageIndex: entry.messageIndex ?? 0,
 			updatedAt: new Date().toISOString(),
 		};
 		saveStore(this.store);

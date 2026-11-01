@@ -30,9 +30,9 @@ const SLOT_RUTAS = [
 	"1.10.1", "1.10.3", "1.10.4", // flow ids
 	"2.1.1",                // turn id
 	"2.1.2.1", "2.1.2.2", "2.1.2.3", // conversation id, ts, uniqueMessageId
-	"2.1.5",                // profundidad del hilo
+	"2.1.5",                // flag de PRIMER mensaje (solo en el primero)
 	"2.2",                  // PROMPT
-	"2.4.1",
+	"2.4.1",                // indice del mensaje en el hilo
 ];
 
 function frameDeEnvio(captura) {

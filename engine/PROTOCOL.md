@@ -121,28 +121,40 @@ encodePb) con tests golden en `engine/gateway.test.mjs`.
 	f2.1.2.1 conversation id
 	f2.1.2.2 timestamp epoch ms del MENSAJE
 	f2.1.2.3 uniqueMessageId (snowflake) — NUEVO en cada mensaje
-	f2.1.5   PROFUNDIDAD del hilo (mensajes llevados) — 1, 2, 3...
+	f2.1.4   RESPONSE_ID de la respuesta anterior ("e.xxx" o UUID): el eslabon
+	         del hilo. Solo va a partir del segundo mensaje.
+	f2.1.5   flag de PRIMER mensaje (varint 1). Solo va en el primero.
 	f2.2     EL PROMPT (este es el slot que se reemplaza)
 	f2.3     ADJUNTOS (repetido): f1.1=media_id, f2=1, f5=0, f6=mime, f7=nombre
-	f2.4.1   "0"
+	f2.4.1   indice del mensaje en el hilo: "0", "2", "4", ...
 
 Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	prompt, turn id, conversation id, request id, timestamps del mensaje,
-	uniqueMessageId, profundidad del hilo, flow ids, player id + accountId
-	(cuando se conoce el usuario) y los adjuntos.
+	uniqueMessageId, puntero de hilo (f2.1.4), indice (f2.4.1), flow ids,
+	player id + accountId (cuando se conoce el usuario) y los adjuntos.
 
-### Los 4 campos que gobiernan la memoria del hilo (los que mas costaron)
+### Los campos que gobiernan el hilo (los que mas costaron)
 
 	1. f2.1.2.3 uniqueMessageId — NUEVO en cada mensaje. Es un snowflake:
 	   (Date.now() en ms << 22) | random(22 bits). Si se repite, el gateway
 	   responde con la RESPUESTA DEL MENSAJE ANTERIOR (no genera nada nuevo).
-	2. f2.1.5 profundidad del hilo — cuantos mensajes lleva la conversacion.
-	   Si queda en 1, el gateway trata el mensaje como el primero de una
-	   conversacion nueva: responde, pero SIN memoria de lo anterior.
-	3. f1.5.1 / f1.5.3 — timestamps de inicio de sesion/stream. Deben quedar
-	   CONSTANTES durante el hilo. Si se refrescan en cada mensaje, el gateway
-	   queda esperando el stream anterior: el WS se queda mudo (timeout).
-	4. f1.6 request id = "req-id" del JSON wrapper = messageId.
+	2. f2.1.4 response_id de la respuesta ANTERIOR — EL ESLABON DEL HILO.
+	   Sin el, el servidor no sabe a que conversacion pertenece el mensaje y
+	   usa el contexto "activo" de la CUENTA: con dos chats abiertos, las
+	   respuestas se cruzan (un hilo recibe el contexto de otro). Verificado
+	   con la captura pair2 (dos mensajes del mismo chat en el navegador) y
+	   con dos canales alternados por el motor.
+	3. f2.1.5 + f1.1.12.4 — flags de PRIMER mensaje. El front los manda solo
+	   en el primer envio; despues los OMITE. (Antes se creia que f2.1.5 era
+	   una "profundidad" incremental: era falso.)
+	4. f2.4.1 — indice del mensaje en el hilo: "0" en el primero, y avanza de
+	   a 2 por turno (mensaje de usuario + respuesta del asistente).
+	5. f1.1.1 — superficie de la UI: KADABRA__HOME__... en el primero,
+	   KADABRA__CHAT__... despues.
+	6. f1.5.1 / f1.5.3 — timestamps de inicio de sesion/stream. El motor los
+	   mantiene CONSTANTES por conexion (refrescarlos dejo el WS mudo en las
+	   pruebas); el navegador los avanza, pero el servidor acepta constantes.
+	7. f1.6 request id = "req-id" del JSON wrapper = messageId.
 
 ## Respuesta (tipo 0x0d srv, protobuf crudo)
 	Dentro hay JSON utf8 con:
@@ -169,13 +181,15 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	  3. Responde pero sin texto → cambió la forma de la respuesta (secciones).
 	  4. Devuelve SIEMPRE la respuesta anterior → el uniqueMessageId (f2.1.2.3)
 	     dejo de ser único por mensaje.
-	  5. Responde pero sin memoria → la profundidad del hilo (f2.1.5) cambio de
-	     ruta o de semantica.
+	  5. Responde pero sin memoria o con el contexto de OTRO chat → el puntero
+	     de hilo (f2.1.4 = response_id anterior) cambio de ruta o de formato.
+	     Sin el, el servidor usa el contexto activo de la cuenta.
 
 	Procedimiento:
 	  1) Capturar de nuevo (perfil dedicado, CDP 9298):
 	       node engine/capture-full.mjs 9298        # mensaje + imagen + cabeceras
-	       node engine/capture-pair.mjs 9298        # dos mensajes del mismo chat
+	       node engine/capture-pair2.mjs 9298       # dos mensajes del MISMO chat
+	                                                # (el boton de enviar, no Enter)
 	  2) Comparar el envelope nuevo contra el contrato, sin adivinar:
 	       node engine/check-slots.mjs               # fixture mas reciente
 	       node engine/check-slots.mjs <captura.json>   # captura nueva
@@ -187,11 +201,14 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	  4) Regenerar los tests golden: `node --test engine/gateway.test.mjs`.
 	  5) Verificar en vivo, en este orden:
 	       a) texto simple      → responde
-	       b) memoria           → turno 1 guarda un dato, turno 2 lo recalls
+	       b) memoria           → turno 1 GUARDA el dato, turno 2 lo pregunta
+	                              SIN repetirlo en la pregunta
 	       c) imagen            → PNG verde → "Verde"
 	       d) reconexion        → cerrar la WS y volver a preguntar
 	     Para (b) y (d) esperar >120 s entre turnos: es lo que delata los
-	     errores de profundidad y de timestamps.
+	     errores del puntero de hilo (f2.1.4) y de timestamps.
+	     (e) aislamiento     → DOS canales de la misma cuenta ALTERNADOS:
+	                            cada uno debe recordar SU dato y no el del otro.
 
 	Nota: los ids, timestamps y flow ids cambian en CADA envio. El diff solo es
 	alarmante si cambian las RUTAS o los TIPOS de los valores.
@@ -206,11 +223,15 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	- `capture-guest.mjs` captura el flujo invitado (sin login)
 	- `replay.mjs`      reproduce una captura desde Node (diagnostico)
 	- `probe.mjs`       CLI: `node engine/probe.mjs "hola" [--session]`
-	- `gateway.test.mjs` 14 tests golden (node --test) — EN VERDE
+	- `gateway.test.mjs` 16 tests golden (node --test) — EN VERDE, incluidos
+	                    los dos del puntero de hilo (primero / siguientes)
 	- `meta-graphql.mjs`  ciclo de vida de la conversacion (warmup, modo, rename)
 	- `upload.mjs`        subida de adjuntos a rupload.meta.ai -> media_id
 	- `broker-engine.mjs` pool de canales (user+channel) con memoria y renovacion
-	- `multichannel.mjs`  emulacion multicanal con prueba de memoria
+	- `multichannel.mjs`  emulacion multicanal con prueba de memoria real
+	                    (guarda el dato en un turno y lo pregunta sin revelarlo)
+	- `cleanup-chats.mjs` borra de la cuenta los chats creados por las pruebas
+	                    (dry-run por defecto; nunca toca chats ajenos)
 	- `check-slots.mjs`   verificador de drift: rutas, slots faltantes y diff
 
 ## Ciclo de vida de la conversacion (graphql)

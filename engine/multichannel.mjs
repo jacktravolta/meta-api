@@ -44,12 +44,15 @@ const mirror = (line) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.random() * (b - a);
 
-// dato que cada canal guarda para luego probar su memoria
+// Dato que cada canal GUARDA en el turno 2 y se le PREGUNTA despues SIN
+// revelarlo. La version anterior preguntaba "recuerda: la sala es la 7B,
+// cual era?" — la respuesta viajaba dentro de la pregunta, asi que el modelo
+// solo la repetia y el test daba un falso positivo.
 const SECRETO = [
-	{ q: "Para la reunion de hoy, la sala es la 7B. Guardalo y responde solo 'ok'.", a: "7B" },
-	{ q: "El numero de ticket del proveedor es TKT-8842. Guardalo y responde solo 'ok'.", a: "TKT-8842" },
-	{ q: "La clave del proyecto es AZUL-31. Guardalo y responde solo 'ok'.", a: "AZUL-31" },
-	{ q: "El cliente del caso se llama Fantasma. Guardalo y responde solo 'ok'.", a: "Fantasma" },
+	{ store: "Guarda este dato: mi sala de reunion es la 7B. Responde solo 'ok'.", recall: "Cual es mi sala de reunion? Responde solo el codigo.", a: "7B" },
+	{ store: "Guarda este dato: mi numero de ticket es TKT-8842. Responde solo 'ok'.", recall: "Cual es mi numero de ticket? Responde solo el codigo.", a: "TKT-8842" },
+	{ store: "Guarda este dato: la clave de mi proyecto es AZUL-31. Responde solo 'ok'.", recall: "Cual es la clave de mi proyecto? Responde solo la clave.", a: "AZUL-31" },
+	{ store: "Guarda este dato: el cliente de mi caso se llama Fantasma. Responde solo 'ok'.", recall: "Como se llama el cliente de mi caso? Responde solo el nombre.", a: "Fantasma" },
 ];
 
 const engine = new MetaEngine({ mode: MODE === "session" ? "session" : "guest" });
@@ -68,6 +71,7 @@ const canales = Array.from({ length: CHANNELS }, (_, i) => ({
 	reconexiones: 0,
 	memoriaOk: 0,
 	memoriaFail: 0,
+	memoriaCruce: 0,
 	ultimo: null,
 	turn: 0,
 }));
@@ -81,9 +85,12 @@ async function correrCanal(c) {
 		c.turn++;
 		if (c.turn === 1) {
 			prompt = c.director.next(null);
+		} else if (c.turn === 2) {
+			// se GUARDA el dato en un turno propio
+			prompt = c.secret.store;
 		} else if (c.turn % 5 === 0) {
-			// prueba de memoria: el canal debe recordar su propio dato
-			prompt = `Sin contexto previo, recuerda: ${c.secret.q.replace("Guardalo y responde solo 'ok'.", "")} cual era? Una palabra.`;
+			// prueba de memoria: la pregunta NO contiene la respuesta
+			prompt = c.secret.recall;
 		} else {
 			prompt = c.director.next(c.ultimo);
 		}
@@ -99,12 +106,17 @@ async function correrCanal(c) {
 			mirror(`[${stamp}] [${c.id}] YO   ${prompt}`);
 			mirror(`[${stamp}] [${c.id}] META ${text}`);
 			console.log(`[${stamp}] [${c.id}] ${text.slice(0, 90).replace(/\n/g, " ")}`);
-			// evaluar la prueba de memoria
+			// evaluar la prueba de memoria (turno 5, 10, 15, ...): debe recordar
+			// SU dato y no debe aparecer el dato de otro canal (cruce de hilos).
 			if (c.turn % 5 === 0) {
-				const ok = (text ?? "").toUpperCase().includes(c.secret.a.toUpperCase());
+				const U = (text ?? "").toUpperCase();
+				const ok = U.includes(c.secret.a.toUpperCase());
+				const ajenos = SECRETO.filter((s) => s !== c.secret).map((s) => s.a.toUpperCase());
+				const cruce = ajenos.find((a) => U.includes(a)) ?? null;
 				if (ok) c.memoriaOk++; else c.memoriaFail++;
-				mirror(`[${stamp}] [${c.id}] MEMORIA ${ok ? "OK" : "FALLA"} (esperado ${c.secret.a}) | conv ${conversationId}`);
-				console.log(`   [${c.id}] memoria: ${ok ? "OK" : "FALLA"} (esperaba ${c.secret.a})`);
+				if (cruce) c.memoriaCruce++;
+				mirror(`[${stamp}] [${c.id}] MEMORIA ${ok ? "OK" : "FALLA"} (esperado ${c.secret.a}${cruce ? `, CRUCE con ${cruce}` : ""}) | conv ${conversationId}`);
+				console.log(`   [${c.id}] memoria: ${ok ? "OK" : "FALLA"} (esperaba ${c.secret.a}${cruce ? `, CRUCE ${cruce}` : ""})`);
 			}
 		} catch (err) {
 			// un error NO debe tumbar la emulacion: se registra y el canal sigue
@@ -130,6 +142,7 @@ const resumen = canales.map((c) => ({
 	reconexiones: c.reconexiones,
 	memoria_ok: c.memoriaOk,
 	memoria_falla: c.memoriaFail,
+	memoria_cruce: c.memoriaCruce,
 }));
 mirror(`[sistema] fin: ${JSON.stringify(resumen)}`);
 console.log("\n=== INFORME MULTICANAL ===");

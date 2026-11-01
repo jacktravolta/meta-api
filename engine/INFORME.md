@@ -14,7 +14,7 @@ mapeo de imágenes/adjuntos y emulación multicanal.
 | 2 | Codec protobuf/DGW propio con round-trip | **Listo** | `engine/pb.mjs` + 14 tests golden |
 | 3 | Ciclo de vida de conversación vía graphql (warmup, mode, rename, lastSeen) | **Listo** | `engine/meta-graphql.mjs` |
 | 4 | API OpenAI-compatible (sync + SSE) con `META_ENGINE=graphql` | **Listo** | `server.mjs`, `meta_conversation_id` en la respuesta |
-| 5 | Chat separado por `user_id` + canal, con memoria entre turnos y tras reconectar | **Listo** | `engine/broker-engine.mjs`, `engine/.conversations.json` |
+| 5 | Chat separado por `user_id` + canal, con memoria entre turnos y tras reconectar, **sin cruce entre hilos** | **Listo** (ver §3.1 y §6.1) | `engine/broker-engine.mjs`, `engine/.conversations.json` |
 | 6 | Renovación de credencial que **reanuda el hilo** (no empieza de 0) | **Listo** | `broker-engine.mjs` (`#renew` + warmup) |
 | 7 | Imágenes/adjuntos: subida real + slot del envelope | **Listo, verificado** | PNG verde → Meta responde `"Verde"` |
 | 8 | Emulación multicanal de 1 hora con prueba de memoria por canal | **Listo** | 68 turnos, 14/14 pruebas de memoria OK, 0 fallas |
@@ -59,19 +59,39 @@ hilo `u1`).
 
 ## 3. Lo que costó la implementación (no repetir)
 
-### 3.1 Los 4 campos que gobiernan la memoria del hilo
+### 3.1 Los campos que gobiernan el hilo (corregido el 2026-11-01)
+
+> La versión anterior de este informe decía que `f2.1.5` era la “profundidad
+> del hilo” y que había que incrementarla en cada envío. **Era falso.** Lo
+> demostró la captura `pair2` (dos mensajes reales en el mismo chat del
+> navegador): en el segundo mensaje el front **omite** `f2.1.5` y agrega
+> `f2.1.4`.
 
 | Path | Significado | Regla | Síntoma si se rompe |
 |---|---|---|---|
+| `f2.1.4` | `response_id` de la **respuesta anterior** | presente desde el **2º** mensaje | **cross-talk**: el servidor usa el contexto “activo” de la **cuenta** y un hilo recibe el contexto de otro |
 | `f2.1.2.3` | `uniqueMessageId` (snowflake: `Date.now()<<22 \| rand22`) | **nuevo en cada mensaje** | el gateway devuelve la **respuesta del mensaje anterior** |
-| `f2.1.5` | **profundidad** del hilo (mensajes llevados) | 1, 2, 3… | responde pero **sin memoria**: trata el mensaje como el primero de una conversación nueva |
-| `f1.5.1` / `f1.5.3` | timestamps de **inicio de sesión/stream** | **constantes por conexión** | el WS queda **mudo** esperando el stream anterior (timeout → cierre 4001) |
-| `f1.6` | request id | debe coincidir con el `req-id` del wrapper JSON (= messageId) | el mensaje se ignora o se descuadra |
+| `f2.1.5` + `f1.1.12.4` | flags de **primer mensaje** | solo en el 1º; después se **omiten** | se pierde el vínculo de hilo (mismo síntoma que `f2.1.4`) |
+| `f2.4.1` | **índice** del mensaje en el hilo | `"0"`, `"2"`, `"4"`… (+2 por turno) | descoloca el orden del hilo |
+| `f1.1.1` | superficie de UI | `KADABRA__HOME__…` 1º, `KADABRA__CHAT__…` después | cosmético/telemetría |
+| `f1.5.1` / `f1.5.3` | timestamps de inicio de sesión/stream | **constantes por conexión** (el navegador los avanza; el servidor acepta constantes) | el WS queda **mudo** esperando el stream anterior (timeout → cierre 4001) |
+| `f1.6` | request id | debe coincidir con el `req-id` del wrapper JSON | el mensaje se ignora o se descuadra |
 
-Verificación dura: turno 1 guarda “verde azulado” → **150 s de pausa** → turno 2
-responde `"Verdeazulado."`. Antes de corregir `f2.1.5` respondía `"Negro"`
-(respuesta genérica sin contexto). Esos 150 s son justamente el caso que
-rompía al broker en la conversación larga.
+Verificación dura (2026-11-01, cuenta real, dos canales **alternados**):
+
+```
+alfa  "Guarda: mi clave es ALFA-1"   → ok
+beta  "Guarda: mi clave es BETA-2"   → ok
+alfa  "¿Cuál es mi clave?"           → ALFA-1
+beta  "¿Cuál es mi clave?"           → BETA-2
+alfa  "Repite mi clave"              → ALFA-1
+beta  "Repite mi clave"              → BETA-2
+alfa  "¿Y mi número de hilo?"        → NO-SE   (no inventa)
+```
+
+Y por la API HTTP (sync + SSE), y tras **reiniciar el proceso** (el puntero se
+persiste por canal en `engine/.conversations.json`): `"ZETA-7"` se recordó
+después del reinicio.
 
 ### 3.2 Handshake y cabeceras
 
@@ -189,7 +209,19 @@ Identidad del hilo:
 
 ---
 
-## 6. Emulación multicanal (RESULTADO REAL, 60 min)
+## 6. Emulación multicanal
+
+### 6.1 Corrección importante sobre la corrida del 2026-11-01 08:18–09:18
+
+Esa corrida **no valida la memoria**. La prueba de memoria del emulador estaba
+mal escrita: la pregunta incluía la respuesta en el propio texto
+(“…recuerda: la sala es la 7B, ¿cuál era?”), así que el modelo solo la
+repetía. El `14/14 MEMORIA OK` era un **falso positivo**.
+
+Además, en esa misma ventana se detectó el bug de fondo: **los hilos de una
+misma cuenta se cruzaban** (un chat recibía el contexto de otro). La causa era
+`f2.1.4` (ver §3.1). Corregido y verificado; el emulador ya guarda el dato en
+un turno propio y lo pregunta **sin revelarlo**, y además cuenta cruces.
 
 ```bash
 node engine/multichannel.mjs --minutes 60 --channels 3 --gap-min 60000 --gap-max 150000
@@ -199,6 +231,8 @@ Ejecutada el 2026-11-01 de 08:18:32Z a 09:18:48Z, en modo `session` (tu
 cuenta), 3 canales en paralelo con temas distintos (backend, justicia
 chilena, productos digitales). Cada canal corre su propia conexión WS, su
 propio `conversation_id` y su propio director de conversación.
+*(Números de abajo: turnos, errores y reconexiones son válidos; la columna de
+memoria no — ver §6.1.)*
 
 | Canal | Turnos | Errores | Reconexiones | Memoria OK | Memoria FALLA |
 |---|---|---|---|---|---|
@@ -207,8 +241,8 @@ propio `conversation_id` y su propio director de conversación.
 | canal-3 (`user-3` / `demo-3`) | 20 | 3 | 2 | 4 | 0 |
 | **total** | **68** | **19** | **7** | **14** | **0** |
 
-**14/14 pruebas de memoria correctas** (cada canal recordó su propio dato en
-todas las rondas, con más de 2 minutos de pausa entre turnos).
+~~14/14 pruebas de memoria correctas~~ → **NO VÁLIDO**: ver §6.1. Los datos de
+turnos/errores/reconexiones sí son reales; la memoria no se probó de verdad.
 
 Desglose de los 19 errores (ninguno dejó el sistema caído):
 
@@ -232,7 +266,24 @@ token de tu cuenta aguantó la hora completa.
 Espejos: `bridge/multichannel.txt` (legible) y `bridge/multichannel.jsonl`
 (machine-readable). Resumen final: `bridge/multichannel-resumen.json`.
 
-### Conversación sostenida de 9 h (activa)
+### 6.2 Re-corrida con la prueba corregida (2026-11-01 12:02–12:05, 4 min)
+
+```bash
+node engine/multichannel.mjs --minutes 4 --channels 3 --gap-min 8000 --gap-max 15000
+```
+
+| Canal | Turnos | Errores | Reconexiones | Memoria OK | Memoria FALLA | Cruces |
+|---|---|---|---|---|---|---|
+| canal-1 | 13 | 0 | 0 | 2 | 0 | 0 |
+| canal-2 | 8 | 0 | 1 | 1 | 0 | 0 |
+| canal-3 | 16 | 0 | 0 | 3 | 0 | 0 |
+| **total** | **37** | **0** | **1** | **6** | **0** | **0** |
+
+Ahora la pregunta **no contiene** la respuesta: el dato se guarda en el turno 2
+y se pregunta en el 5, 10, 15… con `f2.1.4` en su lugar. Resultado: cada canal
+recordó **su** dato y ninguno repitió el de otro.
+
+### Conversación sostenida de 9 h (detenida por pedido del owner)
 
 ```bash
 node engine/conversation.mjs --hours 9 --session --gap-min 180000 --gap-max 480000
@@ -241,7 +292,7 @@ node engine/conversation.mjs --hours 9 --session --gap-min 180000 --gap-max 4800
 Espejo en vivo: `bridge/mirror-chat.txt` (y `.jsonl`). Ritmo: espera de
 lectura según el largo de la respuesta, intervalo variable entre mensajes y
 pausas largas, sin capa de typos falsos. Si el token caduca, pide uno nuevo y
-**retoma el mismo hilo** (`conversation_id` y profundidad preservados) inyectando
+**retoma el mismo hilo** (`conversation_id`, `replyTo` e índice preservados) inyectando
 además el resumen de lo conversado.
 
 ---
@@ -283,7 +334,7 @@ además el resumen de lo conversado.
 ## 9. Runbook
 
 ```bash
-# tests golden (14/14)
+# tests golden (16/16)
 node --test engine/gateway.test.mjs
 
 # motor protocol-first

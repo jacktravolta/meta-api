@@ -25,6 +25,7 @@ export const DOC = {
 	rename: "2775bdbd0886fb2056fae9c68d323368",
 	markLastSeen: "0b2cb3a499606dfe326807a2b8b7ee20",
 	saveMessageLatency: "26999e5d1366c257595b7fafa7822c31",
+	deleteConversation: "ad35bda8475e29ba4264ef0d6cc0958a",
 };
 
 const FRIENDLY = {
@@ -35,6 +36,7 @@ const FRIENDLY = {
 	rename: "useEctoRenameConversationMutation",
 	markLastSeen: "useMarkConversationLastSeenMessageMutation",
 	saveMessageLatency: "useSaveMessageLatencyMutation",
+	deleteConversation: "useEctoDeleteConversationMutation",
 };
 
 export class MetaGraphQL {
@@ -114,5 +116,11 @@ export class MetaGraphQL {
 	async saveMessageLatency(input) {
 		const d = await this.call(DOC.saveMessageLatency, { input }, FRIENDLY.saveMessageLatency);
 		return d?.message ?? null;
+	}
+
+	/** Borra un chat de la cuenta. variables { input: { id: conversationId } } */
+	async deleteConversation(conversationId) {
+		const d = await this.call(DOC.deleteConversation, { input: { id: conversationId } }, FRIENDLY.deleteConversation);
+		return d?.deleteConversation ?? null;
 	}
 }
