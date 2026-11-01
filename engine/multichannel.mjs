@@ -65,6 +65,7 @@ const canales = Array.from({ length: CHANNELS }, (_, i) => ({
 	turnos: 0,
 	errores: 0,
 	renovaciones: 0,
+	reconexiones: 0,
 	memoriaOk: 0,
 	memoriaFail: 0,
 	ultimo: null,
@@ -75,40 +76,43 @@ mirror(`[sistema] arrancan ${CHANNELS} canales | duracion ${MINUTES} min | modo 
 
 async function correrCanal(c) {
 	while (Date.now() < deadline) {
+		const stamp = new Date().toISOString().slice(11, 19);
 		let prompt;
-		const c2 = c;
-		c2.turn++;
-		if (c2.turn === 1) {
-			prompt = c2.director.next(null);
-		} else if (c2.turn % 5 === 0) {
+		c.turn++;
+		if (c.turn === 1) {
+			prompt = c.director.next(null);
+		} else if (c.turn % 5 === 0) {
 			// prueba de memoria: el canal debe recordar su propio dato
-			prompt = `Sincontextoprevio, recuerda: ${c2.secret.q.replace("Guardalo y responde solo 'ok'.", "")} cual era? Una palabra.`;
+			prompt = `Sin contexto previo, recuerda: ${c.secret.q.replace("Guardalo y responde solo 'ok'.", "")} cual era? Una palabra.`;
 		} else {
-			prompt = c2.director.next(c2.ultimo);
+			prompt = c.director.next(c.ultimo);
 		}
 		try {
-			const { text, conversationId, renewed } = await engine.ask(prompt, {
-				userId: c2.userId,
-				channel: c2.channel,
+			const { text, conversationId, renewed, reconnect } = await engine.ask(prompt, {
+				userId: c.userId,
+				channel: c.channel,
 			});
-			c2.turnos++;
-			if (renewed) c2.renovaciones++;
-			c2.ultimo = text;
-			const stamp = new Date().toISOString().slice(11, 19);
-			mirror(`[${stamp}] [${c2.id}] YO   ${prompt}`);
-			mirror(`[${stamp}] [${c2.id}] META ${text}`);
-			console.log(`[${stamp}] [${c2.id}] ${text.slice(0, 90).replace(/\n/g, " ")}`);
+			c.turnos++;
+			if (renewed) c.renovaciones++;
+			if (reconnect) c.reconexiones++;
+			c.ultimo = text;
+			mirror(`[${stamp}] [${c.id}] YO   ${prompt}`);
+			mirror(`[${stamp}] [${c.id}] META ${text}`);
+			console.log(`[${stamp}] [${c.id}] ${text.slice(0, 90).replace(/\n/g, " ")}`);
 			// evaluar la prueba de memoria
-			if (c2.turn % 5 === 0) {
-				const ok = (text ?? "").toUpperCase().includes(c2.secret.a.toUpperCase());
-				if (ok) c2.memoriaOk++; else c2.memoriaFail++;
-				mirror(`[${stamp}] [${c2.id}] MEMORIA ${ok ? "OK" : "FALLA"} (esperado ${c2.secret.a}) | conv ${conversationId}`);
-				console.log(`   [${c2.id}] memoria: ${ok ? "OK" : "FALLA"} (esperaba ${c2.secret.a})`);
+			if (c.turn % 5 === 0) {
+				const ok = (text ?? "").toUpperCase().includes(c.secret.a.toUpperCase());
+				if (ok) c.memoriaOk++; else c.memoriaFail++;
+				mirror(`[${stamp}] [${c.id}] MEMORIA ${ok ? "OK" : "FALLA"} (esperado ${c.secret.a}) | conv ${conversationId}`);
+				console.log(`   [${c.id}] memoria: ${ok ? "OK" : "FALLA"} (esperaba ${c.secret.a})`);
 			}
 		} catch (err) {
-			c2.errores++;
-			mirror(`[${stamp}] [${c2.id}] ERROR ${err.message}`);
-			console.error(`[${c2.id}] error:`, err.message);
+			// un error NO debe tumbar la emulacion: se registra y el canal sigue
+			c.errores++;
+			mirror(`[${stamp}] [${c.id}] ERROR ${err?.message ?? err}`);
+			console.error(`[${c.id}] error:`, err?.message ?? err);
+			await sleep(20_000);
+			continue;
 		}
 		await sleep(rand(GAP_MIN, GAP_MAX));
 	}
@@ -123,6 +127,7 @@ const resumen = canales.map((c) => ({
 	turnos: c.turnos,
 	errores: c.errores,
 	renovaciones: c.renovaciones,
+	reconexiones: c.reconexiones,
 	memoria_ok: c.memoriaOk,
 	memoria_falla: c.memoriaFail,
 }));

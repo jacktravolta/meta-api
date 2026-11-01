@@ -123,8 +123,12 @@ export class MetaEngine {
 			userId: creds.userId,
 			conversationId: convId,
 		});
+		// La profundidad del hilo vive FUERA de la conexion: si se reiniciara en
+		// 1 al reconectar, el gateway trataria el mensaje como el primero de una
+		// conversacion nueva y el hilo perderia la memoria.
+		gw.depth = this.store[key]?.depth ?? 0;
 		await gw.connect();
-		const entry = { convId, gw, title: this.store[key]?.title ?? null, lastUsed: Date.now() };
+		const entry = { convId, gw, title: this.store[key]?.title ?? null, depth: gw.depth, lastUsed: Date.now() };
 		this.channels.set(key, entry);
 		return entry;
 	}
@@ -142,7 +146,11 @@ export class MetaEngine {
 			entry.lastUsed = now;
 			return entry;
 		}
-		return this.#open(key);
+		// habia una conexion (muerta): se reabre. El conversation_id y la
+		// profundidad se conservan desde el store, asi que el hilo continua.
+		const nuevo = await this.#open(key);
+		nuevo.reopened = !!entry;
+		return nuevo;
 	}
 
 	/**
@@ -158,18 +166,30 @@ export class MetaEngine {
 		} catch (err) {
 			const authError = err instanceof GatewayError
 				&& (err.code === CLOSE.UNAUTHORIZED || err.code === CLOSE.REJECTED);
-			if (!authError) throw err;
-			// credencial caducada: se renueva y el hilo se reanuda con el MISMO
-			// conversation_id (el warmup lo vuelve a atar al chat)
-			try { entry.gw.close(); } catch { /* ignore */ }
-			this.channels.delete(key);
-			await this.#renew();
-			entry = await this.#open(key);
-			return await this.#send(key, entry, prompt, onText, attachments, true);
+			if (authError) {
+				// credencial caducada: se renueva y el hilo se reanuda con el MISMO
+				// conversation_id (el warmup lo vuelve a atar al chat)
+				try { entry.gw.close(); } catch { /* ignore */ }
+				this.channels.delete(key);
+				await this.#renew();
+				entry = await this.#open(key);
+				return await this.#send(key, entry, prompt, onText, attachments, true);
+			}
+			// Conexion muerta (idle largo -> cierre 4001 KEEPALIVE_TIMEOUT, WS
+			// caida, timeout de stream): se reconecta y se reintenta UNA vez.
+			// El conversation_id y la profundidad se conservan, asi que el hilo
+			// sigue siendo el mismo.
+			if (entry.gw.isClosed() || err instanceof GatewayError) {
+				try { entry.gw.close(); } catch { /* ignore */ }
+				this.channels.delete(key);
+				const nuevo = await this.#open(key);
+				return await this.#send(key, nuevo, prompt, onText, attachments, false, true);
+			}
+			throw err;
 		}
 	}
 
-	async #send(key, entry, prompt, onText, attachments = [], renewed = false) {
+	async #send(key, entry, prompt, onText, attachments = [], renewed = false, reconnect = false) {
 		// los adjuntos se suben ANTES del request: el envelope solo lleva el
 		// media_id (f2.3), no los bytes.
 		let uploaded = [];
@@ -179,16 +199,24 @@ export class MetaEngine {
 		}
 		const { text, reqId } = await entry.gw.chat(prompt, { onText, attachments: uploaded, idleMs: this.idleMs });
 		entry.lastUsed = Date.now();
+		entry.depth = entry.gw.depth;
 
 		// titulo del chat = primer mensaje (como hace el front)
 		if (!entry.title && text && this.mode === "session" && this.gql) {
 			entry.title = prompt.replace(/\s+/g, " ").slice(0, 80);
-			this.store[key] = { ...(this.store[key] ?? {}), convId: entry.convId, title: entry.title, updatedAt: new Date().toISOString() };
-			saveStore(this.store);
 			try { await this.gql.rename(entry.convId, entry.title); } catch { /* el titulo no es critico */ }
 		}
 
-		return { text, conversationId: entry.convId, userId: this.creds?.userId ?? null, renewed };
+		this.store[key] = {
+			...(this.store[key] ?? {}),
+			convId: entry.convId,
+			title: entry.title,
+			depth: entry.depth,
+			updatedAt: new Date().toISOString(),
+		};
+		saveStore(this.store);
+
+		return { text, conversationId: entry.convId, userId: this.creds?.userId ?? null, renewed, reconnect: reconnect || !!entry.reopened };
 	}
 
 	/** Chats del usuario (vista de "canales"): [{ conversationId, title }] */
