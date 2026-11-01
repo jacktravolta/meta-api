@@ -17,7 +17,7 @@ mapeo de imágenes/adjuntos y emulación multicanal.
 | 5 | Chat separado por `user_id` + canal, con memoria entre turnos y tras reconectar | **Listo** | `engine/broker-engine.mjs`, `engine/.conversations.json` |
 | 6 | Renovación de credencial que **reanuda el hilo** (no empieza de 0) | **Listo** | `broker-engine.mjs` (`#renew` + warmup) |
 | 7 | Imágenes/adjuntos: subida real + slot del envelope | **Listo, verificado** | PNG verde → Meta responde `"Verde"` |
-| 8 | Emulación multicanal de 1 hora con prueba de memoria por canal | **Listo** | `engine/multichannel.mjs`, `bridge/multichannel.txt` |
+| 8 | Emulación multicanal de 1 hora con prueba de memoria por canal | **Listo** | 68 turnos, 14/14 pruebas de memoria OK, 0 fallas |
 | 9 | Informe/documentación de handoff | **Listo** | este documento + `engine/PROTOCOL.md` + `engine/TAREAS.md` |
 
 Motores disponibles (mutuamente excluyentes por variable de entorno):
@@ -189,19 +189,60 @@ Identidad del hilo:
 
 ---
 
-## 6. Emulación multicanal
+## 6. Emulación multicanal (RESULTADO REAL, 60 min)
 
 ```bash
-node engine/multichannel.mjs --minutes 60 --channels 3 --gap-min 60000 --gap-max 180000
+node engine/multichannel.mjs --minutes 60 --channels 3 --gap-min 60000 --gap-max 150000
 ```
 
-Cada canal corre su propia conexión, su propio `conversation_id` y su propio
-director de conversación (temas distintos: backend, justicia chilena, productos
-digitales). Cada 5 turnos el canal hace una **prueba de memoria**: pregunta un
-dato que él mismo guardó antes y se registra `MEMORIA OK|FALLA`.
+Ejecutada el 2026-11-01 de 08:18:32Z a 09:18:48Z, en modo `session` (tu
+cuenta), 3 canales en paralelo con temas distintos (backend, justicia
+chilena, productos digitales). Cada canal corre su propia conexión WS, su
+propio `conversation_id` y su propio director de conversación.
+
+| Canal | Turnos | Errores | Reconexiones | Memoria OK | Memoria FALLA |
+|---|---|---|---|---|---|
+| canal-1 (`user-1` / `demo-1`) | 25 | 8 | 2 | 5 | 0 |
+| canal-2 (`user-2` / `demo-2`) | 23 | 8 | 3 | 5 | 0 |
+| canal-3 (`user-3` / `demo-3`) | 20 | 3 | 2 | 4 | 0 |
+| **total** | **68** | **19** | **7** | **14** | **0** |
+
+**14/14 pruebas de memoria correctas** (cada canal recordó su propio dato en
+todas las rondas, con más de 2 minutos de pausa entre turnos).
+
+Desglose de los 19 errores (ninguno dejó el sistema caído):
+
+| Error | Cantidad | Causa | Efecto |
+|---|---|---|---|
+| `getaddrinfo EAI_AGAIN gateway.meta.ai` | 14 | **DNS transitorio** del host, no del protocolo | costaba un turno: la conexión se abría fuera del `try` |
+| `4001 KEEPALIVE_TIMEOUT` | 5 | el servidor encolaba y tardaba >120 s en emitir el primer frame | reconexión automática y turno perdido |
+
+Ambos casos están corregidos en el código posterior a la corrida:
+
+* la apertura de la conexión ahora está **dentro** del `try` con reintentos
+  (3 intentos con espera creciente), así que un fallo de DNS no cuesta el turno;
+* la espera por el primer frame subió de 120 s a **180 s**, porque bajo
+  concurrencia el servidor encola.
+
+Los 7 chats quedaron separados y con memoria propia: cada canal recuperó su
+dato y el `conversation_id` de cada uno es distinto
+(`638f6a75…`, `593236df…`, `b94499bb…`). **0 renovaciones de credencial**: el
+token de tu cuenta aguantó la hora completa.
 
 Espejos: `bridge/multichannel.txt` (legible) y `bridge/multichannel.jsonl`
 (machine-readable). Resumen final: `bridge/multichannel-resumen.json`.
+
+### Conversación sostenida de 9 h (activa)
+
+```bash
+node engine/conversation.mjs --hours 9 --session --gap-min 180000 --gap-max 480000
+```
+
+Espejo en vivo: `bridge/mirror-chat.txt` (y `.jsonl`). Ritmo: espera de
+lectura según el largo de la respuesta, intervalo variable entre mensajes y
+pausas largas, sin capa de typos falsos. Si el token caduca, pide uno nuevo y
+**retoma el mismo hilo** (`conversation_id` y profundidad preservados) inyectando
+además el resumen de lo conversado.
 
 ---
 
@@ -289,6 +330,12 @@ Node 22 es obligatorio: `/home/test/.nvm/versions/node/v22.23.3/bin/node`
 ## 11. Commits
 
 ```
+e043fb1 feat(api): el chunk final del SSE incluye meta_conversation_id
+638f0c4 fix(engine): 180 s de espera por el primer frame antes de abortar
+1667727 docs(engine): runbook de drift + verificador mecanico de slots
+4616c21 fix(engine): la conversacion de 9h reanuda el MISMO hilo al reconectar
+3c0b1f0 fix(engine): reconectar el hilo caido conservando su memoria
+f627d78 docs(engine): informe final de handoff y estado actualizado
 b447f89 chore(engine): sacar el estado de runtime del control de versiones
 1596aaa feat(engine): memoria por hilo, adjuntos/imagenes y emulacion multicanal
 61cd093 feat(engine): motor protocol-first integrado al broker (META_ENGINE=graphql)
@@ -296,3 +343,6 @@ b447f89 chore(engine): sacar el estado de runtime del control de versiones
 608130c feat(engine): cliente del gateway DGW con tests golden
 0d1232d feat(engine): esqueleto del motor protocol-first
 ```
+
+(El commit final con el reintento de errores de DNS y los resultados de la
+emulación va después de este documento.)

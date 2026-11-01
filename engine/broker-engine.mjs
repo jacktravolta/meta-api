@@ -30,6 +30,7 @@ import * as session from "./session.mjs";
 import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const STORE = path.join(HERE, ".conversations.json");
 
@@ -163,33 +164,41 @@ export class MetaEngine {
 	 */
 	async ask(prompt, { userId = "anon", channel = "default", onText, attachments = [] } = {}) {
 		const key = this.#channelKey(userId, channel);
-		let entry = await this.#conn(key);
-		try {
-			return await this.#send(key, entry, prompt, onText, attachments);
-		} catch (err) {
-			const authError = err instanceof GatewayError
-				&& (err.code === CLOSE.UNAUTHORIZED || err.code === CLOSE.REJECTED);
-			if (authError) {
-				// credencial caducada: se renueva y el hilo se reanuda con el MISMO
-				// conversation_id (el warmup lo vuelve a atar al chat)
-				try { entry.gw.close(); } catch { /* ignore */ }
-				this.channels.delete(key);
-				await this.#renew();
-				entry = await this.#open(key);
-				return await this.#send(key, entry, prompt, onText, attachments, true);
+		let lastError = null;
+		let renewed = false;
+		let reconnected = false;
+		// El try incluye la APERTURA de la conexion: un fallo de DNS o de
+		// upgrade no debe costar el turno (medido: 14 EAI_AGAIN en la emulacion
+		// de 1 h, cada uno perdia un turno).
+		for (let attempt = 0; attempt < 3; attempt++) {
+			let entry = null;
+			try {
+				entry = await this.#conn(key);
+				return await this.#send(key, entry, prompt, onText, attachments, renewed, reconnected);
+			} catch (err) {
+				lastError = err;
+				const authError = err instanceof GatewayError
+					&& (err.code === CLOSE.UNAUTHORIZED || err.code === CLOSE.REJECTED);
+				// se fuerza la reconexion para el proximo intento
+				if (entry) {
+					try { entry.gw.close(); } catch { /* ignore */ }
+					this.channels.delete(key);
+					reconnected = true;
+				}
+				if (authError && !renewed) {
+					// credencial caducada: se renueva y el hilo se reanuda con el
+					// MISMO conversation_id (el warmup lo vuelve a atar al chat)
+					renewed = true;
+					await this.#renew();
+					continue;
+				}
+				if (attempt < 2) {
+					await sleep(3000 * (attempt + 1));
+					continue;
+				}
 			}
-			// Conexion muerta (idle largo -> cierre 4001 KEEPALIVE_TIMEOUT, WS
-			// caida, timeout de stream): se reconecta y se reintenta UNA vez.
-			// El conversation_id y la profundidad se conservan, asi que el hilo
-			// sigue siendo el mismo.
-			if (entry.gw.isClosed() || err instanceof GatewayError) {
-				try { entry.gw.close(); } catch { /* ignore */ }
-				this.channels.delete(key);
-				const nuevo = await this.#open(key);
-				return await this.#send(key, nuevo, prompt, onText, attachments, false, true);
-			}
-			throw err;
 		}
+		throw lastError;
 	}
 
 	async #send(key, entry, prompt, onText, attachments = [], renewed = false, reconnect = false) {
