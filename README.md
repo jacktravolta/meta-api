@@ -401,18 +401,29 @@ META_ENGINE=graphql META_ENGINE_MODE=session node server.mjs
 | --- | --- | --- |
 | `browser` (default) | — | Chrome/CDP + scraping del DOM (como siempre) |
 | `graphql` | `guest` (default) | Gateway DGW con usuario invitado: se crea solo y se renueva si caduca |
-| `graphql` | `session` | Gateway DGW con tu sesión (`engine/.session.json`) |
+| `graphql` | `session` | Gateway DGW con tu sesión (`engine/.session.json`) — **recomendado** |
 
 Notas del motor nuevo:
 
 - Sync y streaming SSE, con la misma forma OpenAI que el motor browser.
-- **Solo texto**: el envelope del protocolo no transporta imágenes (usa `browser` para eso).
-- Continuidad de hilo por `payload.user` o header `x-meta-conversation`.
+- **Texto e imágenes**: los adjuntos se suben a `rupload.meta.ai` y el envelope
+  lleva solo el `media_id` (verificado: un PNG verde → Meta responde `"Verde"`).
+  En la API entran con el multimodal estándar de OpenAI (`image_url` con data URL).
+- **Chat separado por usuario y canal**: la identidad del hilo es
+  `payload.user` + `payload.channel` (o headers `x-meta-conversation` /
+  `x-meta-channel`). La respuesta trae `meta_conversation_id`.
+- **Memoria del hilo**: verificada con 150 s de pausa entre turnos y tras
+  reconectar la WS. Si la credencial caduca, se renueva y el hilo **se reanuda**
+  con el mismo `conversation_id` (no empieza de 0).
 - El token de invitado caduca (~30-60 min): el broker pide otro solo y sigue.
 - Credenciales en `engine/.auth.json` y `engine/.session.json` (0600, fuera de git).
 
+Documentación del motor:
+
+- `engine/INFORME.md` — informe final de handoff (qué se entregó, trampas, runbook).
 - `engine/PROTOCOL.md` — spec del protocolo + procedimiento de recuperación si Meta muta.
 - `engine/TAREAS.md` — ticket ejecutable para el próximo agente (pasos, criterios, seguridad).
 - `engine/fixtures/` — captura real de referencia para tests golden.
 - `engine/probe.mjs` — CLI: `node engine/probe.mjs "hola" [--session]`.
 - `engine/conversation.mjs` — conversación sostenida con espejo en `bridge/mirror-chat.txt`.
+- `engine/multichannel.mjs` — emulación de N canales en paralelo con prueba de memoria.

@@ -17,6 +17,15 @@
 - [x] Tests golden — 14/14 en verde (`node --test engine/gateway.test.mjs`).
 - [x] Paso 4 (integracion server.mjs) — `META_ENGINE=graphql` con sync + SSE,
       continuidad por hilo, renovacion de token. VERIFICADO EN VIVO.
+- [x] Ciclo de vida de la conversacion (`meta-graphql.mjs`) — warmup, modo,
+      reconcile, rename, markLastSeen, saveMessageLatency.
+- [x] Memoria del hilo — VERIFICADO: 150 s de pausa y reconexion de la WS.
+      Los 4 campos criticos estan documentados en PROTOCOL.md.
+- [x] Imagenes y adjuntos — `upload.mjs` + slot `f2.3` + marcador
+      `<|attachment:0|>`. VERIFICADO: PNG verde -> Meta responde "Verde".
+- [x] Emulacion multicanal — `multichannel.mjs` (3 canales, prueba de memoria
+      por canal, espejo en `bridge/multichannel.txt`).
+- [x] Informe de handoff — `engine/INFORME.md`.
 - [ ] Paso 5 (runbook de drift), 6 (operacion).
 
 ### Lo que costo la implementacion (no repetir)
@@ -30,6 +39,13 @@
 	   puede ser cualquier captura nueva.
 	5. El pb es sensible: si el req-id del JSON wrapper no coincide con f1.6, o
 	   quedan ids de otra sesion, el servidor lo rechaza.
+	6. `f2.1.2.3` (uniqueMessageId) debe ser NUEVO por mensaje: si se repite, el
+	   gateway devuelve la respuesta del mensaje anterior.
+	7. `f2.1.5` es la PROFUNDIDAD del hilo: si queda en 1, el gateway trata el
+	   mensaje como el primero de una conversacion nueva (responde sin memoria).
+	   Persistirla por canal: al reconectar, reiniciarla rompe la memoria.
+	8. `f1.5.1`/`f1.5.3` son timestamps de INICIO de sesion/stream: constantes
+	   por conexion. Si se refrescan en cada mensaje, el WS queda mudo.
 
 ## Estado del arte (resumen 2 líneas)
 
