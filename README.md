@@ -381,3 +381,14 @@ journalctl --user -u meta-api -f
 
 One tab, minimal browser (no NTP/search/crash bubbles, startup tabs closed), visible
 window, 30-second idle close.
+
+## Motor protocol-first (en construcción)
+
+El front de meta.ai ya no usa scraping SSR: es un gateway WebSocket
+(`wss://gateway.meta.ai/ws/clippy`) con frames binarios DGW. El protocolo está
+capturado y decodificado; el plan de implementación completo (token, encoder,
+`gateway.mjs`, integración con fallback a este motor browser) vive en:
+
+- `engine/PROTOCOL.md` — spec del protocolo + procedimiento de recuperación si Meta muta.
+- `engine/TAREAS.md` — ticket ejecutable para el próximo agente (pasos, criterios, seguridad).
+- `engine/fixtures/` — captura real de referencia para tests golden.
