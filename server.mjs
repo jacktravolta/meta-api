@@ -2140,7 +2140,7 @@ async function route(req, res) {
         res.write(`data: ${JSON.stringify(chunk({ role: "assistant", content: "" }))}\n\n`);
         let sent = 0;
         try {
-          const { text } = await engine.ask(content, {
+          const { text, conversationId } = await engine.ask(content, {
             userId: conversationKey,
             channel,
             attachments,
@@ -2151,7 +2151,11 @@ async function route(req, res) {
             },
           });
           if (text && text.length > sent) res.write(`data: ${JSON.stringify(chunk({ content: text.slice(sent) }))}\n\n`);
-          res.write(`data: ${JSON.stringify(chunk({}, "stop"))}\n\n`);
+          // el chunk final lleva el chat de meta (extension propia): permite
+          // continuar el mismo hilo desde el cliente de streaming
+          const final = chunk({}, "stop");
+          final.meta_conversation_id = conversationId;
+          res.write(`data: ${JSON.stringify(final)}\n\n`);
           res.end("data: [DONE]\n\n");
         } catch (err) {
           log("stream motor protocol-first:", String(err.message || err));
