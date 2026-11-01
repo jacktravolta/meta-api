@@ -24,3 +24,12 @@ engine/.auth.json
 engine/.session.json
 bridge/mirror-chat.txt
 bridge/mirror-chat.jsonl
+
+# Estado de runtime del motor protocol-first (no versionar)
+engine/.conversations.json
+engine/.conversations.json.bak
+
+# Espejos de emulacion multicanal (runtime)
+bridge/multichannel.txt
+bridge/multichannel.jsonl
+bridge/multichannel-resumen.json
