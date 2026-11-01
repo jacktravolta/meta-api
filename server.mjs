@@ -104,14 +104,19 @@ const MODE_DEFAULT = String(process.env.META_MODE || "normal").toLowerCase() ===
 // El engine nuevo no acepta imagenes (el envelope solo lleva texto) y usa un
 // usuario invitado por defecto (META_ENGINE_MODE=session para tu cuenta).
 const ENGINE = String(process.env.META_ENGINE || "browser").toLowerCase();
-const ENGINE_MODE = String(process.env.META_ENGINE_MODE || "guest").toLowerCase() === "session" ? "session" : "guest";
+// "session" (default): tu cuenta. Cada usuario/canal tiene su propio chat.
+// "guest": usuario invitado autonomo (sin memoria entre reinicios).
+const ENGINE_MODE = String(process.env.META_ENGINE_MODE || "session").toLowerCase() === "guest" ? "guest" : "session";
+// puerto CDP del navegador con la sesion de meta (solo para recapturar el
+// token cuando caduca; no se usa para conversar).
+const SESSION_CDP_PORT = Number(process.env.META_SESSION_CDP || 9298);
 let metaEngine = null; // se crea lazily en el primer request
 
 async function getMetaEngine() {
   if (metaEngine) return metaEngine;
   const { MetaEngine } = await import("./engine/broker-engine.mjs");
-  metaEngine = new MetaEngine({ mode: ENGINE_MODE });
-  log(`motor protocol-first listo (modo ${ENGINE_MODE}, sin navegador)`);
+  metaEngine = new MetaEngine({ mode: ENGINE_MODE, cdpPort: SESSION_CDP_PORT });
+  log(`motor protocol-first listo (modo ${ENGINE_MODE}, sin navegador en runtime)`);
   return metaEngine;
 }
 function resolveMode(raw) {
@@ -2113,10 +2118,11 @@ async function route(req, res) {
 
     // Motor protocol-first (gateway DGW): sin Chrome, sin scraping.
     if (ENGINE === "graphql") {
-      if (images.length) {
-        return json(501, { error: { message: "el motor protocol-first solo admite texto; para imagenes usa META_ENGINE=browser" } });
-      }
       const conversationKey = String(payload.user || req.headers["x-meta-conversation"] || "default");
+      const channel = String(payload.channel || req.headers["x-meta-channel"] || "default");
+      // Los adjuntos (imagenes/video/PDF) viajan como data URLs o rutas: se
+      // suben a rupload.meta.ai y el envelope lleva solo el media_id.
+      const attachments = images.map((src, i) => ({ data: src, filename: `adjunto-${i + 1}` }));
       let engine;
       try { engine = await getMetaEngine(); }
       catch (err) { return json(502, { error: { message: String(err.message || err) } }); }
@@ -2135,7 +2141,9 @@ async function route(req, res) {
         let sent = 0;
         try {
           const { text } = await engine.ask(content, {
-            conversationKey,
+            userId: conversationKey,
+            channel,
+            attachments,
             onText: (t) => {
               if (!t || t.length <= sent) return;
               res.write(`data: ${JSON.stringify(chunk({ content: t.slice(sent) }))}\n\n`);
@@ -2153,11 +2161,13 @@ async function route(req, res) {
         return;
       }
       try {
-        const { text } = await engine.ask(content, { conversationKey });
+        const { text, conversationId } = await engine.ask(content, { userId: conversationKey, channel, attachments });
         return json(200, {
           id: chunkId, object: "chat.completion", created, model,
           choices: [{ index: 0, message: { role: "assistant", content: text ?? "" }, finish_reason: "stop" }],
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          // el chat de meta donde quedo la conversacion (por usuario/canal)
+          meta_conversation_id: conversationId,
         });
       } catch (err) {
         log("motor protocol-first:", String(err.message || err));

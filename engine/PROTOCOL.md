@@ -111,7 +111,7 @@ encodePb) con tests golden en `engine/gateway.test.mjs`.
 	f1.1.19  { sha de build, ... }
 	f1.2.1/2 accountId bigint (x2) -> id del usuario
 	f1.2.3   userType
-	f1.5.1/3 timestamps epoch ms
+	f1.5.1/3 timestamps de INICIO de sesion/stream (CONSTANTES por conexion)
 	f1.6     request id (DEBE coincidir con el "req-id" del JSON wrapper)
 	f1.9.2   locale ("es-LA" / "es-ES")
 	f1.10.1/3 flow ids por request (se rotan)
@@ -119,14 +119,30 @@ encodePb) con tests golden en `engine/gateway.test.mjs`.
 	f1.18    pipes de herramientas (stocks, weather, media_gallery, ...)
 	f2.1.1   turn id
 	f2.1.2.1 conversation id
-	f2.1.2.2 timestamp epoch ms
-	f2.1.2.3 varint grande (origen desconocido)
+	f2.1.2.2 timestamp epoch ms del MENSAJE
+	f2.1.2.3 uniqueMessageId (snowflake) — NUEVO en cada mensaje
+	f2.1.5   PROFUNDIDAD del hilo (mensajes llevados) — 1, 2, 3...
 	f2.2     EL PROMPT (este es el slot que se reemplaza)
+	f2.3     ADJUNTOS (repetido): f1.1=media_id, f2=1, f5=0, f6=mime, f7=nombre
 	f2.4.1   "0"
 
 Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
-	prompt, turn id, conversation id, request id, timestamps, flow ids,
-	player id + accountId (cuando se conoce el usuario).
+	prompt, turn id, conversation id, request id, timestamps del mensaje,
+	uniqueMessageId, profundidad del hilo, flow ids, player id + accountId
+	(cuando se conoce el usuario) y los adjuntos.
+
+### Los 4 campos que gobiernan la memoria del hilo (los que mas costaron)
+
+	1. f2.1.2.3 uniqueMessageId — NUEVO en cada mensaje. Es un snowflake:
+	   (Date.now() en ms << 22) | random(22 bits). Si se repite, el gateway
+	   responde con la RESPUESTA DEL MENSAJE ANTERIOR (no genera nada nuevo).
+	2. f2.1.5 profundidad del hilo — cuantos mensajes lleva la conversacion.
+	   Si queda en 1, el gateway trata el mensaje como el primero de una
+	   conversacion nueva: responde, pero SIN memoria de lo anterior.
+	3. f1.5.1 / f1.5.3 — timestamps de inicio de sesion/stream. Deben quedar
+	   CONSTANTES durante el hilo. Si se refrescan en cada mensaje, el gateway
+	   queda esperando el stream anterior: el WS se queda mudo (timeout).
+	4. f1.6 request id = "req-id" del JSON wrapper = messageId.
 
 ## Respuesta (tipo 0x0d srv, protobuf crudo)
 	Dentro hay JSON utf8 con:
@@ -154,6 +170,56 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	- `replay.mjs`      reproduce una captura desde Node (diagnostico)
 	- `probe.mjs`       CLI: `node engine/probe.mjs "hola" [--session]`
 	- `gateway.test.mjs` 14 tests golden (node --test) — EN VERDE
+
+## Ciclo de vida de la conversacion (graphql)
+
+	El front NO usa el WS para todo: el WS genera la respuesta, pero el chat se
+	crea/actualiza por graphql. Para que un conversation_id generado por el
+	cliente quede atado a un chat real (y conserve memoria), hay que llamar:
+
+		useConversationWarmupMutation      e7f802582dbfed8e181b012e010993eb
+		    variables { conversationId }           -> { warmupConversation: true }
+		useUpdateConversationModeMutation  c32bbe999c48e64e855dc63177d5153f
+		    variables { input:{conversationId, mode:"think_fast"} }
+		usePendingConversationReconcileQuery cbdb4f17ee16ba3117147e9619026b8c
+		    variables {}                            -> lista los chats del usuario
+		useEctoRenameConversationMutation  2775bdbd0886fb2056fae9c68d323368
+		    variables { input:{id, title} }
+		useMarkConversationLastSeenMessageMutation 0b2cb3a499606dfe326807a2b8b7ee20
+		    variables { input:{conversationId, lastSeenMessageId} }
+		useSaveMessageLatencyMutation      26999e5d1366c257595b7fafa7822c31
+		    variables { input:{messageId, conversationId, uniqueMessageId, requestId} }
+
+	Con warmup + el MISMO conversation_id, el hilo conserva memoria incluso
+	tras cerrar y reabrir el WS (verificado: el bot recuerda un codigo).
+
+## Adjuntos: como viajan las imagenes (mapeado completo)
+
+	1) SUBIDA (fuera del WS):
+	   POST https://rupload.meta.ai/gen_ai_document_gen_ai_tenant/<uuid>
+	     Authorization: OAuth ecto1:<token>     (OJO: "OAuth", NO "Bearer")
+	     ecto_auth_token: true
+	     is_abra_user: true
+	     desired_upload_handler: genai_document
+	     Offset: 0
+	     x-entity-length: <bytes>
+	     x-entity-digest: sha256 <base64 del contenido>
+	     x-entity-type: image/png
+	     x-entity-name: <nombre del archivo>
+	     body: binario crudo
+	   -> { "media_id": "1431172098550174" }
+	   (el front hace antes un GET de sondeo con las mismas cabeceras)
+
+	2) ENVELOPE: f2.3 (mensaje repetido) con
+	     f2.3.1.1 = media_id (varint)
+	     f2.3.2  = 1
+	     f2.3.5  = 0
+	     f2.3.6  = mime
+	     f2.3.7  = nombre
+	   y el prompt lleva el marcador delante del texto:
+	     "<|attachment:0|> <texto>"
+
+	VERIFICADO end-to-end: PNG verde enviado por la API -> meta responde "Verde".
 
 ## Cierre de turno (reglas verificadas en vivo)
 

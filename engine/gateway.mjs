@@ -98,6 +98,15 @@ function leafAt(nodes, path) {
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
+// Snowflake de meta (mismo formato que el uniqueMessageId real):
+// (Date.now() en ms << 22) | bits aleatorios. OJO: si se repite, el gateway
+// lo toma como el MISMO mensaje y devuelve la respuesta anterior.
+export function newUniqueMessageId() {
+	const ms = BigInt(Date.now());
+	const rand22 = BigInt(Math.floor(Math.random() * 0x400000));
+	return (ms << 22n) | rand22;
+}
+
 const appSessionId = () =>
 	Array.from({ length: 8 }, () => Math.floor(Math.random() * 0xffff).toString(16).padStart(4, "0")).join("-");
 
@@ -105,7 +114,7 @@ const appSessionId = () =>
 // cualquier captura y no dependa de valores hardcodeados.
 // replaced == 0 => drift de protocolo: mejor fallar que mandar pbs corruptos.
 export function insertSlots(nodes, {
-	prompt, conversationId, turnId, reqId, userId, now = Date.now(),
+	prompt, conversationId, turnId, reqId, userId, now = Date.now(), sessionTs = null, depth = null, attachments = [],
 }) {
 	let replaced = 0;
 
@@ -145,10 +154,24 @@ export function insertSlots(nodes, {
 	const reqLeaf = leafAt(nodes, [1, 6]);
 	if (reqLeaf?.kind === "str") { reqLeaf.str = reqId; replaced++; }
 
-	// 3) timestamps (epoch ms)
-	for (const [p, delta] of [[[1, 5, 1], 0], [[1, 5, 3], -1000], [[2, 1, 2, 2], 0]]) {
+	// 3) timestamps (epoch ms).
+	//    f1.5.1 / f1.5.3 = timestamps de INICIO de la sesion/stream: deben
+	//    quedar CONSTANTES durante el hilo (si se refrescan en cada mensaje, el
+	//    servidor espera el stream anterior y no responde: se queda mudo).
+	//    f2.1.2.2 = timestamp del mensaje: ese si avanza.
+	const sStart = sessionTs?.start ?? now;
+	const sEnd = sessionTs?.end ?? now - 1000;
+	for (const [p, value] of [[[1, 5, 1], sStart], [[1, 5, 3], sEnd], [[2, 1, 2, 2], now]]) {
 		const leaf = leafAt(nodes, p);
-		if (leaf && leaf.wire === 0) { leaf.varint = BigInt(now + delta); replaced++; }
+		if (leaf && leaf.wire === 0) { leaf.varint = BigInt(value); replaced++; }
+	}
+
+	// 3b) uniqueMessageId (f2.1.2.3): IDENTIFICADOR DEL MENSAJE. Si se repite,
+	// el gateway responde con la respuesta del mensaje anterior.
+	const uniqueLeaf = leafAt(nodes, [2, 1, 2, 3]);
+	if (uniqueLeaf && uniqueLeaf.wire === 0) {
+		uniqueLeaf.varint = newUniqueMessageId();
+		replaced++;
 	}
 
 	// 4) flow ids por request (el browser los regenera en cada envio)
@@ -171,11 +194,43 @@ export function insertSlots(nodes, {
 		}
 	}
 
+	// 6) profundidad del hilo (f2.1.5): cuantos mensajes lleva la conversacion.
+	//    El front lo incrementa en cada envio; si se queda en 1, el gateway
+	//    trata el mensaje como PRIMER turno de una conversacion nueva y el
+	//    hilo pierde la memoria de lo anterior.
+	if (depth !== null) {
+		const leaf = leafAt(nodes, [2, 1, 5]);
+		if (leaf && leaf.wire === 0) { leaf.varint = BigInt(depth); replaced++; }
+	}
+
+	// 7) adjuntos (f2.3): cada adjunto es un submensaje con
+	//    f1.1 = media_id (bigint), f2 = 1, f5 = 0, f6 = mime, f7 = nombre.
+	//    El prompt lleva el marcador <|attachment:N|> delante del texto.
+	if (attachments.length) {
+		const msg = nodes.find((n) => n.field === 2 && n.wire === 2 && n.kind === "pb");
+		if (!msg) throw new Error("template: sin mensaje (f2) para adjuntar");
+		for (const a of attachments) {
+			msg.pb.push({
+				field: 3, wire: 2, kind: "pb",
+				pb: [
+					{ field: 1, wire: 2, kind: "pb", pb: [{ field: 1, wire: 0, varint: BigInt(a.mediaId) }] },
+					{ field: 2, wire: 0, varint: 1n },
+					{ field: 5, wire: 0, varint: 0n },
+					{ field: 6, wire: 2, kind: "str", str: a.mime ?? "application/octet-stream" },
+					{ field: 7, wire: 2, kind: "str", str: a.filename ?? "archivo" },
+				],
+			});
+			replaced++;
+		}
+		const markers = attachments.map((_, i) => `<|attachment:${i}|>`).join(" ");
+		promptLeaf.str = `${markers} ${promptLeaf.str}`;
+	}
+
 	return { replaced };
 }
 
 export function buildRequestPayload({
-	prompt, conversationId, turnId = randomUUID(), reqId = randomUUID(), userId, now = Date.now(),
+	prompt, conversationId, turnId = randomUUID(), reqId = randomUUID(), userId, now = Date.now(), sessionTs = null, depth = null, attachments = [],
 }) {
 	const { payload } = loadTemplate();
 	// clon profundo (bigint es inmutable; solo clono el arbol de nodos)
@@ -191,7 +246,7 @@ export function buildRequestPayload({
 		return c;
 	});
 	const nodes = deepClone(payload);
-	const { replaced } = insertSlots(nodes, { prompt, conversationId, turnId, reqId, userId, now });
+	const { replaced } = insertSlots(nodes, { prompt, conversationId, turnId, reqId, userId, now, sessionTs, depth, attachments });
 	return { payload: encodePb(nodes), replaced, reqId };
 }
 
@@ -245,6 +300,10 @@ export class MetaGateway {
 		this.userId = userId;
 		this.cookies = cookies ?? null; // string "k=v; k2=v2" o null
 		this.conversationId = conversationId;
+		// timestamps de inicio de sesion/stream: CONSTANTES durante el hilo
+		this.sessionTs = { start: Date.now(), end: Date.now() - 1000 };
+		// profundidad del hilo: cuantos mensajes lleva esta conversacion
+		this.depth = 0;
 		this.pingMs = pingMs;
 		this.debug = debug;
 		this.ws = null;
@@ -396,7 +455,7 @@ export class MetaGateway {
 
 	// Envia un prompt y acumula el stream. onText(textoAcumulado) opcional.
 	// Resuelve al llegar patch vacio; luego close o seguir listo con el mismo ws.
-	async chat(prompt, { onText, ...opts } = {}) {
+	async chat(prompt, { onText, attachments = [], ...opts } = {}) {
 		if (!this.ws || this.ws.readyState !== 1 || this.#closed)
 			throw new Error("chat: gateway no conectado");
 		const reqId = randomUUID();
@@ -405,7 +464,11 @@ export class MetaGateway {
 			conversationId: this.conversationId,
 			reqId,
 			userId: this.userId,
+			sessionTs: this.sessionTs,
+			depth: this.depth + 1,
+			attachments,
 		});
+		this.depth += 1;
 		if (replaced < 2) throw new Error(`template: ${replaced} slots — drift de protocolo probable`);
 		this.ws.send(new Uint8Array(buildFrame(FRAME.DATA,
 			JSON.stringify({ "req-id": reqId, payload: payload.toString("base64") }),
