@@ -33,3 +33,12 @@ engine/.conversations.json.bak
 bridge/multichannel.txt
 bridge/multichannel.jsonl
 bridge/multichannel-resumen.json
+
+# Imagenes generadas bajadas del CDN + espejo de eventos del motor
+engine/.media/
+bridge/engine-eventos.txt
+bridge/engine-eventos.jsonl
+engine/.run-state.json
+engine/.rooms.json
+engine/.usage.json
+

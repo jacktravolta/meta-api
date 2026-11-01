@@ -17,6 +17,7 @@
 // f2.3.6 y el nombre en f2.3.7. El prompt lleva el marcador <|attachment:0|>.
 
 import { createHash, randomUUID } from "node:crypto";
+import { evento } from "./eventos.mjs";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -57,6 +58,7 @@ export function toFile(input, fallbackName = "archivo") {
  */
 export async function uploadFile(file, { token, cookies = null } = {}) {
 	if (!token) throw new Error("upload: falta el token ecto1");
+	const t0 = Date.now();
 	const { bytes, mime, filename } = toFile(file.data ?? file, file.filename ?? "archivo");
 	const digest = "sha256 " + createHash("sha256").update(bytes).digest("base64");
 	const url = `${UPLOAD_BASE}/${randomUUID()}`;
@@ -95,6 +97,8 @@ export async function uploadFile(file, { token, cookies = null } = {}) {
 	let body; try { body = JSON.parse(text); } catch { throw new Error(`upload: respuesta no parseable: ${text.slice(0, 200)}`); }
 	const mediaId = body?.media_id ?? body?.mediaId ?? body?.id;
 	if (!mediaId) throw new Error(`upload: sin media_id en la respuesta: ${text.slice(0, 200)}`);
+	const t1 = Date.now();
+	evento("UPLOAD", { archivo: filename, mime, bytes: bytes.length, media_id: String(mediaId), ms: t1 - t0 });
 	return { mediaId: String(mediaId), mime, filename, bytes: bytes.length };
 }
 

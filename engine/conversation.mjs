@@ -22,6 +22,8 @@ import { MetaGateway, GatewayError, CLOSE } from "./gateway.mjs";
 import { getCredentials, clearCredentials } from "./auth.mjs";
 import * as session from "./session.mjs";
 import { Director } from "./director.mjs";
+import { downloadImages } from "./media.mjs";
+import { evento } from "./eventos.mjs";
 import { randomUUID } from "node:crypto";
 
 const execFileAsync = promisify(execFile);
@@ -44,6 +46,14 @@ const DURATION_MS = HOURS ? HOURS * 3600_000 : MINUTES ? MINUTES * 60_000 : 10 *
 const USE_SESSION = has("--session");
 const VERBOSE = has("--verbose");
 const MAX_GAP_MS = Number(arg("--max-gap", 900_000));
+const DESCANSOS = has("--descansos");
+// watchdog: si meta se queda mudo, se le manda "continua" (como en la web)
+const WATCHDOG_MS = Number(arg("--watchdog", 150_000));
+// pide una imagen en el turno N (del proceso actual) y la deja bajada en disco
+// --imagen-al acepta una lista: "1,4" = pide imagen en el turno 1 y en el 4
+const IMG_AL = String(arg("--imagen-al", "0")).split(",").map((n) => Number(n.trim())).filter((n) => n > 0);
+const IMG_PROMPT = arg("--imagen-prompt",
+  "Genera una imagen de un diagrama de arquitectura en estilo tecnico sobrio: un cliente OpenAI hablando con un broker propio, que a su vez se conecta a Meta AI por WebSocket. Sin texto, solo formas y flechas.");
 const GAP_MIN_MS = Number(arg("--gap-min", 30_000));
 const GAP_MAX_MS = Number(arg("--gap-max", 150_000));
 const CDP_PORT = Number(arg("--cdp", 9298));
@@ -71,9 +81,12 @@ function paceAfterReply(replyText) {
 function nextGapMs(replyText) {
 	const words = (replyText ?? "").split(/\s+/).filter(Boolean).length;
 	let gap = rand(GAP_MIN_MS, GAP_MAX_MS);
-	if (words > 120) gap += rand(20000, 60000);      // respuesta larga -> pausa mas larga
-	if (Math.random() < 0.12) gap += rand(180000, 420000); // descanso ocasional
-	return Math.min(gap, MAX_GAP_MS);
+	// respuesta larga -> un poco mas de respiro (dentro de la ventana)
+	if (words > 120) gap += rand(8000, 20000);
+	// descanso ocasional (3-7 min) SOLO si se pide explicitamente: por defecto
+	// el total se mantiene entre --gap-min y --gap-max.
+	if (DESCANSOS && Math.random() < 0.12) gap += rand(180000, 420000);
+	return Math.min(Math.max(gap, GAP_MIN_MS), GAP_MAX_MS);
 }
 
 let gateway = null;
@@ -125,6 +138,52 @@ async function renewCredentials() {
 // continua el hilo (ademas de inyectar el resumen como contexto).
 let conversationId = randomUUID();
 let depth = 0;
+// puntero de hilo: SIN f2.1.4 el servidor usa el contexto activo de la cuenta
+// y, al reconectar, el hilo se pierde o se cruza con otro chat.
+let replyTo = null;
+let messageIndex = 0;
+
+// el reloj de la corrida (se ancla al inicio original si se reanuda)
+let startedAt = Date.now();
+
+// Estado del hilo en disco: un reinicio del runner (o un corte) retoma la MISMA
+// conversacion en vez de empezar de cero. --resume lo carga; sin el, hilo nuevo.
+const RUN_STATE = path.join(HERE, ".run-state.json");
+function loadRunState() {
+	try {
+		const st = JSON.parse(fs.readFileSync(RUN_STATE, "utf8"));
+		if (!st?.conversationId) return null;
+		return st;
+	} catch { return null; }
+}
+function saveRunState() {
+	try {
+		fs.writeFileSync(RUN_STATE, JSON.stringify({
+			conversationId, replyTo, messageIndex, depth,
+			startedAt, updatedAt: new Date().toISOString(),
+		}, null, 1), { mode: 0o600 });
+		fs.chmodSync(RUN_STATE, 0o600);
+	} catch { /* el estado es opcional */ }
+}
+if (has("--resume")) {
+	const st = loadRunState();
+	if (st) {
+		conversationId = st.conversationId;
+		replyTo = st.replyTo ?? null;
+		messageIndex = st.messageIndex ?? 0;
+		depth = st.depth ?? 0;
+		// el reloj de las 9 h NO se reinicia al reanudar: se ancla al inicio real
+		if (st.startedAt) {
+			startedAt = Date.parse(st.startedAt);
+			const fin = startedAt + DURATION_MS;
+			if (Date.now() >= fin) { console.log("--resume: la duracion ya se cumplio"); process.exit(0); }
+			console.log(`reloj anclado al inicio original: ${new Date(startedAt).toISOString()} | termina ${new Date(fin).toISOString()}`);
+		}
+		console.log(`hilo reanudado: ${conversationId} | idx ${messageIndex} | replyTo ${replyTo ?? "-"}`);
+	} else {
+		console.log("--resume: no hay estado previo, hilo nuevo");
+	}
+}
 
 async function ensureGateway() {
 	if (gateway && !gateway.isClosed()) return gateway;
@@ -142,10 +201,12 @@ async function ensureGateway() {
 		userId: credentials.userId,
 		conversationId,
 	});
-	// la profundidad del hilo (f2.1.5) sobrevive a la reconexion: si se
-	// reiniciara en 1, el gateway trataria el mensaje como el primero de una
-	// conversacion nueva y perderiamos la memoria.
+	// el puntero de hilo sobrevive a la reconexion: replyTo = response_id del
+	// ultimo turno e indice del mensaje. Si se reiniciaran, el mensaje se
+	// enviaria como "primero" y el hilo perderia (o cruzaria) la memoria.
 	gateway.depth = depth;
+	gateway.replyTo = replyTo;
+	gateway.messageIndex = messageIndex;
 	await gateway.connect();
 	mirror(`[sistema] conexion establecida (${USE_SESSION ? "sesion propia" : "invitado " + credentials.userId}) | hilo ${conversationId}`);
 	return gateway;
@@ -156,8 +217,24 @@ async function send(prompt) {
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
 			const gw = await ensureGateway();
-			const { text } = await gw.chat(prompt);
+			const t0 = Date.now();
+			evento("PETICION", { conv: conversationId, idx: gw.messageIndex, reply_to: gw.replyTo, chars: prompt.length, prompt: prompt.replace(/\s+/g, " ").slice(0, 120) });
+			const { text, images = [] } = await gw.chat(prompt, {
+				watchdogMs: WATCHDOG_MS,
+				watchdogPrompt: "continua",
+				onWatchdog: (info) => {
+					evento("WATCHDOG", { conv: conversationId, ms: info.ms, enviado: "continua" });
+					mirror(`[sistema] meta se quedo callado ${Math.round(info.ms / 1000)}s: se le manda "continua"`);
+				},
+			});
 			depth = gw.depth;
+			replyTo = gw.replyTo;
+			messageIndex = gw.messageIndex;
+			saveRunState();
+			// si Meta devuelve imagenes, se bajan (el CDN caduca) y se reflejan
+			const bajadas = await downloadImages(images, { convId: conversationId });
+			for (const b of bajadas) mirror(`[img] ${b.mime} ${b.bytes}B -> ${b.path}`);
+			evento("RESPUESTA", { conv: conversationId, ms: Date.now() - t0, chars: (text ?? "").length, imagenes: bajadas.length, texto: (text ?? "").replace(/\s+/g, " ").slice(0, 120) });
 			return text;
 		} catch (err) {
 			lastError = err;
@@ -187,7 +264,6 @@ const TOPIC_COUNT = 4;
 const director = new Director({ seed: Math.floor(Math.random() * TOPIC_COUNT) });
 let lastText = null;
 let turns = 0;
-const startedAt = Date.now();
 let nextAt = Date.now() + rand(1500, 4000);
 
 console.log(`conversacion iniciada: ${Math.round(DURATION_MS / 60000)} minutos | modo ${USE_SESSION ? "sesion propia" : "invitado"}`);
@@ -198,6 +274,10 @@ while (Date.now() - startedAt < DURATION_MS) {
 	if (now < nextAt) { await sleep(Math.min(nextAt - now, 30000)); continue; }
 
 	let prompt = director.next(lastText);
+	if (IMG_AL.includes(turns + 1)) {
+		prompt = IMG_PROMPT;
+		mirror(`[sistema] turno ${turns + 1}: se pide una imagen`);
+	}
 	// tras renovar la credencial, el hilo nuevo arranca con el resumen de lo
 	// conversado: no se empieza de cero
 	if (pendingContext) {

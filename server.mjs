@@ -35,12 +35,17 @@
  */
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { writeFileSync, mkdirSync, readFileSync, unlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative, extname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgentLoop } from "./agent/loop.js";
+import { toolsContract, parseToolCalls, toOpenAiToolCalls, formatToolResults, systemPrompt } from "./engine/toolcall.mjs";
+import { extraerCodigo } from "./engine/codigo.mjs";
+import { materializar } from "./engine/artifacts.mjs";
+import { promptTokens, completionTokens, registrar, consulta as consultaUsage } from "./engine/usage.mjs";
+import { uploadAll, toFile } from "./engine/upload.mjs";
 import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
 // HOMOLOGADO cdpAutoCura: el Resolutor es SOLO un fallback. El selector principal
 // se evalúa primero; el Resolutor entra únicamente cuando el principal devuelve null.
@@ -60,6 +65,7 @@ if (NODE_MAJOR < 22) {
   process.exit(1);
 }
 
+const MEDIA_DIR = join(import.meta.dirname, "engine", ".media");
 const PORT = Number(process.env.META_API_PORT || 8055);
 const HOST = process.env.META_API_HOST || "127.0.0.1";
 const CHROME = process.env.META_CHROME || "/usr/bin/google-chrome-beta";
@@ -112,10 +118,24 @@ const ENGINE_MODE = String(process.env.META_ENGINE_MODE || "session").toLowerCas
 const SESSION_CDP_PORT = Number(process.env.META_SESSION_CDP || 9298);
 let metaEngine = null; // se crea lazily en el primer request
 
+/** Credenciales del motor (para subir adjuntos). No se loguean. */
+async function metaEngineCreds() {
+	const engine = await getMetaEngine();
+	return await engine.credentials();
+}
+
 async function getMetaEngine() {
   if (metaEngine) return metaEngine;
   const { MetaEngine } = await import("./engine/broker-engine.mjs");
-  metaEngine = new MetaEngine({ mode: ENGINE_MODE, cdpPort: SESSION_CDP_PORT });
+  metaEngine = new MetaEngine({
+    mode: ENGINE_MODE,
+    cdpPort: SESSION_CDP_PORT,
+    // temporizadores: meta responde en 3-6 s; si no responde, se corta con un
+    // error claro en vez de dejar al cliente colgado.
+    idleMs: Number(process.env.META_IDLE_MS || 45_000),
+    deadlineMs: Number(process.env.META_TURN_DEADLINE_MS || 75_000),
+    askTimeoutMs: Number(process.env.META_ASK_TIMEOUT_MS || 120_000),
+  });
   log(`motor protocol-first listo (modo ${ENGINE_MODE}, sin navegador en runtime)`);
   return metaEngine;
 }
@@ -144,6 +164,60 @@ const CONTEXT_BUDGET_CHARS = Number(process.env.META_CONTEXT_BUDGET_CHARS || 150
 const CONTEXT_SOFT_PCT = Number(process.env.META_CONTEXT_SOFT_PCT || 70);
 // Starting estimate for a thread we resume but never saw being built.
 const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 25000);
+// El prompt de sistema de opencode (AGENTS.md + skills + MCP) puede pesar 30 KB
+// y el frame del gateway de meta tope 64 KB: se recorta a este tope. Si aun
+// asi el prompt no entra, el motor lo parte en varios turnos del mismo hilo.
+const MAX_SYSTEM_CHARS = Number(process.env.META_MAX_SYSTEM_CHARS || 8000);
+
+// Recorta un texto largo dejando claro que se perdio algo. El prompt de
+// sistema de opencode (AGENTS.md + skills) puede pesar 30 KB y el frame del
+// gateway tope 64 KB.
+function recortar(texto, max) {
+	const s = String(texto ?? "");
+	if (!max || s.length <= max) return s;
+	const perdidos = s.length - max;
+	return s.slice(0, max) + `\n\n[... ${perdidos} caracteres del prompt de sistema recortados por el limite del frame ...]`;
+}
+
+// ---- Clave automatica de conversacion ----------------------------------------
+// El cliente (opencode) manda el historial completo en cada turno: el primer
+// mensaje del usuario es el mismo durante toda la sesion, asi que su hash
+// identifica la sesion sin pedirle nada extra.
+function claveAutomatica(messages) {
+	try {
+		const primero = (messages ?? []).find((m) => m?.role === "user");
+		if (!primero) return null;
+		const texto = typeof primero.content === "string"
+			? primero.content
+			: JSON.stringify(primero.content ?? "");
+		if (!texto.trim()) return null;
+		return "auto-" + createHash("sha256").update(texto).digest("hex").slice(0, 10);
+	} catch {
+		return null;
+	}
+}
+
+// ---- Tokens (estimados) + registro -------------------------------------------
+// Meta no expone contador de tokens: se estima con el texto de entrada y de
+// salida, y se REGISTRA por sala para poder entregarlo cuando lo pidan.
+function usageDe({ messages, tools, texto, bloques, conversationId, sala }) {
+	const p = promptTokens(messages, { tools });
+	const c = completionTokens(texto, { bloques });
+	const charsIn = (messages ?? []).reduce((a, m) => a + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content ?? "").length), 0);
+	const charsOut = String(texto ?? "").length;
+	const uso = {
+		prompt_tokens: p,
+		completion_tokens: c,
+		total_tokens: p + c,
+	};
+	registrar({
+		sala: sala ?? conversationId ?? "sin-sala",
+		conversationId,
+		promptTokens: p, completionTokens: c, charsIn, charsOut,
+	});
+	return uso;
+}
+
 // ---- Image attachments ------------------------------------------------------
 // OpenAI-style multimodal content: content is an ARRAY of parts, not a string.
 // Stringifying it yields "[object Object],[object Object]", which is what Meta
@@ -300,6 +374,12 @@ const TRANSCRIPTS_DIR = process.env.META_TRANSCRIPTS_DIR || "/home/test/test/tra
 let chromeProc = null;
 let workers = [];          // [{id,ws,page,wsUrl,url,conversation,queue,busy}]
 let nextWorker = 0;
+// imagen generada -> {url, mime, bytes, local, path} (local: ruta servible por /v1/media)
+function publicImage(img) {
+  const rel = relative(MEDIA_DIR, img.path);
+  return { url: img.url, mime: img.mime, bytes: img.bytes, path: img.path, local: `/v1/media/${rel.split(sep).join("/")}` };
+}
+
 const jobs = new Map();    // job_id -> {status,content,error,url,created}
 let cdpSeq = 0;
 let idleTimer = null;    // pending auto-close after inactivity
@@ -2008,6 +2088,17 @@ async function route(req, res) {
       idle_close_ms: IDLE_CLOSE_MS,
       idle_closes_at: idleTimer ? new Date(idleDeadline).toISOString() : null,
       resume_url: lastThreadUrl,
+      // Motor protocol-first: que identidad esta en uso REALMENTE (cuenta o
+      // invitado) y por que. Si dice "session" y no hay sesion, el motor
+      // intenta capturar el acceso desde el navegador y, si no puede, cae a
+      // invitado: el cliente lo ve aqui.
+      ...(ENGINE === "graphql" ? {
+        motor: {
+          modo: ENGINE_MODE,
+          ...(metaEngine?.authInfo?.() ?? { modo: ENGINE_MODE, modo_configurado: ENGINE_MODE }),
+          salas: metaEngine?.roomsList?.()?.length ?? 0,
+        },
+      } : {}),
     });
   }
   // Warms the browser without sending anything: opens START_URL (home or a
@@ -2064,6 +2155,77 @@ async function route(req, res) {
     return json(202, { job_id: jobId, status: "queued", poll: `/v1/jobs/${jobId}` });
   }
 
+  if (req.method === "GET" && url.pathname.startsWith("/v1/media/")) {
+    // sirve las imagenes ya bajadas (engine/.media/<conv>/<archivo>)
+    const rel = decodeURIComponent(url.pathname.slice("/v1/media/".length));
+    const file = join(MEDIA_DIR, rel);
+    if (!file.startsWith(MEDIA_DIR + sep)) return json(400, { error: { message: "ruta invalida" } });
+    try {
+      const buf = readFileSync(file);
+      const ext = extname(file).slice(1).toLowerCase();
+      const mime = ext === "webp" ? "image/webp" : ext === "png" ? "image/png" : ext === "jpg" ? "image/jpeg" : "application/octet-stream";
+      res.writeHead(200, { "Content-Type": mime, "Cache-Control": "private, max-age=300" });
+      return res.end(buf);
+    } catch {
+      return json(404, { error: { message: "no existe" } });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/attachments") {
+    // Sube un adjunto a meta (rupload) y devuelve el media_id, que es lo que
+    // viaja en el envelope (f2.3). Acepta data URL, ruta local o URL remota
+    // (la remota se descarga primero).
+    let p = {};
+    try { p = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "invalid JSON" } }); }
+    const entrada = p.data ?? p.data_url ?? p.url ?? p.path ?? p.file;
+    if (!entrada) return json(400, { error: { message: "falta data (data URL), path o url" } });
+    let data = entrada;
+    let filename = p.filename ?? p.name ?? "adjunto";
+    if (/^https?:\/\//i.test(String(entrada))) {
+      try {
+        const r = await fetch(String(entrada));
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const buf = Buffer.from(await r.arrayBuffer());
+        const mime = String(r.headers.get("content-type") || "application/octet-stream").split(";")[0];
+        data = `data:${mime};base64,${buf.toString("base64")}`;
+        if (!p.filename) filename = String(entrada).split("/").pop() || filename;
+      } catch (err) {
+        return json(400, { error: { message: `no se pudo descargar la url: ${err.message}` } });
+      }
+    }
+    try {
+      const creds = await metaEngineCreds();
+      const subidos = await uploadAll([{ data, filename, mime: p.mime }], creds);
+      const s = subidos[0] ?? {};
+      return json(200, {
+        media_id: s.media_id ?? s.mediaId ?? null,
+        filename,
+        mime: s.mime ?? p.mime ?? null,
+        bytes: s.bytes ?? null,
+        listo: true,
+      });
+    } catch (err) {
+      return json(502, { error: { message: `adjunto no subido: ${err.message}` } });
+    }
+  }
+
+  if (req.method === "GET" && (url.pathname === "/v1/usage" || url.pathname.startsWith("/v1/usage/"))) {
+    // Tokens estimados y registrados: global y por sala.
+    const sala = url.pathname.startsWith("/v1/usage/") ? decodeURIComponent(url.pathname.slice("/v1/usage/".length)) : null;
+    return json(200, { object: "usage", ...consultaUsage(sala) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/v1/rooms") {
+    // Registro de salas: id corto (max 6 digitos) -> usuario/canal. El id es
+    // el que aparece en el titulo del chat de meta.
+    try {
+      const engine = await getMetaEngine();
+      return json(200, { object: "list", data: engine.roomsList() });
+    } catch (err) {
+      return json(502, { error: { message: String(err.message || err) } });
+    }
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/models") {
     return json(200, { object: "list", data: [
       { id: "meta-ai", object: "model", owned_by: "meta-ai-headless", created: 0 },
@@ -2107,8 +2269,19 @@ async function route(req, res) {
       const { text, images } = parseUserContent(m.content);
       return text || images.length;
     });
-    if (!rawUser) return json(400, { error: { message: "messages[].role user required" } });
-    const parsed = parseUserContent(rawUser.content);
+    // La compactacion de opencode a veces manda el transcripto SIN rol "user"
+    // (todo en el system). Si no hay mensaje de usuario, se usa el ultimo
+    // system como peticion: antes se respondia 400 y el cliente reportaba
+    // "Compaction produced no summary".
+    const rawSistema = !rawUser
+      ? [...msgs].reverse().find((m) => {
+        if (!m || m.role !== "system") return false;
+        const { text } = parseUserContent(m.content);
+        return text.trim();
+      })
+      : null;
+    if (!rawUser && !rawSistema) return json(400, { error: { message: "messages[].role user required" } });
+    const parsed = parseUserContent((rawUser ?? rawSistema).content);
     const content = parsed.text;
     const images = parsed.images;
     if (!content && !images.length) {
@@ -2118,7 +2291,18 @@ async function route(req, res) {
 
     // Motor protocol-first (gateway DGW): sin Chrome, sin scraping.
     if (ENGINE === "graphql") {
-      const conversationKey = String(payload.user || req.headers["x-meta-conversation"] || "default");
+      // Clave del chat de meta para este cliente:
+      //   1. payload.user        (campo estandar de OpenAI)
+      //   2. header x-meta-conversation (fija un chat: el mismo para todos)
+      //   3. automatico: hash del PRIMER mensaje del usuario -> cada sesion de
+      //      opencode (que manda el historial completo) tiene su propio chat y
+      //      no se cruza con otra sesion.
+      const conversationKey = String(
+        payload.user ||
+        req.headers["x-meta-conversation"] ||
+        claveAutomatica(msgs) ||
+        "default",
+      );
       const channel = String(payload.channel || req.headers["x-meta-channel"] || "default");
       // Los adjuntos (imagenes/video/PDF) viajan como data URLs o rutas: se
       // suben a rupload.meta.ai y el envelope lleva solo el media_id.
@@ -2133,31 +2317,123 @@ async function route(req, res) {
         id: chunkId, object: "chat.completion.chunk", created, model,
         choices: [{ index: 0, delta, finish_reason: finishReason }],
       });
+
+      // --- TOOLS (function calling emulado sobre prompt) ---
+      // Meta no tiene function calling: el protocolo es el prompt. Se le
+      // renderizan las tools que ofrece el cliente; si responde con un bloque
+      // tool_call, se convierte en tool_calls de OpenAI y el cliente las
+      // ejecuta (OpenCode corre sus propias tools y devuelve role:"tool").
+      const tools = Array.isArray(payload.tools) ? payload.tools : [];
+      let toolNames = tools.map((t) => t?.function?.name ?? t?.name).filter(Boolean);
+      // tool_choice (spec OpenAI): "auto" | "none" | "required" | {function:{name}}
+      const choice = payload.tool_choice;
+      let forzado = null;
+      if (choice === "required") forzado = "*";
+      else if (choice && typeof choice === "object") {
+        const n = choice.function?.name ?? choice.name;
+        if (n) { forzado = n; toolNames = toolNames.filter((x) => x === n); }
+      } else if (choice === "none") toolNames = [];
+      const contrato = tools.length ? toolsContract(tools, { forzado }) : "";
+      const resultados = tools.length ? formatToolResults(msgs) : "";
+      const sistema = tools.length ? recortar(systemPrompt(msgs), MAX_SYSTEM_CHARS) : "";
+      // El prompt real: contexto minimo + contrato + resultados + peticion.
+      // Si el cliente ya devolvio resultados de tools, la peticion original ya
+      // esta en el hilo de meta: se sigue desde la salida, no se repite.
+      const promptFinal = tools.length
+        ? [sistema, contrato, resultados, resultados ? "" : content].filter(Boolean).join("\n\n")
+        : content;
+      const startedAt = Date.now();
       if (payload.stream === true) {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         res.flushHeaders();
         res.write(": stream abierto\n\n");
         res.write(`data: ${JSON.stringify(chunk({ role: "assistant", content: "" }))}\n\n`);
         let sent = 0;
+        // latido: meta puede tardar 5-60 s (y con tools, hasta que llega la
+        // respuesta COMPLETA). Sin esto el cliente puede cortar la conexion
+        // por inactividad y quedarse "pensando" para siempre.
+        const latido = setInterval(() => {
+          try { res.write(`: latido ${Math.round((Date.now() - startedAt) / 1000)}s\n\n`); } catch { /* cerrado */ }
+        }, 10_000);
         try {
-          const { text, conversationId } = await engine.ask(content, {
+          // con tools NO se streamea el texto crudo: la respuesta completa se
+          // necesita para decidir si es texto o una tool_call.
+          const frames = [];
+          const { text, conversationId, images = [], response } = await engine.askConContenido(promptFinal, {
             userId: conversationKey,
             channel,
             attachments,
-            onText: (t) => {
+            onJson: tools.length ? (j) => frames.push(j) : undefined,
+            onText: tools.length ? undefined : (t) => {
               if (!t || t.length <= sent) return;
               res.write(`data: ${JSON.stringify(chunk({ content: t.slice(sent) }))}\n\n`);
               sent = t.length;
             },
           });
+          if (tools.length) {
+            // meta entrega la tool_call como BLOQUE DE CODIGO (el texto va vacio)
+            const bloques = extraerCodigo(frames, response);
+            const calls = parseToolCalls(text, toolNames, bloques);
+            if (calls.length) {
+              const oa = toOpenAiToolCalls(calls);
+              res.write(`data: ${JSON.stringify(chunk({ tool_calls: oa.map((c, i) => ({ index: i, ...c })) }))}\n\n`);
+              // tokens estimados: se cuentan igual que en una respuesta normal
+              const usoTools = usageDe({
+                messages: msgs, tools, texto: text, bloques,
+                conversationId, sala: engine.roomsList?.().find?.((r) => r.clave === `${conversationKey}:${channel}`)?.id,
+              });
+              const fin = chunk({}, "tool_calls");
+              fin.meta_conversation_id = conversationId;
+              fin.usage = usoTools;
+              res.write(`data: ${JSON.stringify(fin)}\n\n`);
+              if (payload.stream_options?.include_usage === true) {
+                res.write(`data: ${JSON.stringify({
+                  id: chunkId, object: "chat.completion.chunk", created, model,
+                  choices: [], usage: usoTools,
+                })}\n\n`);
+              }
+              res.end("data: [DONE]\n\n");
+              clearInterval(latido);
+              return;
+            }
+            if (text) { res.write(`data: ${JSON.stringify(chunk({ content: text }))}\n\n`); sent = text.length; }
+          }
           if (text && text.length > sent) res.write(`data: ${JSON.stringify(chunk({ content: text.slice(sent) }))}\n\n`);
+          // imagenes generadas: se anuncian como markdown (se ven en el chat)
+          for (const img of images) {
+            res.write(`data: ${JSON.stringify(chunk({ content: `\n\n![imagen](${img.url})` }))}\n\n`);
+          }
+          // archivos del sandbox de meta: se reproducen localmente (en el
+          // sandbox del repo) y se sirven en /v1/media/...
+          const artefactos = await materializar({
+            frames, respuesta: response,
+            dir: join(MEDIA_DIR, String(conversationId ?? "sin-conv")),
+          });
           // el chunk final lleva el chat de meta (extension propia): permite
           // continuar el mismo hilo desde el cliente de streaming
+          const usoSSE = usageDe({
+            messages: msgs, tools, texto: text, bloques: artefactos.bloques ?? [],
+            conversationId, sala: engine.roomsList?.().find?.((r) => r.clave === `${conversationKey}:${channel}`)?.id,
+          });
           const final = chunk({}, "stop");
           final.meta_conversation_id = conversationId;
+          final.usage = usoSSE;
+          final.meta_elapsed_ms = Date.now() - startedAt;
+          if (images.length) final.meta_images = images.map(publicImage);
+          if (artefactos.archivos.length) final.meta_files = artefactos.archivos;
+          if (artefactos.zip) final.meta_zip = artefactos.zip;
           res.write(`data: ${JSON.stringify(final)}\n\n`);
+          // stream_options.include_usage (spec OpenAI): chunk final con usage
+          if (payload.stream_options?.include_usage === true) {
+            res.write(`data: ${JSON.stringify({
+              id: chunkId, object: "chat.completion.chunk", created, model,
+              choices: [], usage: usoSSE,
+            })}\n\n`);
+          }
           res.end("data: [DONE]\n\n");
+          clearInterval(latido);
         } catch (err) {
+          clearInterval(latido);
           log("stream motor protocol-first:", String(err.message || err));
           res.write(`data: ${JSON.stringify(chunk({}, "stop"))}\n\n`);
           res.end("data: [DONE]\n\n");
@@ -2165,17 +2441,68 @@ async function route(req, res) {
         return;
       }
       try {
-        const { text, conversationId } = await engine.ask(content, { userId: conversationKey, channel, attachments });
+        const frames = [];
+        const { text, conversationId, images = [], response } = await engine.askConContenido(promptFinal, {
+          userId: conversationKey, channel, attachments,
+          onJson: tools.length ? (j) => frames.push(j) : undefined,
+        });
+        const conImagenes = images.length
+          ? `${text ?? ""}\n\n${images.map((i) => `![imagen](${i.url})`).join("\n")}`
+          : (text ?? "");
+        // archivos del sandbox de meta: se reproducen localmente y se sirven
+        const artefactos = await materializar({
+          frames, respuesta: response,
+          dir: join(MEDIA_DIR, String(conversationId ?? "sin-conv")),
+        });
+        if (tools.length) {
+          // meta entrega la tool_call como BLOQUE DE CODIGO (el texto va vacio)
+          const bloques = extraerCodigo(frames, response);
+          const calls = parseToolCalls(text, toolNames, bloques);
+          if (calls.length) {
+            const oa = toOpenAiToolCalls(calls);
+            const usoTools = usageDe({
+              messages: msgs, tools, texto: text, bloques,
+              conversationId, sala: engine.roomsList?.().find?.((r) => r.clave === `${conversationKey}:${channel}`)?.id,
+            });
+            return json(200, {
+              id: chunkId, object: "chat.completion", created, model,
+              choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: oa }, finish_reason: "tool_calls" }],
+              usage: usoTools,
+              meta_conversation_id: conversationId,
+            });
+          }
+        }
+        const uso = usageDe({
+          messages: msgs, tools, texto: text, bloques: artefactos.bloques ?? [],
+          conversationId, sala: engine.roomsList?.().find?.((r) => r.clave === `${conversationKey}:${channel}`)?.id,
+        });
         return json(200, {
           id: chunkId, object: "chat.completion", created, model,
-          choices: [{ index: 0, message: { role: "assistant", content: text ?? "" }, finish_reason: "stop" }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+          choices: [{ index: 0, message: { role: "assistant", content: conImagenes }, finish_reason: "stop" }],
+          usage: uso,
           // el chat de meta donde quedo la conversacion (por usuario/canal)
           meta_conversation_id: conversationId,
+          // cuanto tardo meta en responder (para que el cliente muestre un timer)
+          meta_elapsed_ms: Date.now() - startedAt,
+          // imagenes generadas (url CDN original + copia local descargada)
+          ...(images.length ? { meta_images: images.map(publicImage) } : {}),
+          // archivos del sandbox (zip, scripts, documentos): reproducidos aqui
+          ...(artefactos.archivos.length ? { meta_files: artefactos.archivos } : {}),
+          ...(artefactos.zip ? { meta_zip: artefactos.zip } : {}),
         });
       } catch (err) {
-        log("motor protocol-first:", String(err.message || err));
-        return json(502, { error: { message: String(err.message || err) } });
+        const msg = String(err.message || err);
+        log("motor protocol-first:", msg);
+        // tiempo agotado: no es un fallo de meta, es que no respondio a tiempo
+        if (/presupuesto|sin respuesta completa|sin frames por/i.test(msg)) {
+          return json(504, {
+            error: {
+              message: `meta no respondio a tiempo (${Math.round((Date.now() - startedAt) / 1000)}s): ${msg}`,
+              meta_elapsed_ms: Date.now() - startedAt,
+            },
+          });
+        }
+        return json(502, { error: { message: msg } });
       }
     }
 

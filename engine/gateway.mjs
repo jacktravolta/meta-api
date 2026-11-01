@@ -18,6 +18,8 @@ import {
 	FRAME, buildFrame, parseFrame,
 	decodePb, encodePb, extractJsons, parseFrames,
 } from "./pb.mjs";
+import { imagesOfJson } from "./media.mjs";
+import { evento } from "./eventos.mjs";
 
 // `ws` es CommonJS y permite headers (Cookie, Origin) en el upgrade HTTP;
 // el WebSocket global de Node no los soporta.
@@ -442,7 +444,11 @@ export class MetaGateway {
 
 	async connect({ timeoutMs = 20000 } = {}) {
 		const url = this.url();
-		this.#log("conectando", url.replace(this.token, "REDACTED"));
+		// el token viaja url-encoded en la query: hay que ocultar las dos formas
+		this.#log("conectando", url
+			.replace(this.token, "REDACTED")
+			.replace(encodeURIComponent(this.token), "REDACTED")
+			.replace(/ecto1(?::|%3A)[A-Za-z0-9_-]{16,}/g, "ecto1:REDACTED"));
 		const headers = {
 			// el gateway valida el Origin en el pre-auth: debe ser la URL completa
 			Origin: `https://${PROTOCOL.ORIGIN}`,
@@ -501,29 +507,37 @@ export class MetaGateway {
 	}
 
 	// Envia un prompt y acumula el stream. onText(textoAcumulado) opcional.
-	// Resuelve al llegar patch vacio; luego close o seguir listo con el mismo ws.
-	async chat(prompt, { onText, attachments = [], ...opts } = {}) {
+	// onJson(json) recibe cada JSON crudo del stream (diagnostico: imagenes,
+	// tarjetas, adjuntos generados). Resuelve al llegar patch vacio; luego
+	// close o seguir listo con el mismo ws.
+	async chat(prompt, { onText, onJson, attachments = [], watchdogMs = 0, watchdogPrompt = "continua", onWatchdog = null, ...opts } = {}) {
 		if (!this.ws || this.ws.readyState !== 1 || this.#closed)
 			throw new Error("chat: gateway no conectado");
 		const reqId = randomUUID();
 		const firstMessage = this.messageIndex === 0;
-		const { payload, replaced } = buildRequestPayload({
-			prompt,
-			conversationId: this.conversationId,
-			reqId,
-			userId: this.userId,
-			sessionTs: this.sessionTs,
-			depth: this.depth + 1,
-			attachments,
-			replyTo: this.replyTo,
-			messageIndex: this.messageIndex,
-			firstMessage,
-		});
+		// el watchdog reenvia "continua" en el MISMO hilo: mismo puntero, mismo
+		// indice (el turno no avanza hasta que termina bien).
+		const enviar = (texto, { conAdjuntos = false } = {}) => {
+			const id = randomUUID(); // el "req-id" del wrapper DEBE ser el f1.6 del pb
+			const { payload, replaced } = buildRequestPayload({
+				prompt: texto,
+				conversationId: this.conversationId,
+				reqId: id,
+				userId: this.userId,
+				sessionTs: this.sessionTs,
+				depth: this.depth + 1,
+				attachments: conAdjuntos ? attachments : [],
+				replyTo: this.replyTo,
+				messageIndex: this.messageIndex,
+				firstMessage,
+			});
+			if (replaced < 2) throw new Error(`template: ${replaced} slots — drift de protocolo probable`);
+			this.ws.send(new Uint8Array(buildFrame(FRAME.DATA,
+				JSON.stringify({ "req-id": id, payload: payload.toString("base64") }),
+				FRAME.FLAG_CLIENT)));
+		};
+		enviar(prompt, { conAdjuntos: true });
 		this.depth += 1;
-		if (replaced < 2) throw new Error(`template: ${replaced} slots — drift de protocolo probable`);
-		this.ws.send(new Uint8Array(buildFrame(FRAME.DATA,
-			JSON.stringify({ "req-id": reqId, payload: payload.toString("base64") }),
-			FRAME.FLAG_CLIENT)));
 
 		// cola del turno anterior: se descarta (el frame de "estado final" de la
 		// respuesta previa llega despues del patch vacio y contamina el turno nuevo)
@@ -531,14 +545,38 @@ export class MetaGateway {
 
 		let acc = null;      // response con TEXTO del turno en curso
 		let curRid = null;   // response_id del turno en curso
+		const imgs = new Map(); // imagenes generadas (dedupe por url)
 		let sawText = false; // ya hubo texto de este turno
+		let sawContent = false; // hubo ALGO (texto, codigo o artefacto)
+		let nudged = false;  // ya se le mando el "continua"
+		let lastProgressAt = Date.now();
+		let lastContentAt = Date.now(); // ultimo frame con CONTENIDO (texto/codigo)
 		const idleMs = opts.idleMs ?? 120_000;
+		// Tope duro del turno: sin esto, un turno mudo puede quedarse esperando
+		// el idle completo y multiplicado por los reintentos del broker.
+		const deadlineMs = opts.deadlineMs ?? 0;
+		const deadlineAt = deadlineMs > 0 ? Date.now() + deadlineMs : 0;
 		for (;;) {
+			const restante = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : idleMs;
+			const espera = Math.min(idleMs, restante || idleMs);
 			const fr = await Promise.race([
 				this.#readFrame(),
-				new Promise((res) => setTimeout(() => res({ idle: true }), idleMs)),
+				new Promise((res) => setTimeout(() => res({ idle: true }), espera)),
 			]);
-			if (fr.idle) throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT, `stream sin frames por ${idleMs}ms`);
+			if (fr.idle) {
+				if (deadlineAt && Date.now() >= deadlineAt) {
+					throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT, `turno sin respuesta completa en ${deadlineMs}ms`);
+				}
+				throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT, `stream sin frames por ${espera}ms`);
+			}
+			// watchdog: meta se quedo mudo (defecto conocido, tambien en la web).
+			// se le reenvia "continua" en el MISMO hilo, como hace el usuario.
+			if (watchdogMs > 0 && !nudged && Date.now() - lastContentAt > watchdogMs) {
+				nudged = true;
+				this.#log("watchdog: meta mudo, se envia", watchdogPrompt);
+				onWatchdog?.({ ms: Date.now() - lastContentAt });
+				try { enviar(watchdogPrompt); } catch (err) { this.#log("watchdog: envio fallo", err?.message); }
+			}
 			if (this.#closed) throw new GatewayError(this.#closed.code, this.#closed.reason || "cerrado en stream");
 			if (fr.error) throw fr.error;
 			if (fr.keepalive) continue;
@@ -546,6 +584,20 @@ export class MetaGateway {
 			if (fr.type !== FRAME.DATA) { this.#log("frame no manejado", fr); continue; }
 
 			for (const j of extractJsons(fr.payload)) {
+				onJson?.(j);
+				lastProgressAt = Date.now();
+				// un frame con contenido es "progreso real"; los heartbeats no cuentan
+				if (Array.isArray(j.sections) && j.sections.length) lastContentAt = Date.now();
+				if (this.debug) {
+					// traza de frames: sirve para ver por que un turno no cierra
+					const n = Array.isArray(j.sections) ? j.sections.length : 0;
+					const ops = Array.isArray(j.operations) ? j.operations.length : -1;
+					evento("WS_FRAME", {
+						type: j.type ?? "(final)", rid: j.response_id ?? j.response?.response_id ?? "-",
+						secciones: n, ops, chars: textOf(j.response ?? j)?.length ?? 0,
+					});
+				}
+				for (const im of imagesOfJson(j)) imgs.set(im.key ?? im.url, im);
 				const rid = j.response_id ?? j.response?.response_id ?? null;
 				const isFull = j.type === "full" && !!j.response;
 				const isPatch = j.type === "patch";
@@ -564,7 +616,7 @@ export class MetaGateway {
 						onText?.(t);
 					}
 					this.#lastRid = rid ?? curRid;
-					return this.#finish(acc, reqId, rid ?? curRid);
+					return this.#finish(acc, reqId, rid ?? curRid, [...imgs.values()]);
 				}
 
 				if (isFull) {
@@ -581,7 +633,15 @@ export class MetaGateway {
 					}
 					const r = j.response ?? j;
 					const t = textOf(r);
-					if (t === null) continue; // status ("pensando"), no es respuesta
+					if (t === null) {
+						// puede ser una respuesta SIN texto (codigo o artefacto): si
+						// trae secciones, es contenido y cuenta como turno.
+						if (Array.isArray(r?.sections) && r.sections.length) {
+							acc = r; sawContent = true;
+							if (rid && !curRid) curRid = rid;
+						}
+						continue; // status ("pensando"), no es respuesta
+					}
 					const prev = textOf(acc) ?? "";
 					if (!acc || t.length >= prev.length) {
 						acc = r;
@@ -593,9 +653,9 @@ export class MetaGateway {
 					if (ops.length === 0) {
 						// parche vacio: fin de stream SOLO si ya hubo texto;
 						// antes del texto son heartbeats de la fase de thinking
-						if (sawText) {
+						if (sawText || sawContent) {
 							this.#lastRid = curRid;
-							return this.#finish(acc, reqId, curRid);
+							return this.#finish(acc, reqId, curRid, [...imgs.values()]);
 						}
 						continue;
 					}
@@ -612,10 +672,10 @@ export class MetaGateway {
 	//   replyTo = response_id de ESTA respuesta (f2.1.4)
 	//   messageIndex += 2 (un mensaje de usuario + uno del asistente)
 	// Si el turno falla no se llama: el hilo no avanza.
-	#finish(acc, reqId, responseId) {
+	#finish(acc, reqId, responseId, images = []) {
 		if (responseId) this.replyTo = responseId;
 		this.messageIndex += 2;
-		return { text: textOf(acc), reqId, responseId: responseId ?? null };
+		return { text: textOf(acc), reqId, responseId: responseId ?? null, images, response: acc };
 	}
 
 	close() {

@@ -126,6 +126,15 @@ export const FRAME = {
 // PRESERVA verbatim (parseFrame -> prefix -> buildFrame) para no dañar tramas.
 // Para 0x0f (handshake) y 0x0c (ack) el body ES el payload directo.
 
+// El largo del frame DGW viaja en un u16: 65535 bytes es el tope del cuerpo.
+// Un prompt grande NO entra en un frame (medido: 358908 bytes con el prompt de
+// sistema + 20 tools + historial de opencode -> RangeError de Node).
+export const MAX_FRAME_BODY = 0xffff;
+// El cuerpo del frame lleva el envelope JSON con el protobuf en base64 (x1.33)
+// y el pb lleva el prompt en UTF-8 mas ~1.2 KB de cabecera fija: 40 KB de
+// prompt deja el frame en ~55 KB, con margen para el tope de 65535.
+export const MAX_PROMPT_BYTES = 40_000;
+
 export function buildFrame(type, payload, prefixOrFlag) {
 	const p = payload instanceof Buffer ? payload : Buffer.from(payload);
 	let body = p;
@@ -134,6 +143,12 @@ export function buildFrame(type, payload, prefixOrFlag) {
 			? prefixOrFlag
 			: Buffer.from([0x00, prefixOrFlag ?? FRAME.FLAG_SERVER]);
 		body = Buffer.concat([prefix, p]);
+	}
+	if (body.length > MAX_FRAME_BODY) {
+		throw new Error(
+			`frame DGW demasiado grande: ${body.length} bytes (max ${MAX_FRAME_BODY}). ` +
+			"El prompt se tiene que partir en varios turnos (ver engine/partir.mjs).",
+		);
 	}
 	const head = Buffer.alloc(6);
 	head[0] = type;
