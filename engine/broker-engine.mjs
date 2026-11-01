@@ -46,7 +46,10 @@ function saveStore(store) {
 }
 
 export class MetaEngine {
-	constructor({ mode = "session", idleMs = 120_000, cdpPort = 9298 } = {}) {
+	// idleMs: cuanto se espera el PRIMER frame de la respuesta. Con varias
+	// conversaciones simultaneas, el servidor puede encolar y tardar mas de
+	// 120 s -> el cliente abortaba (4001 KEEPALIVE_TIMEOUT) y perdia el turno.
+	constructor({ mode = "session", idleMs = 180_000, cdpPort = 9298 } = {}) {
 		this.mode = mode === "guest" ? "guest" : "session";
 		this.idleMs = idleMs;
 		this.cdpPort = cdpPort;
