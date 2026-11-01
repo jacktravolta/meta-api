@@ -20,3 +20,5 @@ bridge/*.log
 bridge/don-bot-enviados.txt
 bridge/msg-meta.txt
 bridge/ignorar-meta.flag
+engine/.auth.json
+engine/.session.json

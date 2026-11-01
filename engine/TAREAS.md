@@ -7,10 +7,27 @@
 
 ## Estado (actualizado 2026-11-01)
 
-- [x] Paso 2 (encoder pb) y Paso 3 (cliente gateway) IMPLEMENTADOS y en verde:
-      `pb.mjs`, `gateway.mjs`, `probe.mjs`, `gateway.test.mjs` (9/9 tests).
-- [ ] Paso 1 (origen del token ecto1) — SIGUE BLOQUEANDO la prueba en vivo.
-- [ ] Paso 4 (integracion server.mjs), 5 (runbook), 6 (operacion segura).
+- [x] Paso 1 (origen del token ecto1) — RESUELTO: `useCreateTempUserMutation`
+      (doc_id 128302cfa314f375be53f53a266699fd) emite un accessToken `ecto1:`
+      sin cuenta ni cookies. Tambien funciona con la sesion propia (token+cookies
+      reciclados desde una captura).
+- [x] Paso 2 (encoder pb) — `pb.mjs` + slots por ruta, round-trip byte a byte.
+- [x] Paso 3 (cliente gateway) — `gateway.mjs`: connect/handshake/chat/close,
+      keepalive, errores por codigo de cierre. VERIFICADO EN VIVO.
+- [x] Tests golden — 14/14 en verde (`node --test engine/gateway.test.mjs`).
+- [ ] Paso 4 (integracion server.mjs), 5 (runbook de drift), 6 (operacion).
+
+### Lo que costo la implementacion (no repetir)
+	1. `Origin: https://www.meta.ai` en el upgrade del WS — sin esto el gateway
+	   cierra 4005 "Pre-Auth Validation Failed" antes del handshake.
+	2. El servidor puede mandar keepalive 0x0a ANTES del handshake: hay que
+	   saltarlo en vez de asumir que el primer frame es la respuesta.
+	3. Los frames del servidor llevan prefijo de 2 bytes VARIABLE (01 00 / 00 02 /
+	   03 00): preservarlo verbatim.
+	4. Los slots del envelope se identifican por RUTA, no por valor: el template
+	   puede ser cualquier captura nueva.
+	5. El pb es sensible: si el req-id del JSON wrapper no coincide con f1.6, o
+	   quedan ids de otra sesion, el servidor lo rechaza.
 
 ## Estado del arte (resumen 2 líneas)
 
