@@ -159,6 +159,43 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	Reconstruccion de texto: concatenar full.text + patch.operations
 	(los patch con operaciones no vacias traen slices de texto por delta).
 
+## Runbook de drift (cuando Meta muta el protocolo)
+
+	Señales de drift, en orden de probabilidad:
+	  1. `template: N slots — drift de protocolo probable` → el motor no
+	     encontró las rutas que sustituye (cambió el schema del envelope).
+	  2. El handshake responde code != 200 o el WS cierra 4005 → cambió la
+	     validación del upgrade (Origin/UA/cabeceras).
+	  3. Responde pero sin texto → cambió la forma de la respuesta (secciones).
+	  4. Devuelve SIEMPRE la respuesta anterior → el uniqueMessageId (f2.1.2.3)
+	     dejo de ser único por mensaje.
+	  5. Responde pero sin memoria → la profundidad del hilo (f2.1.5) cambio de
+	     ruta o de semantica.
+
+	Procedimiento:
+	  1) Capturar de nuevo (perfil dedicado, CDP 9298):
+	       node engine/capture-full.mjs 9298        # mensaje + imagen + cabeceras
+	       node engine/capture-pair.mjs 9298        # dos mensajes del mismo chat
+	  2) Comparar el envelope nuevo contra el contrato, sin adivinar:
+	       node engine/check-slots.mjs               # fixture mas reciente
+	       node engine/check-slots.mjs <captura.json>   # captura nueva
+	     El script lista las rutas, dice cuales slots faltan y hace el diff
+	     contra el fixture anterior (rutas nuevas/eliminadas y valores).
+	  3) Si las rutas cambiaron: actualizar las rutas en `insertSlots`
+	     (engine/gateway.mjs) y guardar la captura nueva en
+	     `engine/fixtures/capture-ws-<fecha>.json` (token REDACTED).
+	  4) Regenerar los tests golden: `node --test engine/gateway.test.mjs`.
+	  5) Verificar en vivo, en este orden:
+	       a) texto simple      → responde
+	       b) memoria           → turno 1 guarda un dato, turno 2 lo recalls
+	       c) imagen            → PNG verde → "Verde"
+	       d) reconexion        → cerrar la WS y volver a preguntar
+	     Para (b) y (d) esperar >120 s entre turnos: es lo que delata los
+	     errores de profundidad y de timestamps.
+
+	Nota: los ids, timestamps y flow ids cambian en CADA envio. El diff solo es
+	alarmante si cambian las RUTAS o los TIPOS de los valores.
+
 ## Implementacion existente (2026-11-01)
 	- `pb.mjs`          codec frames DGW + protobuf (round-trip byte a byte)
 	- `gateway.mjs`     cliente MetaGateway: connect/chat/close, slots por ruta,
@@ -170,6 +207,11 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	- `replay.mjs`      reproduce una captura desde Node (diagnostico)
 	- `probe.mjs`       CLI: `node engine/probe.mjs "hola" [--session]`
 	- `gateway.test.mjs` 14 tests golden (node --test) — EN VERDE
+	- `meta-graphql.mjs`  ciclo de vida de la conversacion (warmup, modo, rename)
+	- `upload.mjs`        subida de adjuntos a rupload.meta.ai -> media_id
+	- `broker-engine.mjs` pool de canales (user+channel) con memoria y renovacion
+	- `multichannel.mjs`  emulacion multicanal con prueba de memoria
+	- `check-slots.mjs`   verificador de drift: rutas, slots faltantes y diff
 
 ## Ciclo de vida de la conversacion (graphql)
 
