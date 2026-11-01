@@ -120,6 +120,12 @@ async function renewCredentials() {
 	return { token: c.accessToken, cookies: null, userId: c.abraUserId };
 }
 
+// Identidad del hilo: NO cambia al reconectar. Si el token caduca o la WS se
+// cae, se abre una conexion nueva contra el MISMO conversation_id y se
+// continua el hilo (ademas de inyectar el resumen como contexto).
+let conversationId = randomUUID();
+let depth = 0;
+
 async function ensureGateway() {
 	if (gateway && !gateway.isClosed()) return gateway;
 	if (USE_SESSION) {
@@ -134,10 +140,14 @@ async function ensureGateway() {
 		token: credentials.token,
 		cookies: credentials.cookies,
 		userId: credentials.userId,
-		conversationId: randomUUID(),
+		conversationId,
 	});
+	// la profundidad del hilo (f2.1.5) sobrevive a la reconexion: si se
+	// reiniciara en 1, el gateway trataria el mensaje como el primero de una
+	// conversacion nueva y perderiamos la memoria.
+	gateway.depth = depth;
 	await gateway.connect();
-	mirror(`[sistema] conexion establecida (${USE_SESSION ? "sesion propia" : "invitado " + credentials.userId})`);
+	mirror(`[sistema] conexion establecida (${USE_SESSION ? "sesion propia" : "invitado " + credentials.userId}) | hilo ${conversationId}`);
 	return gateway;
 }
 
@@ -147,6 +157,7 @@ async function send(prompt) {
 		try {
 			const gw = await ensureGateway();
 			const { text } = await gw.chat(prompt);
+			depth = gw.depth;
 			return text;
 		} catch (err) {
 			lastError = err;
