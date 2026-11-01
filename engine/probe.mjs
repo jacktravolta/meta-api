@@ -1,24 +1,49 @@
-// probe.mjs — prueba en vivo del engine protocol-first contra Meta AI real.
-// Uso: node engine/probe.mjs "tu prompt"
-// Si pasa un segundo argumento, lo envia al MISMO hilo para probar continuidad.
+// probe.mjs — prueba del gateway protocol-first contra meta.ai en vivo.
+//
+// Requiere un token ecto1: de una sesion autenticada REAL:
+//   META_ECTO_TOKEN=<ecto1:...> node engine/probe.mjs "hola"
+//
+// El token se obtiene manualmente del usuario o de una cuenta dedicada
+// (ver engine/TAREAS.md paso 1 y reglas de seguridad en paso 6).
+// NUNCA pegues el token en el shell con historial abierto si es compartido.
 
-import { createSession } from "./abra.mjs";
+import { MetaGateway, GatewayError, CLOSE } from "./gateway.mjs";
+import { randomUUID } from "node:crypto";
 
-const args = process.argv.slice(2);
-const prompt = args[0] || "decime hola en una frase";
-const followUp = args[1];
+const prompt = process.argv[2];
+const token = process.env.META_ECTO_TOKEN;
 
-const t0 = Date.now();
-const log = (m) => console.error(`[${((Date.now() - t0) / 1000).toFixed(1)}s] ${m}`);
+if (!prompt) {
+	console.error("uso: node engine/probe.mjs \"mensaje\"");
+	process.exit(2);
+}
+if (!token) {
+	console.error("falta META_ECTO_TOKEN en el entorno (paso 1 de TAREAS.md)");
+	process.exit(2);
+}
 
-const session = await createSession({ log });
-const r1 = await session.send(prompt);
-log("respuesta 1:");
-console.log(r1.text);
-console.error(`[conversationId=${r1.conversationId}]`);
+const conversationId = randomUUID();
+const gw = new MetaGateway({ token, conversationId, debug: false });
 
-if (followUp) {
-	const r2 = await session.send(followUp);
-	log("respuesta 2 (mismo hilo):");
-	console.log(r2.text);
+try {
+	await gw.connect();
+	console.error(`conectado (conversation ${conversationId})`);
+	const { text } = await gw.chat(prompt, {
+		onText: (acc) => {
+			process.stdout.clearLine?.(0);
+			process.stdout.cursorTo?.(0);
+			process.stdout.write(acc.replace(/\n/g, " \\n "));
+		},
+	});
+	process.stdout.write("\n");
+	console.log("TEXTO FINAL:", JSON.stringify(text));
+	gw.close();
+	process.exit(text ? 0 : 3);
+} catch (err) {
+	console.error("FALLO:", err.message);
+	if (err instanceof GatewayError) {
+		if (err.code === CLOSE.UNAUTHORIZED) console.error("=> consumo token invalido/expirado; buscar endpoint de interchange (TAREAS.md paso 1)");
+		if (err.code === CLOSE.REJECTED || err.code === CLOSE.BAD_REQUEST) console.error("=> schema del pb fue rechazado; re-capturar y diff (TAREAS.md paso 5)");
+	}
+	process.exit(1);
 }

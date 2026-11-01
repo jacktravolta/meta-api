@@ -5,6 +5,13 @@
 > `fixtures/capture-ws-20261031.json`). Este doc cubre QUÉ falta, en QUÉ orden y
 > CÓMO saber si quedó bien.
 
+## Estado (actualizado 2026-11-01)
+
+- [x] Paso 2 (encoder pb) y Paso 3 (cliente gateway) IMPLEMENTADOS y en verde:
+      `pb.mjs`, `gateway.mjs`, `probe.mjs`, `gateway.test.mjs` (9/9 tests).
+- [ ] Paso 1 (origen del token ecto1) — SIGUE BLOQUEANDO la prueba en vivo.
+- [ ] Paso 4 (integracion server.mjs), 5 (runbook), 6 (operacion segura).
+
 ## Estado del arte (resumen 2 líneas)
 
 - El envío autenticado del meta.ai actual NO es HTTP scraping: es WebSocket

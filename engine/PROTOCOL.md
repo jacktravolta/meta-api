@@ -32,17 +32,29 @@ intercambio. Pista encontrada en el bundle 1hevzi2weu6be.js (~offset 63160):
 
 ## Frames DGW (binario)
 
-Estructura verificada con captura real (fecha 2026-10-31):
+Estructura verificada FRAME A FRAME con la captura real (2026-10-31).
+Regla unica: **len = total_del_frame - 6** (cuenta el body desde [6]).
 
-	[0]     tipo:  0x0f handshake JSON, 0x0d datos, 0x0c ack corto,
-	               0x09 y 0x0a keepalive de 1 byte (no se decide quien es ping)
+	[0]     tipo: 0x0f handshake JSON, 0x0d datos, 0x0c ack corto,
+	             0x09 ping(cliente) / 0x0a pong(servidor) = 1 byte solo
 	[1..2]  reserved (00 00)
-	[3..4]  largo u16 LITTLE-ENDIAN — vale payload_len + 2, NO el largo real
-	        del payload (offsets 6 y 7 quedan fuera del conteo)
-	[5..6]  reserved (00 00)
-	[7]     flag: 0x80 => cliente (payload = JSON con pb b64),
-	              0x00 => servidor (payload = protobuf crudo)
-	[8..]   payload
+	[3..4]  len u16 LITTLE-ENDIAN = total - 6
+	[5]     reserved (00)
+	[6..]   body (len bytes)
+
+Semantica del body por tipo:
+
+	0x0f  body = JSON directo (handshake cliente y respuesta servidor)
+	0x0c  body = 2 bytes (00 00) — ack sin payload
+	0x0d  body = prefijo de 2 bytes + payload:
+	        cliente  : 00 80 + JSON {"req-id","payload":<b64-pb>}
+	        servidor : 01 00 / 00 02 / 03 00 + protobuf crudo
+	      (la semantica del prefijo NO esta confirmada — se preserva verbatim;
+	       parseFrame -> prefix -> buildFrame round-trip byte a byte)
+
+Keepalive: cliente envia 0x09, servidor responde 0x0a (confirmado en captura).
+El codec de referencia es `engine/pb.mjs` (parseFrame/buildFrame/decodePb/
+encodePb) con tests golden en `engine/gateway.test.mjs`.
 
 ## Gateway handshake (tipo 0x0f, cliente -> srv)
 	{
@@ -92,7 +104,18 @@ El PB (1030 bytes con prompt "responde solo: hola"), estructura detectada:
 	Stream termina al llegar de nuevo modal con type=full + siguiente patch vacio:
 	un ping/pong 0x0b/0x0a sigue tras el final.
 
+## Implementacion existente (2026-11-01)
+	- `pb.mjs`        codec frames DGW + protobuf (round-trip byte a byte probado)
+	- `gateway.mjs`   cliente MetaGateway: connect/chat/close, slots del envelope,
+	                  errores tipados por codigo de cierre, keepalive 0x09
+	- `probe.mjs`     prueba en vivo: META_ECTO_TOKEN=... node engine/probe.mjs "hola"
+	- `gateway.test.mjs`  9 tests golden (node --test) — TODOS EN VERDE
+
 ## Pendientes (para motor HTTP puro)
 	1. Token ecto1: procedencia a gemelar en bundles JS de www.meta.ai
-	2. Schema pb estandarizado con campos nombrados + test unitario golden
-	3. Commit del stream largo (GAP de respuesta hasta convertido en secciones)
+	2. Forma de patch.operations NO VACIO (streaming por delta) — sin capturar;
+	   gateway.mjs lo loguea y por ahora resuelve con el ultimo `full` al
+	   llegar el patch vacio (seq>0)
+	3. Verificar semantica del prefijo de 2 bytes de las tramas 0x0d servidor
+	4. Datos del envelope sin nombrar (f1.*): app-session, player, pipes,
+	   "blocking_confirmation", etc. — hoy pasan por template intactos
