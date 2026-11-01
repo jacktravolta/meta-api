@@ -15,7 +15,9 @@
 - [x] Paso 3 (cliente gateway) — `gateway.mjs`: connect/handshake/chat/close,
       keepalive, errores por codigo de cierre. VERIFICADO EN VIVO.
 - [x] Tests golden — 14/14 en verde (`node --test engine/gateway.test.mjs`).
-- [ ] Paso 4 (integracion server.mjs), 5 (runbook de drift), 6 (operacion).
+- [x] Paso 4 (integracion server.mjs) — `META_ENGINE=graphql` con sync + SSE,
+      continuidad por hilo, renovacion de token. VERIFICADO EN VIVO.
+- [ ] Paso 5 (runbook de drift), 6 (operacion).
 
 ### Lo que costo la implementacion (no repetir)
 	1. `Origin: https://www.meta.ai` en el upgrade del WS — sin esto el gateway

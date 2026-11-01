@@ -382,13 +382,37 @@ journalctl --user -u meta-api -f
 One tab, minimal browser (no NTP/search/crash bubbles, startup tabs closed), visible
 window, 30-second idle close.
 
-## Motor protocol-first (en construcción)
+## Motor protocol-first (funcional)
 
 El front de meta.ai ya no usa scraping SSR: es un gateway WebSocket
 (`wss://gateway.meta.ai/ws/clippy`) con frames binarios DGW. El protocolo está
-capturado y decodificado; el plan de implementación completo (token, encoder,
-`gateway.mjs`, integración con fallback a este motor browser) vive en:
+capturado, decodificado y **hablando en producción**: el motor nuevo habla
+directo con el gateway, sin navegador en runtime.
+
+```bash
+# motor nuevo (sin Chrome): usuario invitado autónomo
+META_ENGINE=graphql node server.mjs
+
+# motor nuevo usando tu cuenta (token + cookies de engine/.session.json)
+META_ENGINE=graphql META_ENGINE_MODE=session node server.mjs
+```
+
+| `META_ENGINE` | `META_ENGINE_MODE` | Qué hace |
+| --- | --- | --- |
+| `browser` (default) | — | Chrome/CDP + scraping del DOM (como siempre) |
+| `graphql` | `guest` (default) | Gateway DGW con usuario invitado: se crea solo y se renueva si caduca |
+| `graphql` | `session` | Gateway DGW con tu sesión (`engine/.session.json`) |
+
+Notas del motor nuevo:
+
+- Sync y streaming SSE, con la misma forma OpenAI que el motor browser.
+- **Solo texto**: el envelope del protocolo no transporta imágenes (usa `browser` para eso).
+- Continuidad de hilo por `payload.user` o header `x-meta-conversation`.
+- El token de invitado caduca (~30-60 min): el broker pide otro solo y sigue.
+- Credenciales en `engine/.auth.json` y `engine/.session.json` (0600, fuera de git).
 
 - `engine/PROTOCOL.md` — spec del protocolo + procedimiento de recuperación si Meta muta.
 - `engine/TAREAS.md` — ticket ejecutable para el próximo agente (pasos, criterios, seguridad).
 - `engine/fixtures/` — captura real de referencia para tests golden.
+- `engine/probe.mjs` — CLI: `node engine/probe.mjs "hola" [--session]`.
+- `engine/conversation.mjs` — conversación sostenida con espejo en `bridge/mirror-chat.txt`.

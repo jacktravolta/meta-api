@@ -22,3 +22,5 @@ bridge/msg-meta.txt
 bridge/ignorar-meta.flag
 engine/.auth.json
 engine/.session.json
+bridge/mirror-chat.txt
+bridge/mirror-chat.jsonl

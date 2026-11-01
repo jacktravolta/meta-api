@@ -155,10 +155,45 @@ Slots que el motor reemplaza en cada envio (por RUTA, no por valor):
 	- `probe.mjs`       CLI: `node engine/probe.mjs "hola" [--session]`
 	- `gateway.test.mjs` 14 tests golden (node --test) — EN VERDE
 
+## Cierre de turno (reglas verificadas en vivo)
+
+	El stream de una respuesta llega en 3 formas distintas segun la longitud y
+	el estado de la sesion. Las tres se resuelven en gateway.mjs:
+
+	1. `full` (seq=0) con `GenAIMarkdownTextUXPrimitive.text` = texto base.
+	2. `patch` (seq=1) con `operations:[{op:"delta", path:"/sections/N/view_model/primitive/text", value:"..."}]`
+	   = deltas que se aplican sobre el acumulado (JSON pointer).
+	   Tambien aparece `op:"add"` con `path:"/sections/1"` y el valor completo de la
+	   seccion (la respuesta entra asi cuando el front ya la compuso).
+	3. Cierre: un `patch` con `operations:[]` DESPUES de haber texto.
+	   En la sesion con cuenta, el cierre es ademas un frame "final": JSON con
+	   `response_id` + `sections` y SIN campo `type` (estado completo de la respuesta).
+
+	Trampa: los parches vacios tambien llegan durante la fase de "pensando"
+	(heartbeats), ANTES del texto. Si se cierra el turno ahi, se devuelve la
+	respuesta del turno anterior o null.
+
+	Trampa 2: el frame "final" de la respuesta anterior llega DESPUES del patch
+	vacio de cierre y queda encolado: si el turno siguiente lo consume, cree que
+	es su propia respuesta. Se descarta por `response_id` (el gateway recuerda el
+	del turno anterior) y se vacia la cola al empezar un turno.
+
+	Trampa 3: los frames DGW llegan troceados entre mensajes WS y/o varios
+	concatenados en uno: el len del header solo cubre el primer frame. Hay que
+	acumular bytes en un buffer y extraer frame a frame (engine/gateway.mjs).
+
+## Vida util de las credenciales (medido 2026-11-01)
+
+	- Token de invitado (`ecto1:` de createTempUser): caduca ~30-60 min.
+	  Al expirar, el gateway cierra 4003 "Unauthorized 401" ANTES del handshake.
+	  Se crea otro invitado (nueva identidad) y la conversacion se retoma
+	  pasando el resumen del hilo como contexto.
+	- Token de sesion propia: mismo tipo de credencial; si caduca, hay que
+	  recapturarlo del navegador (engine/capture-session.mjs, sin enviar mensajes).
+
 ## Pendientes
-	1. Forma de patch.operations NO VACIO (streaming por delta) — sin capturar;
-	   gateway.mjs lo loguea y resuelve con el ultimo `full` al llegar el patch vacio
-	2. Semantica del prefijo de 2 bytes de las tramas 0x0d servidor
-	3. Envelope: campos aun sin nombre (app-session, pipes, blocking_confirmation)
-	4. Tokens de invitado: ¿caducan? ¿cuanto vive una sesion?
-	5. Integrar el motor como engine del server.mjs (META_ENGINE=graphql|browser)
+	1. Semantica del prefijo de 2 bytes de las tramas 0x0d servidor
+	2. Envelope: campos aun sin nombre (app-session, pipes, blocking_confirmation)
+	3. Continuar una conversacion con una identidad nueva: hoy se pasa el
+	   resumen como contexto, no el historial completo del hilo
+	4. Imagenes: el envelope del protocolo no las transporta (queda en browser)

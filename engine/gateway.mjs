@@ -16,7 +16,7 @@ import { randomUUID } from "node:crypto";
 import wsPkg from "ws";
 import {
 	FRAME, buildFrame, parseFrame,
-	decodePb, encodePb, extractJsons,
+	decodePb, encodePb, extractJsons, parseFrames,
 } from "./pb.mjs";
 
 // `ws` es CommonJS y permite headers (Cookie, Origin) en el upgrade HTTP;
@@ -197,6 +197,36 @@ export function buildRequestPayload({
 
 // ---------- cliente ----------
 
+// Aplica una operacion del patch sobre el objeto response acumulado.
+// Path estilo JSON pointer: "/sections/0/view_model/primitive/text"
+function applyOperation(root, op) {
+	if (!root || !op || typeof op.path !== "string") return;
+	const parts = op.path.split("/").slice(1)
+		.map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+	let cur = root;
+	for (let i = 0; i < parts.length - 1; i++) {
+		if (cur == null) return;
+		cur = cur[parts[i]];
+	}
+	if (cur == null) return;
+	const last = parts[parts.length - 1];
+	if (last === undefined) return;
+	switch (op.op) {
+		case "delta":
+		case "append":
+			cur[last] = (cur[last] ?? "") + (op.value ?? "");
+			break;
+		case "replace":
+			cur[last] = op.value;
+			break;
+		case "remove":
+			delete cur[last];
+			break;
+		default:
+			cur[last] = op.value;
+	}
+}
+
 export class GatewayError extends Error {
 	constructor(code, msg) {
 		super(`gateway cerrado ${code} (${CLOSE_NAMES[code] ?? "desconocido"}): ${msg}`);
@@ -220,10 +250,13 @@ export class MetaGateway {
 		this.ws = null;
 		this.#q = [];
 		this.#waiting = null;
+		this.#lastRid = null; // response_id del turno anterior (para descartar colas)
 	}
 
 	#q;
 	#waiting;
+	#lastRid = null;
+	#buf = Buffer.alloc(0); // bytes pendientes de frames DGW
 	#pingTimer = null;
 	#openRes = null;
 	#openRej = null;
@@ -266,10 +299,26 @@ export class MetaGateway {
 	}
 
 	#onData(data) {
-		if (data.length === 1) this.#q.push({ keepalive: true, type: data[0] });
-		else {
-			try { this.#q.push(parseFrame(data)); }
-			catch (err) { this.#q.push({ error: err }); }
+		if (data.length === 1) {
+			// keepalive: llega como mensaje WS de 1 byte
+			this.#q.push({ keepalive: true, type: data[0] });
+			this.#flush();
+			return;
+		}
+		// Los frames DGW pueden llegar PARTIDOS entre mensajes WS y/o varios
+		// concatenados en uno: se acumula y se extrae frame a frame.
+		this.#buf = this.#buf.length ? Buffer.concat([this.#buf, data]) : data;
+		for (;;) {
+			if (this.#buf.length < 6) break;
+			const len = this.#buf.readUInt16LE(3);
+			const total = 6 + len;
+			if (this.#buf.length < total) break; // frame incompleto: esperar mas bytes
+			try {
+				this.#q.push(parseFrame(this.#buf.subarray(0, total)));
+			} catch (err) {
+				this.#q.push({ error: err });
+			}
+			this.#buf = this.#buf.subarray(total);
 		}
 		this.#flush();
 	}
@@ -347,7 +396,7 @@ export class MetaGateway {
 
 	// Envia un prompt y acumula el stream. onText(textoAcumulado) opcional.
 	// Resuelve al llegar patch vacio; luego close o seguir listo con el mismo ws.
-	async chat(prompt, { onText } = {}) {
+	async chat(prompt, { onText, ...opts } = {}) {
 		if (!this.ws || this.ws.readyState !== 1 || this.#closed)
 			throw new Error("chat: gateway no conectado");
 		const reqId = randomUUID();
@@ -362,22 +411,84 @@ export class MetaGateway {
 			JSON.stringify({ "req-id": reqId, payload: payload.toString("base64") }),
 			FRAME.FLAG_CLIENT)));
 
-		let lastFull = null;
+		// cola del turno anterior: se descarta (el frame de "estado final" de la
+		// respuesta previa llega despues del patch vacio y contamina el turno nuevo)
+		this.#q.length = 0;
+
+		let acc = null;      // response con TEXTO del turno en curso
+		let curRid = null;   // response_id del turno en curso
+		let sawText = false; // ya hubo texto de este turno
+		const idleMs = opts.idleMs ?? 120_000;
 		for (;;) {
-			const fr = await this.#readFrame();
+			const fr = await Promise.race([
+				this.#readFrame(),
+				new Promise((res) => setTimeout(() => res({ idle: true }), idleMs)),
+			]);
+			if (fr.idle) throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT, `stream sin frames por ${idleMs}ms`);
 			if (this.#closed) throw new GatewayError(this.#closed.code, this.#closed.reason || "cerrado en stream");
 			if (fr.error) throw fr.error;
 			if (fr.keepalive) continue;
 			if (fr.type === FRAME.ACK || fr.type === FRAME.HANDSHAKE) continue;
 			if (fr.type !== FRAME.DATA) { this.#log("frame no manejado", fr); continue; }
+
 			for (const j of extractJsons(fr.payload)) {
-				if (j.type === "patch") {
+				const rid = j.response_id ?? j.response?.response_id ?? null;
+				const isFull = j.type === "full" && !!j.response;
+				const isPatch = j.type === "patch";
+				// Frame FINAL: JSON con response_id + sections y SIN "type".
+				// Es el estado completo de la respuesta y el cierre del turno.
+				const isFinal = !j.type && !!j.sections && !!rid;
+
+				if (isFinal) {
+					// estado final: se adopta y cierra el turno
+					if (rid === this.#lastRid) continue;
+					const r = j;
+					const t = textOf(r);
+					if (t !== null) {
+						acc = r;
+						sawText = true;
+						onText?.(t);
+					}
+					this.#lastRid = rid ?? curRid;
+					return { text: textOf(acc), reqId };
+				}
+
+				if (isFull) {
+					if (rid) {
+						if (rid === this.#lastRid) continue; // cola de la respuesta anterior
+						if (!curRid) curRid = rid;
+						else if (rid !== curRid) {
+							// rid distinto: o es la respuesta nueva (si aun no hay
+							// texto) o es cola de la respuesta anterior (se ignora)
+							if (sawText) continue;
+							curRid = rid;
+							acc = null;
+						}
+					}
+					const r = j.response ?? j;
+					const t = textOf(r);
+					if (t === null) continue; // status ("pensando"), no es respuesta
+					const prev = textOf(acc) ?? "";
+					if (!acc || t.length >= prev.length) {
+						acc = r;
+						sawText = true;
+						onText?.(t);
+					}
+				} else if (isPatch) {
 					const ops = j.operations ?? [];
-					if (ops.length === 0 && j.seq > 0) return { text: lastFull, reqId };
-					this.#log("patch con operaciones (forma por confirmar):", JSON.stringify(j).slice(0, 400));
-				} else {
-					const t = textOf(j.response ?? j);
-					if (t !== null) { lastFull = t; onText?.(t); }
+					if (ops.length === 0) {
+						// parche vacio: fin de stream SOLO si ya hubo texto;
+						// antes del texto son heartbeats de la fase de thinking
+						if (sawText) {
+							this.#lastRid = curRid;
+							return { text: textOf(acc), reqId };
+						}
+						continue;
+					}
+					if (!acc) continue; // delta sin full previo: no hay a que aplicar
+					for (const op of ops) applyOperation(acc, op);
+					const t = textOf(acc);
+					if (t !== null) onText?.(t);
 				}
 			}
 		}
@@ -386,6 +497,11 @@ export class MetaGateway {
 	close() {
 		clearInterval(this.#pingTimer);
 		try { this.ws?.close(1000); } catch {}
+	}
+
+	/** el socket sigue abierto y usable? */
+	isClosed() {
+		return !this.ws || this.ws.readyState !== 1 || !!this.#closed;
 	}
 }
 

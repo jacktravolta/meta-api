@@ -146,13 +146,28 @@ export function parseFrame(buf) {
 	if (buf.length < 6) throw new Error(`frame corto (${buf.length}b)`);
 	const type = buf[0];
 	const len = buf.readUInt16LE(3);
-	if (len !== buf.length - 6)
+	const total = 6 + len;
+	if (total > buf.length)
 		throw new Error(`len incoherente: len=${len} total=${buf.length}`);
-	const body = buf.subarray(6);
+	const body = buf.subarray(6, total);
 	if (type === FRAME.DATA) {
-		return { type, len, prefix: body.subarray(0, 2), flag: body[1], payload: body.subarray(2) };
+		return { type, len, total, prefix: body.subarray(0, 2), flag: body[1], payload: body.subarray(2) };
 	}
-	return { type, len, payload: body };
+	return { type, len, total, payload: body };
+}
+
+// Un mensaje WS puede traer VARIOS frames DGW concatenados (el len del header
+// solo cubre el primero): se parten todos.
+export function parseFrames(buf) {
+	const out = [];
+	let off = 0;
+	while (off < buf.length) {
+		const f = parseFrame(buf.subarray(off));
+		if (f.keepalive) { out.push(f); off += 1; continue; }
+		out.push(f);
+		off += f.total;
+	}
+	return out;
 }
 
 // ---------- extraccion de JSON embebido en recv pb ----------
@@ -165,13 +180,19 @@ export function extractJsons(payload, max = 100) {
 		for (const n of nodes) {
 			if (jss.length >= max) return;
 			if (n.wire !== WIRE_LEN) continue;
-			if (n.kind === "str") {
-				if (n.str[0] === "{" || n.str[0] === "[") {
-					try { jss.push(JSON.parse(n.str)); } catch { /* no es JSON */ }
-				}
-			} else if (n.kind === "pb") {
+			if (n.kind === "pb") {
 				walk(n.pb);
+				continue;
 			}
+			// CUALQUIER leaf puede ser un JSON (utf8 con acentos, ñ, emojis, etc):
+			// el texto del gateway viene con caracteres no ASCII y la clasificacion
+			// "printable" los dejaba fuera, perdiendo el texto y los deltas.
+			const bytes = n.kind === "str" ? Buffer.from(n.str, "utf8") : n.bytes;
+			if (!bytes?.length) continue;
+			const s = bytes.toString("utf8");
+			const trimmed = s.trimStart();
+			if (trimmed[0] !== "{" && trimmed[0] !== "[") continue;
+			try { jss.push(JSON.parse(trimmed)); } catch { /* no es JSON */ }
 		}
 	};
 	try { walk(decodePb(payload)); } catch { /* payload irreconocible */ }
