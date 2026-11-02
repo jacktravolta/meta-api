@@ -1,0 +1,1168 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meta AI · webchat</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --line: #2a2f3a;
+    --txt: #e6e8ee;
+    --dim: #9aa3b2;
+    --accent: #4c8dff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --me: #1d2b45;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--txt);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  .badge {
+    font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--dim);
+    white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: #21462a; background: #122417; }
+  .badge.err { color: var(--err); border-color: #5c2222; background: #2a1515; }
+  .badge.warn { color: var(--warn); border-color: #57431a; background: #2a2314; }
+  /* Conmutador de conexion: con sesion / sin sesion (invitado). */
+  .segmentado { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; background: var(--panel-2); }
+  .segmentado .seg { font-size: 12px; padding: 3px 10px; border: none; border-radius: 0; background: transparent; color: var(--dim); cursor: pointer; white-space: nowrap; }
+  .segmentado .seg + .seg { border-left: 1px solid var(--line); }
+  .segmentado .seg.on { background: var(--me); color: #cfe0ff; font-weight: 650; }
+  .segmentado .seg.on.invitado { background: #2a2314; color: var(--warn); }
+  /* Aviso visible junto al boton de adjuntos (modo sin sesion). */
+  .aviso-adj { font-size: 12px; color: var(--warn); max-width: 260px; line-height: 1.3; }
+  .aviso-adj:empty { display: none; }
+  /* Archivos que meta produjo en su sandbox (pdf, zip, scripts). */
+  .archivos { white-space: normal; margin-top: 9px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .archivos a {
+    display: inline-flex; align-items: center; gap: 7px; text-decoration: none;
+    font-size: 12.5px; color: var(--txt); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px;
+  }
+  .archivos a:hover { border-color: #3a4252; background: #232833; }
+  .archivos .tam { color: var(--dim); font-size: 11.5px; }
+  /* Meta nombro un archivo que no se pudo reproducir: se avisa, no se finge. */
+  .aviso-archivos {
+    white-space: normal; margin-top: 9px; font-size: 12.5px; line-height: 1.45;
+    color: var(--warn); background: #2a2314; border: 1px solid #57431a;
+    border-radius: 8px; padding: 7px 10px;
+  }
+  header .crece { flex: 1; }
+  button {
+    font: inherit; color: var(--txt); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #3a4252; background: #232833; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primario { background: var(--accent); border-color: var(--accent); color: #06101f; font-weight: 650; }
+  #hilo { max-height: 74vh; overflow-y: auto; padding: 16px 14px; flex: 1; }
+  .msg { max-width: 860px; margin: 0 auto 14px; display: flex; gap: 10px; }
+  .msg .who {
+    flex: 0 0 30px; height: 30px; border-radius: 8px; display: grid; place-items: center;
+    font-size: 12px; font-weight: 700; background: var(--panel-2); border: 1px solid var(--line); color: var(--dim);
+  }
+  .msg.user .who { background: var(--me); color: #cfe0ff; }
+  .msg .cuerpo {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 9px 12px; white-space: pre-wrap; word-wrap: break-word; flex: 1; min-width: 0;
+  }
+  .msg.user .cuerpo { background: var(--me); }
+  .msg.error .cuerpo { border-color: #5c2222; background: #241414; color: #ffb4ae; }
+  .msg .meta { font-size: 11.5px; color: var(--dim); margin-top: 5px; }
+  .msg.error .meta { color: #d98b85; }
+  .vacio { color: var(--dim); text-align: center; margin-top: 12vh; }
+  .vacio code { background: var(--panel-2); padding: 2px 6px; border-radius: 5px; }
+  footer {
+    border-top: 1px solid var(--line); background: var(--panel);
+    padding: 10px 14px 14px;
+  }
+  form { max-width: 860px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: vertical; min-height: 46px; max-height: 180px;
+    background: var(--panel-2); color: var(--txt); border: 1px solid var(--line);
+    border-radius: 10px; padding: 11px 12px; font: inherit;
+  }
+  textarea:focus { outline: none; border-color: #3d5a8a; }
+  .pie { max-width: 860px; margin: 8px auto 0; font-size: 12px; color: var(--dim); display: flex; gap: 14px; flex-wrap: wrap; }
+  .latido { color: var(--warn); }
+  img.adj { max-width: 240px; max-height: 180px; border-radius: 8px; border: 1px solid var(--line); margin-top: 6px; display: block; }
+  code.inl { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  /* Imagen generada: miniatura + enlace que abre en otra pestana. */
+  a.img-link { display: block; margin-top: 6px; }
+  img.generada { max-width: 320px; max-height: 320px; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  a.pie-img { display: inline-block; margin-top: 4px; font-size: 11.5px; color: var(--dim); word-break: break-all; text-decoration: none; }
+  a.pie-img:hover { color: var(--accent); text-decoration: underline; }
+  /* Adjuntos pendientes: chips con miniatura y boton de quitar. */
+  .chips { max-width: 860px; margin: 0 auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 0 0 8px; }
+  .chips:empty { display: none; }
+  .chip { position: relative; display: flex; align-items: center; gap: 7px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; padding: 5px 8px; font-size: 12.5px; color: var(--dim); max-width: 230px; }
+  .chip img { width: 42px; height: 42px; object-fit: cover; border-radius: 6px; flex: 0 0 auto; }
+  .chip .nombre { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip .peso { color: #6f7787; font-size: 11px; }
+  .chip .quitar { position: absolute; top: -7px; right: -7px; width: 19px; height: 19px; padding: 0; border-radius: 50%; font-size: 12px; line-height: 1; background: #3a1d1d; border-color: #5c2222; color: #ffb4ae; }
+  .chip.bad { border-color: #5c2222; background: #241414; color: #ffb4ae; }
+  /* Adjunto del usuario ya enviado. */
+  img.adj { max-width: 240px; max-height: 180px; border-radius: 8px; border: 1px solid var(--line); margin-top: 6px; display: block; }
+  .adj-otro { display: inline-flex; align-items: center; gap: 6px; margin-top: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; font-size: 12.5px; color: var(--dim); text-decoration: none; }
+  .adj-otro:hover { border-color: #3a4252; color: var(--txt); }
+
+  /* ---------------------------------------------------------------- panel
+     El panel de control comparte fondo, tipografia y variables del chat:
+     es la MISMA aplicacion con otra vista, no otra pagina. */
+  .vista { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  .vista[hidden] { display: none; }   /* el atributo hidden gana a display:flex */
+  body[data-vista="panel"] .solo-chat { display: none; }
+  .panel-grid {
+    width: 100%; max-width: 1120px; margin: 0 auto;
+    display: grid; gap: 14px; align-items: start;
+    grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+    padding: 16px 14px 30px;
+  }
+  .tarjeta { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px 16px; }
+  .tarjeta.ancha { grid-column: 1 / -1; }
+  .tarjeta h2 { font-size: 14px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  .tarjeta-cab { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .tarjeta-cab .chico { margin-left: auto; font-size: 12px; padding: 4px 10px; }
+  .nota { color: var(--dim); font-size: 12.5px; line-height: 1.45; margin: 0 0 12px; }
+  .nota.peq { font-size: 11.5px; margin: 10px 0 0; }
+  .nota.warn { color: var(--warn); }
+  .campo { margin-bottom: 14px; }
+  .campo label { display: block; font-size: 12.5px; color: var(--dim); margin-bottom: 5px; }
+  select, input[type="text"] {
+    width: 100%; font: inherit; color: var(--txt); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  }
+  select:focus, input[type="text"]:focus { outline: none; border-color: #3d5a8a; }
+  .ayuda { color: var(--dim); font-size: 12px; line-height: 1.45; margin: 6px 0 0; }
+  .acciones { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .aviso { font-size: 12.5px; }
+  .aviso:empty { display: none; }
+  .aviso.ok { color: var(--ok); }
+  .aviso.err { color: var(--err); }
+  .aviso.warn { color: var(--warn); }
+  .boton-chico { font-size: 12px; padding: 4px 9px; }
+  /* El secreto nuevo: se destaca porque solo se ve esta vez. */
+  .secreto { margin-top: 14px; border: 1px solid #57431a; background: #2a2314; border-radius: 10px; padding: 12px; }
+  .secreto-cab { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; font-size: 13px; }
+  .secreto-valor {
+    display: block; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 8px; padding: 9px 10px; font-size: 13px; word-break: break-all;
+    user-select: all;
+  }
+  .form-key { max-width: none; margin: 0 0 4px; display: grid; gap: 12px; }
+  .tabla-wrap { overflow-x: auto; margin-top: 14px; }
+  .tabla-claves { width: 100%; min-width: 540px; border-collapse: collapse; font-size: 12.5px; }
+  .tabla-claves th { text-align: left; color: var(--dim); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .tabla-claves td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .tabla-claves tr:last-child td { border-bottom: none; }
+  .tabla-claves .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--dim); }
+  .pill { font-size: 11.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+  .pill.activa { color: var(--ok); border-color: #21462a; background: #122417; }
+  .pill.revocada { color: var(--err); border-color: #5c2222; background: #2a1515; }
+  .pill.caducada { color: var(--warn); border-color: #57431a; background: #2a2314; }
+  .vacio-panel { color: var(--dim); font-size: 12.5px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Meta AI · webchat</h1>
+  <div class="segmentado" role="group" aria-label="Vista">
+    <button type="button" id="seg-chat" class="seg on">Chat</button>
+    <button type="button" id="seg-panel" class="seg">Panel</button>
+  </div>
+  <div class="segmentado solo-chat" role="group" aria-label="Conexión con la API">
+    <button type="button" id="seg-sesion" class="seg on" title="Enviar por la API con sesión">Con sesión</button>
+    <button type="button" id="seg-guest" class="seg invitado" title="Enviar por la API de invitado (sin sesión)">Sin sesión</button>
+  </div>
+  <span id="estado" class="badge">conectando…</span>
+  <span id="modelo" class="badge">meta-ai</span>
+  <span class="crece"></span>
+  <button id="nueva" class="solo-chat" title="Limpiar el canal: meta abre una conversacion nueva con el mismo canal">Limpiar canal</button>
+</header>
+
+<main id="vista-chat" class="vista">
+  <div id="hilo">
+    <div class="vacio" id="vacio">
+      Habla con Meta AI a través de la API local.<br>
+      El modelo es <code>meta-ai</code> y responde en 3–60 s (piensa antes de contestar).
+    </div>
+  </div>
+
+  <footer>
+    <div class="chips" id="chips"></div>
+    <form id="form">
+      <textarea id="txt" rows="1" placeholder="Escribe tu mensaje… (Enter envía, Shift+Enter = salto de línea)" autocomplete="off"></textarea>
+      <span id="aviso-adj" class="aviso-adj"></span>
+      <button type="submit" id="enviar" class="primario">Enviar</button>
+    </form>
+    <div class="pie">
+      <span id="info">—</span>
+      <span id="latido" class="latido"></span>
+    </div>
+  </footer>
+</main>
+
+<section id="vista-panel" class="vista" hidden aria-label="Panel de control de la API">
+  <div class="panel-grid">
+
+    <!-- ------------------------------------------------ ajustes -->
+    <div class="tarjeta">
+      <div class="tarjeta-cab">
+        <h2>Ajustes de la API</h2>
+        <span id="ajustes-estado" class="badge">—</span>
+      </div>
+      <p class="nota">Se aplican al turno siguiente, sin reiniciar la API.</p>
+
+      <div class="campo">
+        <label for="sel-storage">Modo de entrega de archivos</label>
+        <select id="sel-storage">
+          <option value="url">URL directa de Meta (sin copia en la API)</option>
+          <option value="local">Copia local en la API</option>
+        </select>
+        <p class="ayuda" id="ayuda-storage">—</p>
+      </div>
+
+      <div class="campo">
+        <label for="sel-auth">Autenticación</label>
+        <select id="sel-auth">
+          <option value="abierta">Abierta</option>
+          <option value="api-key">API key</option>
+        </select>
+        <p class="ayuda" id="ayuda-auth">—</p>
+      </div>
+
+      <div class="acciones">
+        <button type="button" id="guardar-ajustes" class="primario">Guardar</button>
+        <span id="msg-ajustes" class="aviso"></span>
+      </div>
+      <p class="nota peq" id="ajustes-actualizado"></p>
+    </div>
+
+    <!-- ------------------------------------------------ api keys -->
+    <div class="tarjeta">
+      <div class="tarjeta-cab">
+        <h2>API keys</h2>
+      </div>
+      <p class="nota">Cada clave permite usar la API. Solo se guarda su huella: el secreto completo se muestra una vez, al crearla.</p>
+
+      <form id="form-key" class="form-key">
+        <div class="campo">
+          <label for="key-nombre">Nombre</label>
+          <input id="key-nombre" type="text" placeholder="Ej: pruebas locales" maxlength="120" autocomplete="off">
+        </div>
+        <div class="campo">
+          <label for="key-dias">Caducidad</label>
+          <select id="key-dias">
+            <option value="">Sin caducidad</option>
+            <option value="30">30 días</option>
+            <option value="90">90 días</option>
+            <option value="365">365 días</option>
+          </select>
+        </div>
+        <div class="acciones">
+          <button type="submit" id="generar-clave" class="primario">Generar clave</button>
+          <span id="msg-crear" class="aviso"></span>
+        </div>
+      </form>
+
+      <div id="secreto" class="secreto" hidden>
+        <div class="secreto-cab">
+          <strong>Clave creada</strong>
+          <span class="badge warn">se muestra una sola vez</span>
+        </div>
+        <code id="secreto-valor" class="secreto-valor"></code>
+        <div class="acciones" style="margin-top: 10px;">
+          <button type="button" id="copiar-secreto">Copiar</button>
+          <button type="button" id="ocultar-secreto" class="boton-chico">Ocultar</button>
+          <span id="msg-copiar" class="aviso"></span>
+        </div>
+        <p class="nota warn" style="margin: 10px 0 0;">Si no la copias ahora, no se vuelve a mostrar: la API solo guarda su huella.</p>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------ lista de claves -->
+    <div class="tarjeta ancha">
+      <div class="tarjeta-cab">
+        <h2>Claves creadas</h2>
+        <button type="button" id="recargar-claves" class="chico" title="Volver a pedir la lista de claves">Actualizar</button>
+      </div>
+      <p class="nota">La lista nunca muestra el secreto: solo el prefijo, para distinguir una clave de otra.</p>
+      <span id="msg-claves" class="aviso"></span>
+      <div class="tabla-wrap">
+        <table class="tabla-claves">
+          <thead>
+            <tr><th>Nombre</th><th>Prefijo</th><th>Creada</th><th>Caduca</th><th>Estado</th><th></th></tr>
+          </thead>
+          <tbody id="claves-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<script>
+// ---------------------------------------------------------------- estado
+const CLAVE_HILO = "webchat.hilo";
+const CLAVE_MODO = "webchat.modo"; // "session" | "guest": se persiste en localStorage
+const $ = (s) => document.querySelector(s);
+const hilo = $("#hilo");
+let hiloId = localStorage.getItem(CLAVE_HILO) || ("web-" + Math.random().toString(36).slice(2, 10));
+localStorage.setItem(CLAVE_HILO, hiloId);
+let modoSel = localStorage.getItem(CLAVE_MODO) === "guest" ? "guest" : "session";
+// Identidad que atendio REALMENTE el ultimo turno (lo dice la API en
+// meta_engine_mode). Sirve para no hacer pasar por tu cuenta un turno que
+// respondio el invitado, o al reves.
+let ultimoModo = null;
+let historial = [];          // mensajes OpenAI (system no hace falta: meta lo pone el cliente)
+let ocupada = false;
+
+// ---------------------------------------------------------------- estado de la API
+async function refrescarEstado() {
+  const badge = $("#estado");
+  try {
+    const r = await fetch("/api/estado");
+    const d = await r.json();
+    if (!d.ok) {
+      badge.className = "badge err";
+      badge.textContent = "API caída: " + (d.error || d.raw?.status || "sin respuesta");
+      return;
+    }
+    // La API tiene un modo POR DEFECTO y ademas acepta el modo por peticion
+    // ("engine_mode"). Se muestran las tres cosas sin maquillar nada: el
+    // defecto del back, lo que elegiste y quien atendio el ultimo turno.
+    const elegido = modoSel === "guest" ? "sin sesión" : "con sesión";
+    badge.title = `API ${d.api} · modo por defecto ${d.modo} · salas ${d.salas ?? "-"}` +
+      ` · modos: ${(d.modos_disponibles || ["session", "guest"]).join(", ")}` +
+      ` · elegido: ${elegido}`;
+    if (ultimoModo && ultimoModo !== modoSel) {
+      badge.className = "badge warn";
+      badge.textContent = `Último turno: ${ultimoModo === "guest" ? "invitado" : "tu cuenta"} (elegiste ${elegido})`;
+    } else {
+      badge.className = "badge ok";
+      badge.textContent = `${d.identidad} · ${elegido}` + (d.user_id ? ` (${d.user_id})` : "");
+    }
+  } catch (e) {
+    badge.className = "badge err";
+    badge.textContent = "API inaccesible";
+  }
+}
+refrescarEstado();
+setInterval(refrescarEstado, 15000);
+
+// ---------------------------------------------------------------- archivos
+//
+// Meta puede producir archivos (pdf, zip, scripts) en su sandbox. Por defecto
+// la API NO guarda copia: traspasa la URL de descarga de meta y el cliente
+// baja DIRECTO de meta. Los archivos que la API genera ella (el espejo del
+// codigo de meta) se sirven en /v1/media. Si NO se pudo conseguir ninguno, lo
+// dice en meta_files_pendientes + meta_files_error: aqui se avisa, porque un
+// turno en silencio hace creer que no paso nada.
+function urlConModo(u) {
+  if (!u) return u;
+  // Las urls de meta son absolutas y ajenas a la API: se pasan tal cual (el
+  // visor de meta sirve HTML; los bytes salen con download=1, que ya viene
+  // en la url que entrega la API).
+  if (/^https?:\/\//i.test(u)) return u;
+  return u + (u.includes("?") ? "&" : "?") + "modo=" + encodeURIComponent(modoSel);
+}
+
+function pintarArchivos(cuerpo, obj) {
+  for (const sel of [".archivos", ".aviso-archivos"]) {
+    const previo = cuerpo.querySelector(sel);
+    if (previo) previo.remove();
+  }
+  const archivos = obj.meta_files || [];
+  const zip = obj.meta_zip;
+  const pendientes = obj.meta_files_pendientes || [];
+  const error = obj.meta_files_error;
+  if (!archivos.length && !zip && !pendientes.length && !error) return;
+
+  const enlaces = archivos.slice();
+  if (zip && !enlaces.some((a) => a && a.nombre === zip.nombre)) enlaces.push(zip);
+  if (enlaces.length) {
+    const caja = document.createElement("div");
+    caja.className = "archivos";
+    for (const a of enlaces) {
+      if (!a || !a.url) continue;
+      const link = document.createElement("a");
+      link.href = urlConModo(a.url);
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = `📄 ${a.nombre || "archivo"}`;
+      if (a.bytes != null) {
+        const tam = document.createElement("span");
+        tam.className = "tam";
+        tam.textContent = peso(a.bytes);
+        link.appendChild(tam);
+      }
+      caja.appendChild(link);
+    }
+    if (caja.childNodes.length) cuerpo.appendChild(caja);
+  }
+
+  if (pendientes.length || error) {
+    const nombres = pendientes.map((p) => (p && (p.nombre || p.ruta))).filter(Boolean);
+    const aviso = document.createElement("div");
+    aviso.className = "aviso-archivos";
+    aviso.textContent =
+      (nombres.length
+        ? `Meta dijo que generó ${nombres.join(", ")}`
+        : "Meta generó un archivo") +
+      " pero no se pudo recuperar en este entorno: " +
+      (error || "el archivo no está disponible para descargarlo") + ".";
+    cuerpo.appendChild(aviso);
+  }
+}
+
+// ---------------------------------------------------------------- UI
+function alinear(altura) {
+  const t = $("#txt");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 180) + "px";
+}
+$("#txt").addEventListener("input", () => alinear());
+$("#txt").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("#form").requestSubmit(); }
+});
+
+function quitarVacio() { const v = $("#vacio"); if (v) v.remove(); }
+
+function agregarMensaje(clase, quien, html = "", meta = "") {
+  quitarVacio();
+  const div = document.createElement("div");
+  div.className = "msg " + clase;
+  div.innerHTML = `<div class="who"></div><div><div class="cuerpo"></div><div class="meta"></div></div>`;
+  div.querySelector(".who").textContent = quien;
+  div.querySelector(".cuerpo").innerHTML = html;
+  div.querySelector(".meta").textContent = meta;
+  hilo.appendChild(div);
+  hilo.scrollTop = hilo.scrollHeight;
+  return div;
+}
+
+function escapado(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Markdown muy simple: code blocks, inline code, negrita, listas, IMAGENES y
+// URLs clicables.
+//
+// Las imagenes generadas llegan como ![texto](url) y ANTES se quedaban como
+// texto crudo: no se veian y la url no se podia abrir. Ahora salen en
+// miniatura y el clic abre la pestana nueva (target=_blank).
+//
+// Todo lo que se inserta aqui va a un placeholder \0X n \0 ANTES del linkify,
+// para que la transformacion de URLs no toque el HTML ya generado.
+function md(texto) {
+  let t = escapado(texto);
+  const bloques = [];
+  const imagenes = [];
+
+  // 1) code blocks: quedan protegidos de todo lo que sigue.
+  t = t.replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) => {
+    bloques.push(`<pre><code>${code.replace(/\n$/, "")}</code></pre>`);
+    return `\0B${bloques.length - 1}\0`;
+  });
+
+  // 2) imagenes ![alt](url) -> miniatura + enlace a pestana nueva.
+  t = t.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_, alt, url) => {
+    const seg = url.replace(/"/g, "&quot;");
+    imagenes.push(
+      `<a class="img-link" href="${seg}" target="_blank" rel="noopener" title="Abrir en otra pestaña">` +
+      `<img class="generada" src="${seg}" alt="${alt || "imagen generada"}" loading="lazy">` +
+      `</a><a class="pie-img" href="${seg}" target="_blank" rel="noopener">${seg}</a>`
+    );
+    return `\0I${imagenes.length - 1}\0`;
+  });
+
+  // 3) inline code, negrita, listas.
+  t = t.replace(/`([^`\n]+)`/g, "<code class='inl'>$1</code>");
+  t = t.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  // 3b) Negrita SIN cerrar: meta deja "**texto" al final cuando el archivo
+  // va en otra seccion (p.ej. "Listo, tu documento Word generado ✅\n\n**📝").
+  // Sin esto, el "**" se ve crudo en pantalla.
+  t = t.replace(/\*\*([^*\n]+)$/gm, "<strong>$1</strong>");
+  t = t.replace(/^(\s*)[-*] /gm, "$1• ");
+
+  // 4) URLs sueltas -> enlaces clicables. Solo http/https: una ruta relativa
+  //    suelta (sin ![...]) no tiene por que ser navegable.
+  t = t.replace(/(^|[\s(])(https?:\/\/[^\s<>"']+)/g, (m, pre, url) => {
+    const limpio = url.replace(/[.,;:!?]+$/, "");
+    const resto = url.slice(limpio.length);
+    return `${pre}<a href="${limpio}" target="_blank" rel="noopener">${limpio}</a>${resto}`;
+  });
+
+  // 5) se restauran los placeholders.
+  t = t.replace(/\0B(\d+)\0/g, (_, i) => bloques[Number(i)]);
+  t = t.replace(/\0I(\d+)\0/g, (_, i) => imagenes[Number(i)]);
+  return t;
+}
+
+// ---------------------------------------------------------------- envio
+$("#form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (ocupada) return;
+  const campo = $("#txt");
+  const texto = campo.value.trim();
+  if (!texto) return;
+  campo.value = "";
+  alinear();
+  ocupada = true;
+  $("#enviar").disabled = true;
+
+  // Solo se mandan adjuntos validos: un chip en rojo (tipo no admitido,
+  // demasiado grande) no viaja, y se avisa en la barra inferior.
+  const validos = adjuntosPendientes.filter((a) => !a.mal);
+  const descartados = adjuntosPendientes.length - validos.length;
+  const adjuntos = validos.splice(0);
+  adjuntosPendientes = adjuntosPendientes.filter((a) => a.mal);
+  pintarChips();
+  if (descartados) {
+    $("#info").textContent = `${descartados} archivo(s) no se enviaron (mira los chips en rojo)`;
+  }
+
+  const partes = [{ type: "text", text: texto }];
+  for (const a of adjuntos) partes.push(parteDe(a));
+  const contenido = partes.length > 1 ? partes : texto;
+
+  historial.push({ role: "user", content: contenido });
+  const mio = agregarMensaje("user", "Tú", escapado(texto).replace(/\n/g, "<br>"));
+  for (const a of adjuntos) {
+    if (MIME_IMAGEN.test(a.mime)) {
+      const img = document.createElement("img");
+      img.className = "adj"; img.src = a.dataUrl;
+      mio.querySelector(".cuerpo").appendChild(img);
+    } else {
+      // Video o documento: no se puede incrustar, se muestra como fichero
+      // con su nombre y peso (el backend si lo sube y meta lo recibe).
+      const chip = document.createElement("a");
+      chip.className = "adj-otro";
+      chip.textContent = `${MIME_VIDEO.test(a.mime) ? "🎬" : "📄"} ${a.name} · ${peso(a.bytes)}`;
+      mio.querySelector(".cuerpo").appendChild(chip);
+    }
+  }
+
+  const respuesta = agregarMensaje("bot", "Meta", "", "pensando…");
+  const cuerpo = respuesta.querySelector(".cuerpo");
+  const meta = respuesta.querySelector(".meta");
+  let textoAcumulado = "";
+  let latido = null;
+  const tic = setInterval(() => {
+    $("#latido").textContent = "sigue pensando… " + Math.round(performance.now() / 1000) + "s";
+  }, 1000);
+
+  try {
+    const r = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mensajes: historial, user: hiloId, model: "meta-ai", modo: modoSel }),
+    });
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+
+    const lector = r.body.getReader();
+    const dec = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { done, value } = await lector.read();
+      if (done) break;
+      buffer += dec.decode(value, { stream: true });
+      let corte;
+      while ((corte = buffer.indexOf("\n\n")) >= 0) {
+        const bruto = buffer.slice(0, corte);
+        buffer = buffer.slice(corte + 2);
+        for (const linea of bruto.split("\n")) {
+          if (!linea.startsWith("data: ")) continue;
+          const cuerpoLinea = linea.slice(6);
+          if (cuerpoLinea === "[DONE]") continue;
+          let obj;
+          try { obj = JSON.parse(cuerpoLinea); } catch { continue; }
+          if (obj.error) { respuesta.classList.add("error"); cuerpo.textContent = obj.error.message; meta.textContent = "error"; continue; }
+          const ch = obj.choices?.[0];
+          const delta = ch?.delta?.content;
+          if (delta) {
+            textoAcumulado += delta;
+            cuerpo.innerHTML = md(textoAcumulado);
+            hilo.scrollTop = hilo.scrollHeight;
+          }
+          if (ch?.finish_reason) meta.textContent = "fin: " + ch.finish_reason;
+          if (obj.meta_elapsed_ms != null) meta.textContent += ` · ${(obj.meta_elapsed_ms / 1000).toFixed(1)} s`;
+          if (obj.meta_conversation_id) $("#info").textContent = "hilo meta: " + obj.meta_conversation_id.slice(0, 8);
+          // Las imagenes llegan en dos pasadas: primero como ![imagen](url)
+          // (URL de meta, que CADUCA) y en el chunk final como meta_images con
+          // la copia local en /v1/media. Se cambia la url por la local para
+          // que la vista previa y el enlace sigan vivos despues de cerrar.
+          if (obj.meta_images?.length) {
+            for (const im of obj.meta_images) {
+              if (!im?.url || !im.local) continue;
+              // La copia local se pide a la API que la genero: se le agrega
+              // ?modo=<elegido> para que el proxy la busque en el origen correcto.
+              const local = im.local + (im.local.includes("?") ? "&" : "?") + "modo=" + encodeURIComponent(modoSel);
+              textoAcumulado = textoAcumulado.split(im.url).join(local);
+            }
+            cuerpo.innerHTML = md(textoAcumulado);
+          }
+          // Archivos que meta produjo (pdf, zip, scripts): la API los reproduce
+          // en /v1/media y los manda en meta_files / meta_zip. Si no se pudieron
+          // reproducir, se avisa en vez de dejar el turno mudo.
+          // Va DESPUES del bloque de imagenes: ese bloque reescribe el
+          // innerHTML del cuerpo y se llevaria por delante lo pintado aqui.
+          if (obj.meta_files?.length || obj.meta_zip || obj.meta_files_pendientes?.length || obj.meta_files_error) {
+            pintarArchivos(cuerpo, obj);
+          }
+          // Que identidad atendio este turno (session = tu cuenta, guest = invitado)
+          if (obj.meta_engine_mode) {
+            ultimoModo = obj.meta_engine_mode;
+            refrescarEstado();
+          }
+        }
+      }
+    }
+    if (textoAcumulado) historial.push({ role: "assistant", content: textoAcumulado });
+    else if (!respuesta.classList.contains("error") && !cuerpo.querySelector(".archivos")) {
+      // Sin texto pero con archivos, NO es un turno vacio: el archivo es la
+      // respuesta. Solo se avisa cuando no hay nada que mostrar.
+      respuesta.classList.add("error");
+      cuerpo.textContent = "Meta no devolvió texto (turno vacío).";
+      meta.textContent = "sin contenido";
+    }
+  } catch (err) {
+    respuesta.classList.add("error");
+    cuerpo.textContent = "Falló la llamada a la API: " + err.message;
+    meta.textContent = "error de red";
+  } finally {
+    clearInterval(tic);
+    $("#latido").textContent = "";
+    ocupada = false;
+    $("#enviar").disabled = false;
+    campo.focus();
+  }
+});
+
+// ---------------------------------------------------------------- adjuntos
+//
+// El backend acepta por el MISMO canal: imagenes (PNG/JPG/GIF/WEBP), video
+// (MP4/MOV) y documentos (PDF/TXT) — ver MIME_BY_EXT en engine/upload.mjs.
+// Antes el input decia accept="image/*" y el filtro tiraba todo lo que no
+// fuera imagen, asi que "adjuntar multiples archivos" no funcionaba.
+const MIME_IMAGEN = /^image\/(png|jpe?g|gif|webp)$/i;
+const MIME_VIDEO = /^video\/(mp4|quicktime)$/i;
+const MIME_DOCTO = /^(application\/pdf|text\/plain)$/i;
+const MAX_ADJUNTO = 20 * 1024 * 1024; // el backend topa en META_MAX_IMAGE_BYTES
+
+let adjuntosPendientes = [];
+
+/** Tipo de parte OpenAI que le corresponde a un archivo. */
+function parteDe(a) {
+  if (MIME_IMAGEN.test(a.mime)) return { type: "image_url", image_url: { url: a.dataUrl } };
+  if (MIME_VIDEO.test(a.mime)) return { type: "video_url", video_url: { url: a.dataUrl } };
+  return { type: "document_url", document_url: { url: a.dataUrl } };
+}
+
+function peso(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
+}
+
+/** Repinta la fila de chips con los adjuntos pendientes (y sus miniaturas). */
+function pintarChips() {
+  const caja = $("#chips");
+  caja.innerHTML = "";
+  for (const [i, a] of adjuntosPendientes.entries()) {
+    const chip = document.createElement("div");
+    chip.className = "chip" + (a.mal ? " bad" : "");
+    if (MIME_IMAGEN.test(a.mime)) {
+      const img = document.createElement("img");
+      img.src = a.dataUrl; img.alt = "";
+      chip.appendChild(img);
+    } else {
+      const emoji = document.createElement("span");
+      emoji.textContent = MIME_VIDEO.test(a.mime) ? "🎬" : "📄";
+      emoji.style.fontSize = "20px";
+      chip.appendChild(emoji);
+    }
+    const cajaTexto = document.createElement("div");
+    cajaTexto.style.minWidth = "0";
+    const nom = document.createElement("div");
+    nom.className = "nombre"; nom.textContent = a.name; nom.title = a.name;
+    const info = document.createElement("div");
+    info.className = "peso";
+    info.textContent = a.mal ? a.mal : `${a.mime.split("/")[1] || "?"} · ${peso(a.bytes)}`;
+    cajaTexto.appendChild(nom); cajaTexto.appendChild(info);
+    chip.appendChild(cajaTexto);
+
+    const quitar = document.createElement("button");
+    quitar.type = "button"; quitar.className = "quitar";
+    quitar.textContent = "×"; quitar.title = "Quitar";
+    quitar.onclick = () => { adjuntosPendientes.splice(i, 1); pintarChips(); };
+    chip.appendChild(quitar);
+    caja.appendChild(chip);
+  }
+  const n = adjuntosPendientes.length;
+  $("#info").textContent = n
+    ? `${n} archivo(s) listo(s) para enviar`
+    : (cargaPendiente ? "cargando…" : "—");
+}
+
+let cargaPendiente = false;
+const inputArchivo = document.createElement("input");
+inputArchivo.type = "file";
+// Sin accept: el usuario elige imagen, video o documento.
+inputArchivo.multiple = true;
+inputArchivo.style.display = "none";
+document.body.appendChild(inputArchivo);
+inputArchivo.addEventListener("change", async () => {
+  const elegidos = [...inputArchivo.files];
+  inputArchivo.value = "";
+  if (!elegidos.length) return;
+  cargaPendiente = true; pintarChips();
+  for (const f of elegidos) {
+    // Ya elegido: no se tira en silencio, se muestra el chip en rojo con el motivo.
+    const mime = f.type || "application/octet-stream";
+    let mal = "";
+    if (!(MIME_IMAGEN.test(mime) || MIME_VIDEO.test(mime) || MIME_DOCTO.test(mime))) {
+      mal = `tipo ${mime.split("/")[1] || "?"} no admitido`;
+    } else if (f.size > MAX_ADJUNTO) {
+      mal = `pesa ${peso(f.size)} (max ${peso(MAX_ADJUNTO)})`;
+    }
+    const dataUrl = mal ? "" : await new Promise((res) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = () => res("");
+      fr.readAsDataURL(f);
+    });
+    if (!mal && !dataUrl) mal = "no se pudo leer";
+    adjuntosPendientes.push({ name: f.name, mime, bytes: f.size, dataUrl, mal });
+    pintarChips();
+  }
+  cargaPendiente = false;
+  pintarChips();
+});
+const botonImagen = document.createElement("button");
+botonImagen.type = "button";
+botonImagen.textContent = "📎";
+botonImagen.title = "Adjuntar archivos (imagen, video o documento)";
+botonImagen.onclick = () => inputArchivo.click();
+$("#form").insertBefore(botonImagen, $("#enviar"));
+
+// ---------------------------------------------------------------- conmutador de conexion
+//
+// Elegido en el header ("Con sesión" / "Sin sesión") y guardado en localStorage.
+// El modo elegido viaja en el body de /api/chat y en ?modo= de /v1/media.
+// En modo sin sesion el boton 📎 queda desactivado CON aviso visible (no en
+// silencio): los chips pendientes siguen ahi y se pueden quitar, pero no se
+// agregan archivos nuevos.
+function aplicarModo() {
+  $("#seg-sesion").classList.toggle("on", modoSel === "session");
+  $("#seg-guest").classList.toggle("on", modoSel === "guest");
+  const invitado = modoSel === "guest";
+  botonImagen.disabled = invitado;
+  botonImagen.title = invitado
+    ? "Adjuntos desactivados en modo sin sesión"
+    : "Adjuntar archivos (imagen, video o documento)";
+  $("#aviso-adj").textContent = invitado
+    ? "Sin sesión: no se pueden agregar archivos (los pendientes puedes quitarlos)."
+    : "";
+  refrescarEstado();
+}
+$("#seg-sesion").addEventListener("click", () => {
+  modoSel = "session";
+  localStorage.setItem(CLAVE_MODO, modoSel);
+  aplicarModo();
+});
+$("#seg-guest").addEventListener("click", () => {
+  modoSel = "guest";
+  localStorage.setItem(CLAVE_MODO, modoSel);
+  aplicarModo();
+});
+aplicarModo();
+
+// ---------------------------------------------------------------- limpiar canal
+// El "clear" limpia el canal: el id (hiloId) se mantiene y la API abre una
+// conversacion nueva en meta. Antes se inventaba un hiloId nuevo, lo que
+// dejaba la conversacion vieja en el historial de meta (duplicados).
+$("#nueva").addEventListener("click", async () => {
+  const boton = $("#nueva");
+  boton.disabled = true;
+  try {
+    const r = await fetch("/api/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user: hiloId, modo: modoSel }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d?.error?.message || `HTTP ${r.status}`);
+    historial = [];
+    hilo.innerHTML = '<div class="vacio" id="vacio">Canal limpio. Escribe para empezar.</div>';
+    $("#info").textContent = "—";
+  } catch (err) {
+    const badge = $("#estado");
+    badge.className = "badge err";
+    badge.textContent = "No se pudo limpiar el canal";
+    badge.title = String(err?.message || err);
+  } finally {
+    boton.disabled = false;
+  }
+});
+
+// ---------------------------------------------------------------- panel
+//
+// El panel es la vista de control de la API: ajustes en caliente y API keys.
+// El chat sigue igual: es la MISMA pagina con dos vistas (conmutador arriba).
+// Todo lo que se muestra viene de la API: si algo falla, se muestra el
+// mensaje real del back, nunca uno inventado.
+
+const CLAVE_VISTA = "webchat.vista";
+let vistaSel = localStorage.getItem(CLAVE_VISTA) === "panel" ? "panel" : "chat";
+
+// Que implica cada valor. El texto se muestra junto al selector para que la
+// eleccion se entienda sin adivinar.
+const AYUDA_STORAGE = {
+  url: "La API pasa la URL de descarga de Meta y no guarda copia del archivo (es el valor por defecto).",
+  local: "La API descarga el archivo y lo sirve desde /v1/media: ocupa espacio en el equipo, pero el enlace no caduca.",
+};
+const AYUDA_AUTH = {
+  abierta: "La API no pide credenciales: cualquiera que llegue a la URL puede usarla.",
+  "api-key": "La API exige una API key: las llamadas sin una clave válida reciben 401. El webchat usa su propia clave de servicio, así que el chat sigue funcionando.",
+};
+
+function formateaFecha(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  try {
+    return d.toLocaleString("es-CL", { dateStyle: "short", timeStyle: "short" });
+  } catch {
+    return d.toISOString();
+  }
+}
+
+function mensajeError(d, status) {
+  return d?.error?.message || `HTTP ${status}`;
+}
+
+function pintarAyuda() {
+  $("#ayuda-storage").textContent = AYUDA_STORAGE[$("#sel-storage").value] || "";
+  $("#ayuda-auth").textContent = AYUDA_AUTH[$("#sel-auth").value] || "";
+}
+
+function aplicarVista() {
+  const panel = vistaSel === "panel";
+  document.body.dataset.vista = vistaSel;
+  $("#vista-chat").hidden = panel;
+  $("#vista-panel").hidden = !panel;
+  $("#seg-chat").classList.toggle("on", !panel);
+  $("#seg-panel").classList.toggle("on", panel);
+  if (panel) {
+    cargarAjustes();
+    cargarClaves();
+  }
+}
+
+$("#seg-chat").addEventListener("click", () => {
+  vistaSel = "chat";
+  localStorage.setItem(CLAVE_VISTA, vistaSel);
+  aplicarVista();
+});
+$("#seg-panel").addEventListener("click", () => {
+  vistaSel = "panel";
+  localStorage.setItem(CLAVE_VISTA, vistaSel);
+  aplicarVista();
+});
+
+// ---------------------------------------------------------------- ajustes
+async function cargarAjustes() {
+  const msg = $("#msg-ajustes");
+  try {
+    const r = await fetch("/api/ajustes");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    $("#sel-storage").value = d.fileStorage || "url";
+    $("#sel-auth").value = d.auth || "abierta";
+    pintarAyuda();
+    const badge = $("#ajustes-estado");
+    badge.className = "badge ok";
+    badge.textContent = "cargado";
+    $("#ajustes-actualizado").textContent = d.actualizado
+      ? "Último cambio guardado: " + formateaFecha(d.actualizado)
+      : "";
+    msg.className = "aviso";
+    msg.textContent = "";
+  } catch (e) {
+    const badge = $("#ajustes-estado");
+    badge.className = "badge err";
+    badge.textContent = "no se pudo leer";
+    msg.className = "aviso err";
+    msg.textContent = e.message || String(e);
+  }
+}
+
+$("#sel-storage").addEventListener("change", pintarAyuda);
+$("#sel-auth").addEventListener("change", pintarAyuda);
+
+$("#guardar-ajustes").addEventListener("click", async () => {
+  const boton = $("#guardar-ajustes");
+  const msg = $("#msg-ajustes");
+  boton.disabled = true;
+  msg.className = "aviso";
+  msg.textContent = "Guardando…";
+  try {
+    const r = await fetch("/api/ajustes", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileStorage: $("#sel-storage").value,
+        auth: $("#sel-auth").value,
+      }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    // La API devuelve el objeto COMPLETO ya aplicado: se refleja eso, no lo
+    // que el navegador creía.
+    $("#sel-storage").value = d.fileStorage || "url";
+    $("#sel-auth").value = d.auth || "abierta";
+    pintarAyuda();
+    const badge = $("#ajustes-estado");
+    badge.className = "badge ok";
+    badge.textContent = "guardado";
+    $("#ajustes-actualizado").textContent = d.actualizado
+      ? "Último cambio guardado: " + formateaFecha(d.actualizado)
+      : "";
+    msg.className = "aviso ok";
+    msg.textContent = "Ajustes guardados.";
+  } catch (e) {
+    msg.className = "aviso err";
+    msg.textContent = e.message || String(e);
+  } finally {
+    boton.disabled = false;
+  }
+});
+
+// ---------------------------------------------------------------- api keys
+function celda(texto, clase) {
+  const td = document.createElement("td");
+  td.textContent = texto;
+  if (clase) td.className = clase;
+  return td;
+}
+
+function pintarClaves(claves) {
+  const cuerpo = $("#claves-body");
+  cuerpo.innerHTML = "";
+  if (!claves.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.className = "vacio-panel";
+    td.textContent = "Todavía no hay claves.";
+    tr.appendChild(td);
+    cuerpo.appendChild(tr);
+    return;
+  }
+  for (const c of claves) {
+    const tr = document.createElement("tr");
+    tr.appendChild(celda(c.nombre || "—"));
+    tr.appendChild(celda(c.prefijo || "—", "mono"));
+    tr.appendChild(celda(formateaFecha(c.creado)));
+    tr.appendChild(celda(c.expira ? formateaFecha(c.expira) : "sin caducidad"));
+
+    // Estado: lo dice la API (revocada) o la fecha real de caducidad.
+    const tdEstado = document.createElement("td");
+    const pill = document.createElement("span");
+    const vencida = c.expira && new Date(c.expira).getTime() <= Date.now();
+    if (c.revocado) {
+      pill.className = "pill revocada";
+      pill.textContent = "revocada";
+    } else if (vencida) {
+      pill.className = "pill caducada";
+      pill.textContent = "caducada";
+      pill.title = "Ya pasó su fecha de caducidad: la API no la acepta.";
+    } else {
+      pill.className = "pill activa";
+      pill.textContent = "activa";
+    }
+    tdEstado.appendChild(pill);
+    tr.appendChild(tdEstado);
+
+    const tdAccion = document.createElement("td");
+    const boton = document.createElement("button");
+    boton.type = "button";
+    boton.className = "boton-chico";
+    boton.textContent = "Revocar";
+    boton.disabled = !!c.revocado;
+    boton.addEventListener("click", () => revocarClave(c, boton));
+    tdAccion.appendChild(boton);
+    tr.appendChild(tdAccion);
+
+    cuerpo.appendChild(tr);
+  }
+}
+
+// silencioso = true: no borra el mensaje de la ultima accion.
+async function cargarClaves(silencioso = false) {
+  const msg = $("#msg-claves");
+  try {
+    const r = await fetch("/api/keys");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    pintarClaves(Array.isArray(d.claves) ? d.claves : []);
+    if (!silencioso) {
+      msg.className = "aviso";
+      msg.textContent = "";
+    }
+  } catch (e) {
+    const cuerpo = $("#claves-body");
+    cuerpo.innerHTML = "";
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.className = "vacio-panel";
+    td.textContent = "No se pudo cargar la lista de claves: " + (e.message || String(e));
+    tr.appendChild(td);
+    cuerpo.appendChild(tr);
+    msg.className = "aviso err";
+    msg.textContent = e.message || String(e);
+  }
+}
+
+$("#recargar-claves").addEventListener("click", () => cargarClaves());
+
+async function revocarClave(c, boton) {
+  const msg = $("#msg-claves");
+  const nombre = c.nombre || c.prefijo || c.id;
+  if (!window.confirm(`¿Revocar la clave "${nombre}"? Deja de servir de inmediato y no se puede deshacer.`)) return;
+  boton.disabled = true;
+  try {
+    const r = await fetch(`/api/keys/${encodeURIComponent(c.id)}`, { method: "DELETE" });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    await cargarClaves(true);
+    msg.className = "aviso ok";
+    msg.textContent = `Clave "${nombre}" revocada.`;
+  } catch (e) {
+    msg.className = "aviso err";
+    msg.textContent = e.message || String(e);
+    boton.disabled = false;
+  }
+}
+
+$("#form-key").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const boton = $("#generar-clave");
+  const msg = $("#msg-crear");
+  const nombre = $("#key-nombre").value.trim();
+  if (!nombre) {
+    msg.className = "aviso err";
+    msg.textContent = "Ponle un nombre a la clave para reconocerla después.";
+    $("#key-nombre").focus();
+    return;
+  }
+  const dias = $("#key-dias").value;
+  boton.disabled = true;
+  msg.className = "aviso";
+  msg.textContent = "Generando…";
+  try {
+    const r = await fetch("/api/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // "" = sin caducidad -> null. Un numero = caduca en esa cantidad de dias.
+      body: JSON.stringify({ nombre, dias: dias === "" ? null : Number(dias) }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    if (!d.clave) throw new Error("la API no devolvió el secreto de la clave");
+    mostrarSecreto(d.clave, d.nombre, d.expira);
+    $("#key-nombre").value = "";
+    msg.className = "aviso ok";
+    msg.textContent = "Clave creada.";
+    cargarClaves(true);
+  } catch (err) {
+    msg.className = "aviso err";
+    msg.textContent = err.message || String(err);
+  } finally {
+    boton.disabled = false;
+  }
+});
+
+// El secreto sale de la API UNA sola vez. Se muestra en pantalla y no se
+// guarda en ningun sitio (ni en localStorage): si cierras la pagina sin
+// copiarlo, se pierde.
+function mostrarSecreto(clave, nombre, expira) {
+  $("#secreto-valor").textContent = clave;
+  $("#secreto").hidden = false;
+  $("#msg-copiar").className = "aviso";
+  $("#msg-copiar").textContent = "";
+  const cuando = expira ? "Caduca: " + formateaFecha(expira) : "Sin caducidad";
+  $("#secreto").querySelector(".badge").textContent = `se muestra una sola vez · ${cuando}`;
+  if (nombre) $("#secreto-valor").title = nombre;
+}
+
+$("#ocultar-secreto").addEventListener("click", () => {
+  $("#secreto").hidden = true;
+  $("#secreto-valor").textContent = "";
+});
+
+// Copiar con fallback: navigator.clipboard no existe en contexto no seguro
+// (el webchat se sirve por http), y ahi document.execCommand salva.
+async function copiarTexto(texto) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(texto);
+      return true;
+    }
+  } catch {
+    // se intenta el fallback
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = texto;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+$("#copiar-secreto").addEventListener("click", async () => {
+  const msg = $("#msg-copiar");
+  const clave = $("#secreto-valor").textContent;
+  if (!clave) return;
+  const ok = await copiarTexto(clave);
+  if (ok) {
+    msg.className = "aviso ok";
+    msg.textContent = "Clave copiada al portapapeles.";
+  } else {
+    msg.className = "aviso err";
+    msg.textContent = "No se pudo copiar: selecciona el texto y cópialo a mano.";
+  }
+});
+
+// Estado inicial de la vista.
+aplicarVista();
+pintarAyuda();
+</script>
+</body>
+</html>
