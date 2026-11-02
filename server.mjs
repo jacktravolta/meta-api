@@ -38,12 +38,16 @@ import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { writeFileSync, mkdirSync, readFileSync, unlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, relative, extname, sep } from "node:path";
+import { join, relative, extname, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgentLoop } from "./agent/loop.js";
-import { toolsContract, parseToolCalls, toOpenAiToolCalls, formatToolResults, systemPrompt } from "./engine/toolcall.mjs";
+import { toolsContract, parseToolCalls, toOpenAiToolCalls, systemPrompt } from "./engine/toolcall.mjs";
+import { construirPrompt } from "./engine/prompt.mjs";
+import { dumpActivo, volcar } from "./engine/dump.mjs";
 import { extraerCodigo } from "./engine/codigo.mjs";
-import { materializar } from "./engine/artifacts.mjs";
+import { materializar, detectarTipo } from "./engine/artifacts.mjs";
+import { ajustesActuales, guardarAjustes } from "./engine/ajustes.mjs";
+import { crearClave, listarClaves, revocarClave, verificarClave, esClaveServicioWebchat, claveServicioWebchat } from "./engine/apikeys.mjs";
 import { promptTokens, completionTokens, registrar, consulta as consultaUsage } from "./engine/usage.mjs";
 import { uploadAll, toFile } from "./engine/upload.mjs";
 import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
@@ -66,6 +70,21 @@ if (NODE_MAJOR < 22) {
 }
 
 const MEDIA_DIR = join(import.meta.dirname, "engine", ".media");
+// Tipo real de cada archivo servido: sin esto, un CSV o un PDF llegan al
+// navegador como application/octet-stream y no se pueden previsualizar.
+const MIME_MEDIA = {
+  webp: "image/webp", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", svg: "image/svg+xml",
+  pdf: "application/pdf",
+  csv: "text/csv; charset=utf-8", json: "application/json",
+  txt: "text/plain; charset=utf-8", md: "text/markdown; charset=utf-8",
+  html: "text/html; charset=utf-8",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xls: "application/vnd.ms-excel",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  zip: "application/zip",
+  mp3: "audio/mpeg", wav: "audio/wav", mp4: "video/mp4",
+};
 const PORT = Number(process.env.META_API_PORT || 8055);
 const HOST = process.env.META_API_HOST || "127.0.0.1";
 const CHROME = process.env.META_CHROME || "/usr/bin/google-chrome-beta";
@@ -116,28 +135,69 @@ const ENGINE_MODE = String(process.env.META_ENGINE_MODE || "session").toLowerCas
 // puerto CDP del navegador con la sesion de meta (solo para recapturar el
 // token cuando caduca; no se usa para conversar).
 const SESSION_CDP_PORT = Number(process.env.META_SESSION_CDP || 9298);
-let metaEngine = null; // se crea lazily en el primer request
+// Un motor POR MODO: "session" (tu cuenta) y "guest" (invitado) conviven en
+// el mismo proceso. Cada uno cachea sus propias credenciales (this.creds) y su
+// identidad (this.auth), asi que NO se puede reutilizar una sola instancia y
+// mutarle el mode: dos peticiones concurrentes se pisarian la identidad.
+const motores = new Map();
+
+/**
+ * Modo del motor para una peticion: "session" | "guest".
+ *
+ * Sin parametro (o con uno desconocido) se usa ENGINE_MODE, que por defecto es
+ * "session". Nunca se inventa un modo que no exista.
+ */
+function normalizarModo(raw) {
+  const m = String(raw ?? "").toLowerCase();
+  if (m === "guest" || m === "session") return m;
+  return ENGINE_MODE;
+}
 
 /** Credenciales del motor (para subir adjuntos). No se loguean. */
-async function metaEngineCreds() {
-	const engine = await getMetaEngine();
+async function metaEngineCreds(mode = ENGINE_MODE) {
+	const engine = await getMetaEngine(mode);
 	return await engine.credentials();
 }
 
-async function getMetaEngine() {
-  if (metaEngine) return metaEngine;
+async function getMetaEngine(mode = ENGINE_MODE) {
+  const m = normalizarModo(mode);
+  const existente = motores.get(m);
+  if (existente) return existente;
   const { MetaEngine } = await import("./engine/broker-engine.mjs");
-  metaEngine = new MetaEngine({
-    mode: ENGINE_MODE,
+  const engine = new MetaEngine({
+    mode: m,
     cdpPort: SESSION_CDP_PORT,
     // temporizadores: meta responde en 3-6 s; si no responde, se corta con un
-    // error claro en vez de dejar al cliente colgado.
-    idleMs: Number(process.env.META_IDLE_MS || 45_000),
-    deadlineMs: Number(process.env.META_TURN_DEADLINE_MS || 75_000),
-    askTimeoutMs: Number(process.env.META_ASK_TIMEOUT_MS || 120_000),
+    // error claro en vez de dejar al cliente colgado. Un turno que genera
+    // artefactos (una presentacion, por ejemplo) puede pensar mas de un minuto:
+    // con el deadline corto se cortaba en 504 y el turno se perdia (y el reset
+    // del hilo dejaba otro duplicado en el historial de meta).
+    //
+    // idleMs: NO es solo "cuanto se espera el primer frame": el gateway
+    // re-arma la espera en cada frame y corta el turno si pasa este tiempo
+    // SIN frames. Medido (2026-11-02): una presentacion deja a meta pensando
+    // mas de 2 minutos en silencio -> con idle 45 s (y luego 120 s) el turno
+    // moria con "stream sin frames por ...ms (meta se quedo pensando)" aunque
+    // el deadline fuera de 3 minutos. Al REINTENTAR, el broker rehace el hilo
+    // en otra conversacion y el sandbox de meta (con los archivos ya
+    // generados) se pierde: el turno responde pero el archivo no llega.
+    // Por eso el idle va IGUAL al deadline: el tope del turno es el deadline,
+    // no un silencio intermedio.
+    //
+    // Medido (2026-11-02): una presentacion COMPLETA (2 graficos + pptx) dejo a
+    // meta pensando mas de 300 s seguidos -> con deadline 300 s el turno se
+    // cortaba y el reintento perdia el sandbox (y el archivo). Por eso:
+    //   deadline 600 s  -> tope de un turno (10 min)
+    //   idle     600 s  -> igual al deadline: manda el deadline
+    //   ask     900 s  -> presupuesto TOTAL (turno + reintento); al reintento
+    //                      le quedan ~300 s para rehacer el hilo
+    idleMs: Number(process.env.META_IDLE_MS || 600_000),
+    deadlineMs: Number(process.env.META_TURN_DEADLINE_MS || 600_000),
+    askTimeoutMs: Number(process.env.META_ASK_TIMEOUT_MS || 900_000),
   });
-  log(`motor protocol-first listo (modo ${ENGINE_MODE}, sin navegador en runtime)`);
-  return metaEngine;
+  motores.set(m, engine);
+  log(`motor protocol-first listo (modo ${m}, sin navegador en runtime)`);
+  return engine;
 }
 function resolveMode(raw) {
   const m = String(raw || "").toLowerCase();
@@ -169,6 +229,23 @@ const CONTEXT_SEED_CHARS = Number(process.env.META_CONTEXT_SEED_CHARS || 25000);
 // asi el prompt no entra, el motor lo parte en varios turnos del mismo hilo.
 const MAX_SYSTEM_CHARS = Number(process.env.META_MAX_SYSTEM_CHARS || 8000);
 
+// Tope del historial que se manda a meta (se conserva lo mas RECIENTE: lo
+// antiguo ya esta en el hilo de meta y es lo que menos pesa). Con 0 = sin tope.
+const MAX_HISTORY_CHARS = Number(process.env.META_MAX_HISTORY_CHARS || 120_000);
+
+// Reglas de entrega de archivos para los clientes que NO mandan tools (el
+// webchat, por ejemplo): sin ellas meta usa su herramienta interna de
+// documentos/presentaciones, que crea el archivo en la nube de meta y NO
+// manda ni bytes, ni script, ni url de descarga. El cliente ve entonces un
+// turno que dice "PPT generado" y sin archivo (medido 2026-11-02).
+//
+// Con estas reglas meta entrega el CONTENIDO (texto) o el CODIGO que produce
+// el archivo (binario), que es lo que esta API sabe materializar y servir.
+const REGLAS_ARCHIVOS = `[REGLAS DE ENTREGA DE ARCHIVOS]
+- Si generas un archivo de TEXTO (html, txt, md, csv, json, xml): entrega su contenido COMPLETO dentro de un bloque de codigo con su lenguaje, en una sola respuesta.
+- Si generas un archivo BINARIO (pptx, docx, xlsx, pdf, zip): entrega el archivo DESCARGABLE (con su enlace) o, si no puedes, el CODIGO PYTHON que lo genera (python-pptx, python-docx, openpyxl, reportlab) y el nombre del archivo.
+- No digas que generaste un archivo si no entregaste su contenido, su enlace o el codigo que lo produce.`;
+
 // Recorta un texto largo dejando claro que se perdio algo. El prompt de
 // sistema de opencode (AGENTS.md + skills) puede pesar 30 KB y el frame del
 // gateway tope 64 KB.
@@ -197,6 +274,57 @@ function claveAutomatica(messages) {
 	}
 }
 
+// ---- Identidad del canal ------------------------------------------------------
+// El canal se identifica por USUARIO + PROYECTO (no por un hash del mensaje):
+// asi el hilo se retoma SIEMPRE en la misma conversacion de meta (se conserva
+// la memoria) y no se duplican las conversaciones en su historial.
+function canalIdDe(usuario, proyecto) {
+  const u = String(usuario ?? "").trim();
+  const p = String(proyecto ?? "").trim();
+  if (!u && !p) return "";
+  return `${u || "anon"}${p ? "_" + p : ""}`;
+}
+
+// Nombre de carpeta seguro para un id de canal (filesystem + URL).
+function carpetaDe(canalId) {
+  return String(canalId ?? "").replace(/[^\w.-]+/g, "_").slice(0, 120) || "canal";
+}
+
+// Storage del canal: engine/.media/<canalId>/. Los archivos que genera meta
+// quedan en <canalId>/archivos/<turnoId>/ (una carpeta por turno) y se sirven
+// en /v1/media/<canalId>/archivos/<turnoId>/<archivo>.
+function storageDe(canalId, conversationId) {
+  return canalId
+    ? join(MEDIA_DIR, carpetaDe(canalId))
+    : join(MEDIA_DIR, String(conversationId ?? "sin-conv"));
+}
+
+// Generacion del canal: el "clear" la sube y el siguiente turno abre una
+// conversacion NUEVA en meta para ese MISMO canal (el id no cambia: se limpia
+// el hilo, no se duplica). El broker solo cambia de conversacion cuando un
+// turno falla, y eso duplica el hilo en el historial de meta. La generacion
+// vive FUERA del store del broker: engine/.media/.canales/<canal>.<modo>.json
+// (carpeta oculta: el endpoint /v1/media no sirve segmentos que empiezan con ".").
+const CANALES_DIR = join(MEDIA_DIR, ".canales");
+function rutaCanal(canalId, modo) {
+  return join(CANALES_DIR, `${carpetaDe(canalId)}.${carpetaDe(modo)}.json`);
+}
+function generacionDe(canalId, modo) {
+  try {
+    return Number(JSON.parse(readFileSync(rutaCanal(canalId, modo), "utf8"))?.generacion) || 0;
+  } catch {
+    return 0;
+  }
+}
+function limpiarCanal(canalId, modo) {
+  const generacion = generacionDe(canalId, modo) + 1;
+  mkdirSync(CANALES_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(rutaCanal(canalId, modo), JSON.stringify({
+    canal: canalId, modo, generacion, actualizado: new Date().toISOString(),
+  }, null, 1), { mode: 0o600 });
+  return generacion;
+}
+
 // ---- Tokens (estimados) + registro -------------------------------------------
 // Meta no expone contador de tokens: se estima con el texto de entrada y de
 // salida, y se REGISTRA por sala para poder entregarlo cuando lo pidan.
@@ -218,8 +346,7 @@ function usageDe({ messages, tools, texto, bloques, conversationId, sala }) {
 	return uso;
 }
 
-// ---- Image attachments ------------------------------------------------------
-// OpenAI-style multimodal content: content is an ARRAY of parts, not a string.
+// ---- Image attachments ------------------------------------------------------// OpenAI-style multimodal content: content is an ARRAY of parts, not a string.
 // Stringifying it yields "[object Object],[object Object]", which is what Meta
 // used to receive when a screenshot was pasted into the chat.
 const STATE_HOME = process.env.XDG_STATE_HOME || join(homedir(), ".local", "state");
@@ -2050,10 +2177,105 @@ async function pump(worker) {
   persistPending();
 }
 
+// ---------------------------------------------------------------------------
+// Autenticacion por API key (modo auth = "api-key").
+//
+// La clave viaja en "Authorization: Bearer <clave>" o en "X-API-Key: <clave>".
+// Con auth = "abierta" (por defecto) NO cambia nada: todo sigue abierto.
+//
+// Exenciones cuando auth = "api-key":
+//   - GET /health            : nunca pide clave (es el probe de vida).
+//   - /v1/ajustes y /v1/keys*: se permiten con clave valida O desde loopback
+//     (el panel es local y vive en el mismo equipo).
+// El resto de la API (chat, media, jobs, agent, ...) exige clave valida, de
+// donde venga la peticion.
+//
+// ---------------------------------------------------------------------------
+
+// Peticion local: el panel (webchat/server.py) y el operador en el navegador
+// del mismo equipo.
+function esLoopback(req) {
+  const addr = String(req.socket?.remoteAddress || "");
+  return addr === "::1" || addr === "::ffff:127.0.0.1" || /^127\./.test(addr);
+}
+
+// Extrae la clave de los headers (Bearer o X-API-Key). Vacio si no viene.
+function clavePresentada(req) {
+  const auth = String(req.headers["authorization"] || "").trim();
+  if (auth) {
+    const m = /^bearer\s+(.+)$/i.exec(auth);
+    return (m ? m[1] : auth).trim();
+  }
+  const x = req.headers["x-api-key"];
+  if (typeof x === "string" && x.trim()) return x.trim();
+  return "";
+}
+
+// Rutas del panel: abiertas a las peticiones locales (el panel es local).
+function rutaDelPanel(pathname) {
+  return pathname === "/v1/ajustes" || pathname === "/v1/keys" || pathname.startsWith("/v1/keys/");
+}
+
+// Devuelve el mensaje de error si la peticion NO esta autorizada; null si
+// puede seguir. No revela si la clave existe, solo revoca o caduca.
+function authRechaza(req, pathname) {
+  if (ajustesActuales().auth !== "api-key") return null;   // modo abierto
+  if (pathname === "/health") return null;                   // /health siempre abierto
+  const clave = clavePresentada(req);
+  const valida = clave ? (verificarClave(clave) || esClaveServicioWebchat(clave)) : false;
+  if (valida) return null;
+  if (rutaDelPanel(pathname) && esLoopback(req)) return null;
+  return "Se requiere una clave de API valida. Envia la en 'Authorization: Bearer <clave>' o en 'X-API-Key: <clave>'.";
+}
+
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const body = await new Promise((resolve) => { let d = ""; req.on("data", (c) => (d += c)); req.on("end", () => resolve(d)); });
   const json = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj, null, 2)); };
+
+  // La autenticacion va ANTES de cualquier ruta: sin clave valida no se toca
+  // el motor (no se abre chrome, no se gasta un turno de meta).
+  const authMsg = authRechaza(req, url.pathname);
+  if (authMsg) return json(401, { error: { message: authMsg } });
+
+  // --- Panel: ajustes en caliente ------------------------------------------
+  if (req.method === "GET" && url.pathname === "/v1/ajustes") {
+    return json(200, ajustesActuales());
+  }
+  if (req.method === "PUT" && url.pathname === "/v1/ajustes") {
+    let p;
+    try { p = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "JSON invalido" } }); }
+    try {
+      const guardado = guardarAjustes(p);
+      // Al empezar a exigir claves, la clave interna del webchat tiene que
+      // existir: el proxy local la lee del disco (engine/.webchat-key) y la
+      // manda en X-API-Key.
+      if (guardado.auth === "api-key") claveServicioWebchat();
+      return json(200, guardado);
+    } catch (err) {
+      return json(400, { error: { message: String(err?.message || err) } });
+    }
+  }
+
+  // --- Panel: API keys ----------------------------------------------------
+  if (req.method === "GET" && url.pathname === "/v1/keys") {
+    return json(200, { claves: listarClaves() });
+  }
+  if (req.method === "POST" && url.pathname === "/v1/keys") {
+    let p;
+    try { p = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "JSON invalido" } }); }
+    try {
+      // El secreto se devuelve aqui y no se vuelve a mostrar.
+      return json(200, crearClave({ nombre: p.nombre, dias: p.dias ?? null }));
+    } catch (err) {
+      return json(400, { error: { message: String(err?.message || err) } });
+    }
+  }
+  if (req.method === "DELETE" && url.pathname.startsWith("/v1/keys/")) {
+    const id = decodeURIComponent(url.pathname.slice("/v1/keys/".length));
+    if (!revocarClave(id)) return json(404, { error: { message: "no existe esa clave" } });
+    return json(200, { ok: true });
+  }
 
   if (req.method === "GET" && url.pathname === "/health") {
     return json(200, {
@@ -2095,8 +2317,14 @@ async function route(req, res) {
       ...(ENGINE === "graphql" ? {
         motor: {
           modo: ENGINE_MODE,
-          ...(metaEngine?.authInfo?.() ?? { modo: ENGINE_MODE, modo_configurado: ENGINE_MODE }),
-          salas: metaEngine?.roomsList?.()?.length ?? 0,
+          ...(motores.get(ENGINE_MODE)?.authInfo?.() ?? { modo: ENGINE_MODE, modo_configurado: ENGINE_MODE }),
+          salas: motores.get(ENGINE_MODE)?.roomsList?.()?.length ?? 0,
+          // El modo es configurable por peticion: {"engine_mode":"guest"} en el
+          // cuerpo o header x-meta-mode. Aqui se ve cual es el por defecto y
+          // que modos ya tienen motor creado en este proceso.
+          modo_por_defecto: ENGINE_MODE,
+          modos_disponibles: ["session", "guest"],
+          modos_activos: [...motores.keys()],
         },
       } : {}),
     });
@@ -2155,16 +2383,46 @@ async function route(req, res) {
     return json(202, { job_id: jobId, status: "queued", poll: `/v1/jobs/${jobId}` });
   }
 
+  if (req.method === "POST" && url.pathname === "/v1/chat/clear") {
+    // "clear" del canal: el canal conserva su id (usuario + proyecto) pero el
+    // siguiente turno abre una conversacion NUEVA en meta. El broker solo
+    // cambia de conversacion cuando un turno falla (y eso duplica la
+    // conversacion en el historial de meta), asi que el clear se resuelve con
+    // una generacion por canal.
+    let p = {};
+    try { p = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "invalid JSON" } }); }
+    const canalId = canalIdDe(p.user || req.headers["x-meta-user"], p.project || req.headers["x-meta-project"]);
+    if (!canalId) return json(400, { error: { message: "falta user (o project)" } });
+    const modo = normalizarModo(p.engine_mode ?? req.headers["x-meta-mode"]);
+    const generacion = limpiarCanal(canalId, modo);
+    return json(200, { ok: true, canal: canalId, modo, generacion });
+  }
+
   if (req.method === "GET" && url.pathname.startsWith("/v1/media/")) {
-    // sirve las imagenes ya bajadas (engine/.media/<conv>/<archivo>)
+    // sirve las imagenes ya bajadas y los archivos de meta (engine/.media/<conv>/<archivo>)
     const rel = decodeURIComponent(url.pathname.slice("/v1/media/".length));
+    // Las carpetas internas (".scripts", ".index.json") no se sirven: son del
+    // motor, no del cliente.
+    if (rel.split("/").some((seg) => seg.startsWith("."))) return json(404, { error: { message: "no existe" } });
     const file = join(MEDIA_DIR, rel);
     if (!file.startsWith(MEDIA_DIR + sep)) return json(400, { error: { message: "ruta invalida" } });
     try {
       const buf = readFileSync(file);
       const ext = extname(file).slice(1).toLowerCase();
-      const mime = ext === "webp" ? "image/webp" : ext === "png" ? "image/png" : ext === "jpg" ? "image/jpeg" : "application/octet-stream";
-      res.writeHead(200, { "Content-Type": mime, "Cache-Control": "private, max-age=300" });
+      // El tipo que se sirve es el VALIDADO (por contenido, no por extension):
+      // un .pptx es un zip OOXML de presentacion, un .pdf empieza por %PDF-. La
+      // extension solo desambigua los formatos de texto (csv, md, html), donde
+      // los bytes no dicen el formato exacto.
+      const tipo = detectarTipo(file);
+      const mime = tipo && tipo.familia !== "texto"
+        ? tipo.mime
+        : (MIME_MEDIA[ext] ?? tipo?.mime ?? "application/octet-stream");
+      res.writeHead(200, {
+        "Content-Type": mime,
+        // El nombre real viaja en la cabecera: el navegador lo usa al guardar.
+        "Content-Disposition": `inline; filename="${basename(file).replace(/"/g, "")}"`,
+        "Cache-Control": "private, max-age=300",
+      });
       return res.end(buf);
     } catch {
       return json(404, { error: { message: "no existe" } });
@@ -2194,7 +2452,7 @@ async function route(req, res) {
       }
     }
     try {
-      const creds = await metaEngineCreds();
+      const creds = await metaEngineCreds(normalizarModo(p.engine_mode ?? req.headers["x-meta-mode"]));
       const subidos = await uploadAll([{ data, filename, mime: p.mime }], creds);
       const s = subidos[0] ?? {};
       return json(200, {
@@ -2282,7 +2540,9 @@ async function route(req, res) {
       : null;
     if (!rawUser && !rawSistema) return json(400, { error: { message: "messages[].role user required" } });
     const parsed = parseUserContent((rawUser ?? rawSistema).content);
-    const content = parsed.text;
+    // Si no hay mensaje de usuario, la peticion es el ultimo system: se
+    // recorta (puede pesar 100+ KB y el frame de meta tope 64 KB).
+    const content = rawUser ? parsed.text : recortar(parsed.text, MAX_SYSTEM_CHARS);
     const images = parsed.images;
     if (!content && !images.length) {
       return json(400, { error: { message: "el mensaje del usuario esta vacio (ni texto ni imagenes)" } });
@@ -2291,27 +2551,57 @@ async function route(req, res) {
 
     // Motor protocol-first (gateway DGW): sin Chrome, sin scraping.
     if (ENGINE === "graphql") {
+      // Identidad del canal: USUARIO + PROYECTO. Es estable (no depende del
+      // texto del mensaje): el hilo se retoma siempre en la misma conversacion
+      // de meta, se conserva la memoria y no se duplican las conversaciones en
+      // su historial.
+      const usuario = String(payload.user || req.headers["x-meta-user"] || "").trim();
+      const proyecto = String(payload.project || req.headers["x-meta-project"] || "").trim();
+      const tituloCanal = String(payload.title || req.headers["x-meta-title"] || "").trim();
+      const canalId = canalIdDe(usuario, proyecto);
       // Clave del chat de meta para este cliente:
-      //   1. payload.user        (campo estandar de OpenAI)
+      //   1. usuario + proyecto (identidad estable del canal)
       //   2. header x-meta-conversation (fija un chat: el mismo para todos)
       //   3. automatico: hash del PRIMER mensaje del usuario -> cada sesion de
-      //      opencode (que manda el historial completo) tiene su propio chat y
-      //      no se cruza con otra sesion.
-      const conversationKey = String(
-        payload.user ||
-        req.headers["x-meta-conversation"] ||
-        claveAutomatica(msgs) ||
-        "default",
-      );
-      const channel = String(payload.channel || req.headers["x-meta-channel"] || "default");
+      //      opencode (que manda el historial completo) tiene su propio chat.
+      const conversationKey = canalId
+        || String(req.headers["x-meta-conversation"] || claveAutomatica(msgs) || "default");
+      const canalBase = String(payload.channel || req.headers["x-meta-channel"] || "default");
+      // Identidad del motor para ESTA peticion. OJO: "mode" ya esta ocupado por
+      // el modo de escritura (speed/normal), asi que el campo propio es
+      // "engine_mode" (con header x-meta-mode como equivalente).
+      const modoMotor = normalizarModo(payload.engine_mode ?? req.headers["x-meta-mode"]);
+      // El canal lleva la generacion (clear) y el modo: session y guest NO
+      // comparten hilo (si usaran la misma clave, el conversation_id se
+      // invalidaria cada vez que se cambia de modo y los dos se pisarian la
+      // memoria). El modo por defecto conserva la clave exacta de siempre:
+      // ningun hilo existente se reinicia por este cambio.
+      const gen = canalId ? generacionDe(canalId, modoMotor) : 0;
+      const partesCanal = [canalBase];
+      if (gen) partesCanal.push(`g${gen}`);
+      if (modoMotor !== ENGINE_MODE) partesCanal.push(modoMotor);
+      const channel = partesCanal.join(":");
       // Los adjuntos (imagenes/video/PDF) viajan como data URLs o rutas: se
       // suben a rupload.meta.ai y el envelope lleva solo el media_id.
       const attachments = images.map((src, i) => ({ data: src, filename: `adjunto-${i + 1}` }));
       let engine;
-      try { engine = await getMetaEngine(); }
+      try { engine = await getMetaEngine(modoMotor); }
       catch (err) { return json(502, { error: { message: String(err.message || err) } }); }
       const model = payload.model || "meta-ai";
       const chunkId = "chatcmpl-" + randomUUID();
+      // Cada turno materializa en SU PROPIA carpeta dentro de la conversacion.
+      // Antes todos los turnos de un hilo compartian la misma carpeta y los
+      // archivos de un turno se colaban en el siguiente (pedir un Word
+      // mostraba los PDF del turno anterior).
+      const turnoId = "t" + randomUUID().slice(0, 8);
+      // Historial del HILO DEL CLIENTE: que se entrego en cada turno, para
+      // distinguir lo nuevo de lo que meta reenvia. Ahora vive DENTRO del
+      // storage del canal (engine/.media/<canal>/.hilo/); el legacy
+      // (.media/.hilo/<hash>) se lee como respaldo para no perder el historial
+      // de los hilos que ya estaban vivos.
+      const hiloId = createHash("sha1").update(`${conversationKey}|${channel}`).digest("hex").slice(0, 16);
+      const historialLegacy = join(MEDIA_DIR, ".hilo", hiloId);
+      const historialDir = canalId ? join(storageDe(canalId, null), ".hilo") : historialLegacy;
       const created = Math.floor(Date.now() / 1000);
       const chunk = (delta, finishReason = null) => ({
         id: chunkId, object: "chat.completion.chunk", created, model,
@@ -2334,14 +2624,30 @@ async function route(req, res) {
         if (n) { forzado = n; toolNames = toolNames.filter((x) => x === n); }
       } else if (choice === "none") toolNames = [];
       const contrato = tools.length ? toolsContract(tools, { forzado }) : "";
-      const resultados = tools.length ? formatToolResults(msgs) : "";
       const sistema = tools.length ? recortar(systemPrompt(msgs), MAX_SYSTEM_CHARS) : "";
-      // El prompt real: contexto minimo + contrato + resultados + peticion.
-      // Si el cliente ya devolvio resultados de tools, la peticion original ya
-      // esta en el hilo de meta: se sigue desde la salida, no se repite.
-      const promptFinal = tools.length
-        ? [sistema, contrato, resultados, resultados ? "" : content].filter(Boolean).join("\n\n")
-        : content;
+      // El prompt REAL: instrucciones + contrato + HISTORIAL COMPLETO + peticion.
+      // (La version anterior mandaba solo el ultimo mensaje: meta se quedaba
+      // sin la plantilla del checkpoint y devolvia un turno vacio ->
+      // "Compaction produced no summary". Ver engine/prompt.mjs.)
+      const armado = construirPrompt(msgs, { sistema, contrato, maxHistorial: MAX_HISTORY_CHARS });
+      // Marca del canal al PRINCIPIO del prompt: es lo que meta usa para
+      // titular la conversacion, asi en su historial se ve de que canal es
+      // cada conversacion ("[90][1] Plan de pruebas").
+      const marcaCanal = canalId
+        ? `[${usuario || "anon"}]${proyecto ? `[${proyecto}]` : ""}${tituloCanal ? " " + tituloCanal : ""}`
+        : "";
+      const promptFinal = marcaCanal
+        ? `${marcaCanal}\n\n${REGLAS_ARCHIVOS}\n\n${armado.prompt || content}`
+        : `${REGLAS_ARCHIVOS}\n\n${armado.prompt || content}`;
+      // Diagnostico opt-in (META_DUMP=1): deja el request del cliente y el
+      // prompt que realmente se le mando a meta.
+      if (dumpActivo()) {
+        volcar("request", {
+          modelo: model, canal: channel, clave: conversationKey, modo: modoMotor,
+          stream: payload.stream === true, tools: toolNames,
+          mensajes: msgs, promptFinal,
+        });
+      }
       const startedAt = Date.now();
       if (payload.stream === true) {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
@@ -2363,7 +2669,10 @@ async function route(req, res) {
             userId: conversationKey,
             channel,
             attachments,
-            onJson: tools.length ? (j) => frames.push(j) : undefined,
+            // Los frames se recogen SIEMPRE, no solo cuando hay tools: sin ellos
+            // "materializar" no ve el codigo que ejecuto meta en su sandbox y no
+            // puede reproducir los archivos que genero (pdf, zip, scripts).
+            onJson: (j) => frames.push(j),
             onText: tools.length ? undefined : (t) => {
               if (!t || t.length <= sent) return;
               res.write(`data: ${JSON.stringify(chunk({ content: t.slice(sent) }))}\n\n`);
@@ -2407,7 +2716,18 @@ async function route(req, res) {
           // sandbox del repo) y se sirven en /v1/media/...
           const artefactos = await materializar({
             frames, respuesta: response,
-            dir: join(MEDIA_DIR, String(conversationId ?? "sin-conv")),
+            dir: join(storageDe(canalId, conversationId), "archivos", turnoId),
+            convDir: storageDe(canalId, conversationId),
+            historialDir,
+            historialDirLegacy: historialDir === historialLegacy ? null : historialLegacy,
+            // El sandbox de meta es POR HILO: se guarda una copia en la carpeta
+            // del canal para que el siguiente turno encuentre lo que genero el
+            // anterior (las imagenes del .pptx, el .png del grafico, ...).
+            sandboxCache: canalId ? join(storageDe(canalId, null), ".sandbox-cache") : null,
+            adjuntos: attachments,
+            // Modo de entrega vigente en el panel (url = sin copia en la API,
+            // local = copia servida en /v1/media).
+            modoAlmacen: ajustesActuales().fileStorage,
           });
           // el chunk final lleva el chat de meta (extension propia): permite
           // continuar el mismo hilo desde el cliente de streaming
@@ -2419,9 +2739,20 @@ async function route(req, res) {
           final.meta_conversation_id = conversationId;
           final.usage = usoSSE;
           final.meta_elapsed_ms = Date.now() - startedAt;
+          // que identidad atendio este turno (session = tu cuenta, guest = invitado)
+          final.meta_engine_mode = modoMotor;
           if (images.length) final.meta_images = images.map(publicImage);
           if (artefactos.archivos.length) final.meta_files = artefactos.archivos;
           if (artefactos.zip) final.meta_zip = artefactos.zip;
+          // Meta nombro un archivo pero no se pudo reproducir aqui: se dice
+          // explicitamente en vez de dejar al cliente en silencio. El aviso solo
+          // aparece si NO se recupero nada: si hay archivos, el cliente ya
+          // tiene sus enlaces y avisar seria ruido (p.ej. meta cambio el nombre
+          // del archivo entre turno y turno).
+          if (!artefactos.archivos.length && artefactos.pendientes?.length) {
+            final.meta_files_pendientes = artefactos.pendientes;
+            if (artefactos.error) final.meta_files_error = artefactos.error;
+          }
           res.write(`data: ${JSON.stringify(final)}\n\n`);
           // stream_options.include_usage (spec OpenAI): chunk final con usage
           if (payload.stream_options?.include_usage === true) {
@@ -2444,7 +2775,9 @@ async function route(req, res) {
         const frames = [];
         const { text, conversationId, images = [], response } = await engine.askConContenido(promptFinal, {
           userId: conversationKey, channel, attachments,
-          onJson: tools.length ? (j) => frames.push(j) : undefined,
+          // Mismo motivo que en la ruta de stream: los frames alimentan la
+          // materializacion de archivos aunque la peticion no bringa tools.
+          onJson: (j) => frames.push(j),
         });
         const conImagenes = images.length
           ? `${text ?? ""}\n\n${images.map((i) => `![imagen](${i.url})`).join("\n")}`
@@ -2452,7 +2785,18 @@ async function route(req, res) {
         // archivos del sandbox de meta: se reproducen localmente y se sirven
         const artefactos = await materializar({
           frames, respuesta: response,
-          dir: join(MEDIA_DIR, String(conversationId ?? "sin-conv")),
+          dir: join(storageDe(canalId, conversationId), "archivos", turnoId),
+          convDir: storageDe(canalId, conversationId),
+          historialDir,
+          historialDirLegacy: historialDir === historialLegacy ? null : historialLegacy,
+          // El sandbox de meta es POR HILO: se guarda una copia en la carpeta
+          // del canal para que el siguiente turno encuentre lo que genero el
+          // anterior (las imagenes del .pptx, el .png del grafico, ...).
+          sandboxCache: canalId ? join(storageDe(canalId, null), ".sandbox-cache") : null,
+          adjuntos: attachments,
+          // Modo de entrega vigente en el panel (url = sin copia en la API,
+          // local = copia servida en /v1/media).
+          modoAlmacen: ajustesActuales().fileStorage,
         });
         if (tools.length) {
           // meta entrega la tool_call como BLOQUE DE CODIGO (el texto va vacio)
@@ -2484,11 +2828,23 @@ async function route(req, res) {
           meta_conversation_id: conversationId,
           // cuanto tardo meta en responder (para que el cliente muestre un timer)
           meta_elapsed_ms: Date.now() - startedAt,
+          // que identidad atendio este turno (session = tu cuenta, guest = invitado)
+          meta_engine_mode: modoMotor,
           // imagenes generadas (url CDN original + copia local descargada)
           ...(images.length ? { meta_images: images.map(publicImage) } : {}),
           // archivos del sandbox (zip, scripts, documentos): reproducidos aqui
           ...(artefactos.archivos.length ? { meta_files: artefactos.archivos } : {}),
           ...(artefactos.zip ? { meta_zip: artefactos.zip } : {}),
+          // Meta nombro un archivo pero no se pudo reproducir aqui: se dice
+          // explicitamente en vez de dejar al cliente en silencio. El aviso solo
+          // aparece si NO se recupero nada: si hay archivos, el cliente ya
+          // tiene sus enlaces y avisar seria ruido (p.ej. meta cambio el nombre
+          // del archivo entre turno y turno). El error tambien se avisa solo
+          // (puede fallar el espejo sin que meta nombrara ningun archivo).
+          ...(!artefactos.archivos.length && (artefactos.pendientes?.length || artefactos.error) ? {
+            meta_files_pendientes: artefactos.pendientes,
+            ...(artefactos.error ? { meta_files_error: artefactos.error } : {}),
+          } : {}),
         });
       } catch (err) {
         const msg = String(err.message || err);
@@ -2606,8 +2962,14 @@ async function route(req, res) {
 }
 
 process.on("SIGINT", () => { if (chromeProc) try { chromeProc.kill("SIGTERM"); } catch {} process.exit(0); });
+// Si la API arranca exigiendo claves, la clave interna del webchat se genera
+// sola: el proxy local la lee de engine/.webchat-key y la manda en X-API-Key.
+if (ajustesActuales().auth === "api-key") claveServicioWebchat();
 http.createServer(route).listen(PORT, HOST, () => {
   log(`meta-ai broker async on http://${HOST}:${PORT} (workers=${MIN_WORKERS}-${MAX_WORKERS}, mode=${VISIBLE ? "visible" : "hidden"}, fresh=${FRESH ? "yes" : "no"})`);
+  // Si la API ya exige claves, la clave interna del webchat tiene que existir
+  // antes de que llegue la primera peticion del proxy.
+  if (ajustesActuales().auth === "api-key") log("auth: api-key (webchat con clave de servicio)");
   log(RESUMED_URL
     ? `sesion reanudada desde disco: ${RESUMED_URL.slice(0, 80)}`
     : `sin sesion guardada; arranco en ${START_URL}`);
