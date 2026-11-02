@@ -89,8 +89,9 @@ descarte el turno entero en silencio.
   `engine/toolcall.test.mjs` devuelve el parseo al comportamiento anterior
   (una sola tool call por respuesta) sin tocar el resto del arbol.
 - T4: staging selectivo, en dos commits: (1) la unidad de trabajo
-  (`engine/codigo.mjs`, `engine/toolcall.mjs`, `engine/toolcall.test.mjs` y
-  este doc) y (2) el registro del hash de esa unidad en este mismo doc.
+  `5449a52` (`engine/codigo.mjs`, `engine/toolcall.mjs`,
+  `engine/toolcall.test.mjs` y este doc) y (2) el registro del hash de esa
+  unidad en este mismo doc.
   NO se arrastra el WIP de otras lineas de trabajo (engine/artifacts.mjs,
   server.mjs, engine/gateway.mjs, engine/limites.test.mjs, webchat/).
   RDD global OFF (`gentle-ai review mode status`): no se lanza la revision
