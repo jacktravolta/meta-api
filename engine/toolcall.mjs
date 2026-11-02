@@ -68,6 +68,8 @@ Cuando necesites una, NO me lo expliques con palabras: escribi la llamada exacta
 \`\`\`
 
 Si ya tenes lo que necesitas, responde con texto normal sin bloque de codigo.
+
+IMPORTANTE: si tu respuesta necesita un dato del proyecto (un archivo, un listado, el contenido de una ruta), NO lo prometas ni lo narres: pedi la herramienta con el bloque tool_call. Frases como "Listemos la estructura" o "Voy a revisar el archivo" sin el bloque NO sirven: yo no puedo hacer nada por mi cuenta.
 ${forzado === "*"
 	? "\nIMPORTANTE: en este turno TENES que llamar a una herramienta. No respondas con texto: solo el bloque tool_call."
 	: forzado
@@ -94,12 +96,17 @@ function normaliza(obj, nombres) {
 /**
  * Extrae las tool calls de la respuesta de Meta.
  *
- * Meta responde con la llamada en un BLOQUE DE CODIGO (primitiva aparte, tag
- * `tool_call`) y el texto markdown queda vacio; tambien puede venir en el
- * texto. Se miran las tres formas, en este orden:
- *   1. bloques de codigo que devuelve el motor (contenido JSON crudo)
- *   2. el ultimo fence del texto (tag json/tool_call o sin tag)
- *   3. el texto entero, si es JSON puro
+ * Meta responde con las llamadas en BLOQUES DE CODIGO (una primitiva
+ * `tool_call` aparte POR llamada: en vivo se vieron respuestas con 4+ en
+ * paralelo) y el texto markdown queda vacio; tambien puede venir en el
+ * texto. Se procesa asi:
+ *   1. TODOS los bloques de codigo que devuelve el motor (contenido JSON
+ *      crudo): se acumulan las llamadas de cada uno; un bloque que no
+ *      parsea NO aborta a los demas (dump meta-6: bloque con la cola
+ *      duplicada) y las llamadas repetidas identicas se descartan.
+ *   2. SOLO si ningun bloque rindio llamadas, se cae al fallback historico:
+ *      el ultimo fence del texto (tag json/tool_call o sin tag) y despues
+ *      el texto entero, si es JSON puro.
  *
  * @param {string} texto respuesta de meta (markdown)
  * @param {string[]} nombres tools ofrecidas (filtra llamadas ajenas)
@@ -107,35 +114,18 @@ function normaliza(obj, nombres) {
  */
 export function parseToolCalls(texto, nombres = [], bloques = []) {
 	const set = new Set(nombres);
-	const candidatos = [];
-
-	// 1) bloques de codigo del motor (el caso real: tag tool_call)
-	for (const b of bloques ?? []) {
-		const code = String(b?.code ?? "").trim();
-		if (code.startsWith("{") || code.startsWith("[")) candidatos.push(code);
-	}
-
-	// 2) ultimo fence del texto
-	const src = String(texto ?? "");
-	const fences = [...src.matchAll(BLOCK_RE)]
-		.map((m) => ({ tag: String(m[1] ?? "").toLowerCase(), body: m[2] }))
-		.filter((b) => TAGS_OK.has(b.tag));
-	if (fences.length) candidatos.push(fences[fences.length - 1].body.trim());
-
-	// 3) el texto entero si es JSON
-	const plano = src.trim();
-	if (plano.startsWith("{") || plano.startsWith("[")) candidatos.push(plano);
-
 	const out = [];
-	for (const raw of candidatos) {
-		if (!raw || (!raw.startsWith("{") && !raw.startsWith("["))) continue;
+	const vistas = new Set();
+
+	const empuja = (raw) => {
+		if (!raw || (!raw.startsWith("{") && !raw.startsWith("["))) return;
 		let obj;
 		try { obj = JSON.parse(raw); }
 		catch {
 			// a veces meta mete texto antes del JSON
 			const m = raw.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
-			if (!m) continue;
-			try { obj = JSON.parse(m[1]); } catch { continue; }
+			if (!m) return;
+			try { obj = JSON.parse(m[1]); } catch { return; }
 		}
 		const arr = Array.isArray(obj) ? obj : [obj];
 		for (const o of arr) {
@@ -143,9 +133,33 @@ export function parseToolCalls(texto, nombres = [], bloques = []) {
 			if (!n) continue;
 			const args = JSON.stringify(n.arguments);
 			if (args.length > MAX_ARGS) continue;
+			// misma tool con los mismos argumentos dos veces es la misma llamada
+			const huella = n.name + args;
+			if (vistas.has(huella)) continue;
+			vistas.add(huella);
 			out.push(n);
 		}
-		if (out.length) break; // la primera fuente valida gana
+	};
+
+	// 1) bloques de codigo del motor (el caso real: una primitiva tool_call
+	//    por llamada). Un bloque roto se saltea, no corta el resto.
+	for (const b of bloques ?? []) {
+		empuja(String(b?.code ?? "").trim());
+	}
+
+	// 2) fallback historico: solo si NINGUN bloque rindio llamadas
+	if (!out.length) {
+		const src = String(texto ?? "");
+		const fences = [...src.matchAll(BLOCK_RE)]
+			.map((m) => ({ tag: String(m[1] ?? "").toLowerCase(), body: m[2] }))
+			.filter((b) => TAGS_OK.has(b.tag));
+		if (fences.length) empuja(fences[fences.length - 1].body.trim());
+
+		// 3) el texto entero si es JSON
+		if (!out.length) {
+			const plano = src.trim();
+			if (plano.startsWith("{") || plano.startsWith("[")) empuja(plano);
+		}
 	}
 	return out;
 }

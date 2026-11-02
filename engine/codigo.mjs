@@ -9,7 +9,20 @@
 // artefacto incrustado en su front (el icono "<>"); para eso esta el
 // fallback htmlEmbebido().
 
-/** Bloques de codigo de una respuesta (el mas largo por lenguaje). */
+/**
+ * Bloques de codigo de una respuesta.
+ *
+ * Regla general: por lenguaje queda con el bloque MAS LARGO (meta suele
+ * reenviar versiones parciales del mismo archivo y solo interesa la ultima).
+ *
+ * EXCEPCION `tool_call` (y la variante `tool_call:` que se vio en vivo):
+ * cada primitiva es UNA llamada a herramienta, y una sola respuesta puede
+ * traer varias en paralelo (dump meta-41: 4 primitivas). Colapsarlas por
+ * lenguaje hacia el bloque mas largo hacia perder llamadas, asi que se
+ * conservan TODAS, en orden de aparicion; si meta repite la primitiva
+ * identica en otra seccion, se descarta el duplicado (mismo contenido
+ * exacto). Los otros lenguajes siguen colapsando como siempre.
+ */
 export function bloquesDe(respuesta) {
 	const out = [];
 	const walk = (o) => {
@@ -20,14 +33,24 @@ export function bloquesDe(respuesta) {
 		for (const v of Object.values(o)) walk(v);
 	};
 	walk(respuesta);
+	const tools = [];
+	const vistos = new Set();
 	const mejor = new Map();
 	for (const b of out) {
 		if (!b.code.trim()) continue;
+		if (b.lang.startsWith("tool_call")) {
+			// una primitiva = una llamada: se guardan todas (sin repetir contenido exacto)
+			if (!vistos.has(b.code)) {
+				vistos.add(b.code);
+				tools.push(b);
+			}
+			continue;
+		}
 		const key = b.lang || "txt";
 		const prev = mejor.get(key);
 		if (!prev || b.code.length > prev.code.length) mejor.set(key, b);
 	}
-	return [...mejor.values()];
+	return [...tools, ...mejor.values()];
 }
 
 /** Documento HTML completo embebido en la respuesta (caso artefacto). */
