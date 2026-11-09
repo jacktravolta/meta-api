@@ -510,7 +510,7 @@ export class MetaGateway {
 	// onJson(json) recibe cada JSON crudo del stream (diagnostico: imagenes,
 	// tarjetas, adjuntos generados). Resuelve al llegar patch vacio; luego
 	// close o seguir listo con el mismo ws.
-	async chat(prompt, { onText, onJson, attachments = [], watchdogMs = 0, watchdogPrompt = "continua", onWatchdog = null, ...opts } = {}) {
+	async chat(prompt, { onText, onJson, onCrudo, attachments = [], watchdogMs = 0, watchdogPrompt = "continua", onWatchdog = null, ...opts } = {}) {
 		if (!this.ws || this.ws.readyState !== 1 || this.#closed)
 			throw new Error("chat: gateway no conectado");
 		const reqId = randomUUID();
@@ -547,27 +547,86 @@ export class MetaGateway {
 		let curRid = null;   // response_id del turno en curso
 		const imgs = new Map(); // imagenes generadas (dedupe por url)
 		let sawText = false; // ya hubo texto de este turno
-		let sawContent = false; // hubo ALGO (texto, codigo o artefacto)
+		let sawCodigo = false; // hubo una tool call (codigo): es contenido real
+		let sawPensando = false; // meta esta "pensando": NO es contenido
 		let nudged = false;  // ya se le mando el "continua"
 		let lastProgressAt = Date.now();
 		let lastContentAt = Date.now(); // ultimo frame con CONTENIDO (texto/codigo)
 		const idleMs = opts.idleMs ?? 120_000;
+		// Ventana de gracia: el patch VACIO es un LATIDO de meta, no el fin del
+		// turno (medido 2026-11-08). Cuando el texto acumulado esta truncado se
+		// espera ese frame "final" (estado completo) en vez de devolver la
+		// respuesta cortada. Tope: graceFinalMs (0 = desactivado).
+		const graceMs = Number.isFinite(Number(opts.graceFinalMs))
+			? Math.max(0, Number(opts.graceFinalMs))
+			: 4000;
+		let graceUntil = 0; // 0 = ventana de gracia cerrada
+		// El modelo sigue generando: la ventana se RENUEVA (el corte se mide
+		// en silencio, no en total). El tope duro del turno (deadlineAt) acota
+		// la espera total.
+		const renovarGracia = () => {
+			if (graceUntil) graceUntil = Date.now() + graceMs;
+		};
 		// Tope duro del turno: sin esto, un turno mudo puede quedarse esperando
 		// el idle completo y multiplicado por los reintentos del broker.
 		const deadlineMs = opts.deadlineMs ?? 0;
 		const deadlineAt = deadlineMs > 0 ? Date.now() + deadlineMs : 0;
 		for (;;) {
 			const restante = deadlineAt ? Math.max(0, deadlineAt - Date.now()) : idleMs;
-			const espera = Math.min(idleMs, restante || idleMs);
+			let espera = Math.min(idleMs, restante || idleMs);
+			// Con watchdog se despierta ANTES de que se dispare, para poder
+			// empujar a meta a tiempo (si no, el nudge nunca llega: solo se
+			// evaluaba cuando entraba un frame, y en un turno "pensando" no
+			// entra ninguno).
+			if (watchdogMs > 0 && !nudged) {
+				const hastaWatchdog = lastContentAt + watchdogMs - Date.now();
+				if (hastaWatchdog > 0) espera = Math.min(espera, hastaWatchdog);
+			}
+			// Con la ventana de gracia abierta, la espera NUNCA pasa del tiempo
+			// que queda: si el frame final no llega, se cierra con lo acumulado.
+			if (graceUntil) {
+				const queda = graceUntil - Date.now();
+				if (queda <= 0) {
+					this.#log("ventana de gracia agotada: se cierra con lo acumulado");
+					this.#lastRid = curRid;
+					return this.#finish(acc, reqId, curRid, [...imgs.values()]);
+				}
+				espera = Math.min(espera, queda);
+			}
+			// El temporizador se limpia en cuanto llega un frame: si no, cada
+			// lectura deja un setTimeout vivo (hasta idleMs) y el proceso se
+			// queda despierto sin motivo.
+			let temporizador = null;
 			const fr = await Promise.race([
 				this.#readFrame(),
-				new Promise((res) => setTimeout(() => res({ idle: true }), espera)),
+				new Promise((res) => { temporizador = setTimeout(() => res({ idle: true }), espera); }),
 			]);
+			if (temporizador) clearTimeout(temporizador);
 			if (fr.idle) {
-				if (deadlineAt && Date.now() >= deadlineAt) {
-					throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT, `turno sin respuesta completa en ${deadlineMs}ms`);
+				// La ventana de gracia NO es un error: se cierra el turno con lo
+				// acumulado (lo que ya llego no se pierde nunca).
+				if (graceUntil) {
+					if (Date.now() >= graceUntil) {
+						this.#lastRid = curRid;
+						return this.#finish(acc, reqId, curRid, [...imgs.values()]);
+					}
+					continue; // la ventana sigue viva: se espera un poco mas
 				}
-				throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT, `stream sin frames por ${espera}ms`);
+				// watchdog: meta se quedo mudo (o pensando) -> "continua" en el
+				// MISMO hilo, como hace el usuario en la web.
+				if (watchdogMs > 0 && !nudged && Date.now() - lastContentAt > watchdogMs) {
+					nudged = true;
+					this.#log("watchdog: meta mudo, se envia", watchdogPrompt);
+					onWatchdog?.({ ms: Date.now() - lastContentAt });
+					try { enviar(watchdogPrompt); } catch (err) { this.#log("watchdog: envio fallo", err?.message); }
+					continue; // el turno sigue vivo: se espera la respuesta
+				}
+				if (deadlineAt && Date.now() >= deadlineAt) {
+					throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT,
+						`turno sin respuesta completa en ${deadlineMs}ms${sawPensando ? " (meta se quedo pensando)" : ""}`);
+				}
+				throw new GatewayError(CLOSE.KEEPALIVE_TIMEOUT,
+					`stream sin frames por ${espera}ms${sawPensando ? " (meta se quedo pensando)" : ""}`);
 			}
 			// watchdog: meta se quedo mudo (defecto conocido, tambien en la web).
 			// se le reenvia "continua" en el MISMO hilo, como hace el usuario.
@@ -585,9 +644,8 @@ export class MetaGateway {
 
 			for (const j of extractJsons(fr.payload)) {
 				onJson?.(j);
+				onCrudo?.(j); // diagnostico: TODOS los frames, incluso los previos
 				lastProgressAt = Date.now();
-				// un frame con contenido es "progreso real"; los heartbeats no cuentan
-				if (Array.isArray(j.sections) && j.sections.length) lastContentAt = Date.now();
 				if (this.debug) {
 					// traza de frames: sirve para ver por que un turno no cierra
 					const n = Array.isArray(j.sections) ? j.sections.length : 0;
@@ -610,10 +668,18 @@ export class MetaGateway {
 					if (rid === this.#lastRid) continue;
 					const r = j;
 					const t = textOf(r);
-					if (t !== null) {
+					// Gana el texto MAS LARGO: el frame final trae el estado completo,
+					// pero si vierte menos que lo ya acumulado se conserva lo
+					// acumulado (nunca se pierde contenido).
+					const previo = textOf(acc) ?? "";
+					if (t !== null && t.length >= previo.length) {
 						acc = r;
 						sawText = true;
+						lastContentAt = Date.now();
 						onText?.(t);
+					} else if (t !== null) {
+						this.#log("final mas corto que lo acumulado: se conserva lo acumulado");
+						lastContentAt = Date.now();
 					}
 					this.#lastRid = rid ?? curRid;
 					return this.#finish(acc, reqId, rid ?? curRid, [...imgs.values()]);
@@ -634,11 +700,21 @@ export class MetaGateway {
 					const r = j.response ?? j;
 					const t = textOf(r);
 					if (t === null) {
-						// puede ser una respuesta SIN texto (codigo o artefacto): si
-						// trae secciones, es contenido y cuenta como turno.
-						if (Array.isArray(r?.sections) && r.sections.length) {
-							acc = r; sawContent = true;
+						// Sin texto. Puede ser (a) una tool call: el CODIGO es el
+						// contenido -> turno valido; o (b) el estado "pensando" de
+						// meta (GenAIBotThinkingStatusPrimitive): NO es contenido.
+						// (medido 2026-11-01: contar el "pensando" como contenido
+						// hacia que el patch vacio cerrara el turno y devolviéramos
+						// una respuesta VACIA -> "Compaction produced no summary")
+						if (tieneCodigo(r)) {
+							acc = r; sawCodigo = true;
+							lastContentAt = Date.now();
+							renovarGracia();
 							if (rid && !curRid) curRid = rid;
+						} else if (Array.isArray(r?.sections) && r.sections.length) {
+							sawPensando = true;
+							const prim = r.sections[0]?.view_model?.primitive ?? {};
+							this.#log("pensando:", prim.title ?? prim.__typename ?? "?");
 						}
 						continue; // status ("pensando"), no es respuesta
 					}
@@ -646,14 +722,48 @@ export class MetaGateway {
 					if (!acc || t.length >= prev.length) {
 						acc = r;
 						sawText = true;
+						lastContentAt = Date.now();
+						renovarGracia();
 						onText?.(t);
 					}
 				} else if (isPatch) {
 					const ops = j.operations ?? [];
 					if (ops.length === 0) {
-						// parche vacio: fin de stream SOLO si ya hubo texto;
-						// antes del texto son heartbeats de la fase de thinking
-						if (sawText || sawContent) {
+						// Parche vacio: LATIDO de meta (meta lo manda cuando no hay
+						// cambios). NO es el fin del turno: medido el 2026-11-08 el
+						// latido cae EN MEDIO del texto y el frame "final" con el
+						// texto COMPLETO llega ~1.4 s despues. Cerrar aqui devolvia
+						// la respuesta cortada (y el frame final se descartaba luego
+						// como cola del turno anterior).
+						//
+						// Si ya hay contenido (texto o tool call):
+						//   - texto truncado -> se abre la ventana de gracia y se sigue
+						//     leyendo hasta el frame final;
+						//   - texto completo  -> se cierra el turno (sin latencia).
+						if (sawText || sawCodigo) {
+							if (graceUntil) {
+								// ventana abierta: el latido no cierra nada
+								if (Date.now() >= graceUntil) {
+									this.#lastRid = curRid;
+									return this.#finish(acc, reqId, curRid, [...imgs.values()]);
+								}
+								continue;
+							}
+							const texto = textOf(acc) ?? "";
+							// Un latido NO cierra el turno si el texto esta a medio
+							// camino: estructuralmente (JSON/codigo) o en prosa
+							// (etiqueta, titulo o item de lista sin contenido).
+							const finEstructural = textoTruncado(texto);
+							const finEnProsa = textoInacabado(texto);
+							if (graceMs > 0 && (finEstructural || finEnProsa)) {
+								graceUntil = Date.now() + graceMs;
+								this.#log(
+									"latido con texto a medio camino: se espera el frame final",
+									graceMs,
+									finEstructural ? "estructural" : "prosa",
+								);
+								continue; // NO se cierra el turno
+							}
 							this.#lastRid = curRid;
 							return this.#finish(acc, reqId, curRid, [...imgs.values()]);
 						}
@@ -662,7 +772,17 @@ export class MetaGateway {
 					if (!acc) continue; // delta sin full previo: no hay a que aplicar
 					for (const op of ops) applyOperation(acc, op);
 					const t = textOf(acc);
-					if (t !== null) onText?.(t);
+					if (t !== null) {
+						sawText = true;
+						lastContentAt = Date.now();
+						renovarGracia();
+						onText?.(t);
+					} else if (tieneCodigo(acc)) {
+						// la tool call puede llegar por parche: tambien es contenido
+						sawCodigo = true;
+						lastContentAt = Date.now();
+						renovarGracia();
+					}
 				}
 			}
 		}
@@ -672,12 +792,25 @@ export class MetaGateway {
 	//   replyTo = response_id de ESTA respuesta (f2.1.4)
 	//   messageIndex += 2 (un mensaje de usuario + uno del asistente)
 	// Si el turno falla no se llama: el hilo no avanza.
+	//
+	// EXCEPTO cuando el turno vino VACIO (sin texto y sin bloque de codigo):
+	// medido el 2026-11-01, un turno vacio deja el hilo MUERTO: todas las
+	// peticiones siguientes (con reply_to = response_id de ese turno) se
+	// quedan sin respuesta hasta que caduca. Con un turno vacio el puntero
+	// NO avanza: se sigue apuntando al ultimo turno con contenido real.
 	#finish(acc, reqId, responseId, images = []) {
+		const texto = textOf(acc);
+		const conCodigo = tieneCodigo(acc);
+		const vacio = !texto && !conCodigo;
+		if (vacio) {
+			this.turnoVacio = (this.turnoVacio ?? 0) + 1;
+			return { text: texto, reqId, responseId: responseId ?? null, images, response: acc, vacio: true };
+		}
+		this.turnoVacio = 0;
 		if (responseId) this.replyTo = responseId;
 		this.messageIndex += 2;
-		return { text: textOf(acc), reqId, responseId: responseId ?? null, images, response: acc };
+		return { text: texto, reqId, responseId: responseId ?? null, images, response: acc, vacio: false };
 	}
-
 	close() {
 		clearInterval(this.#pingTimer);
 		try { this.ws?.close(1000); } catch {}
@@ -698,4 +831,130 @@ export function textOf(response) {
 			out.push(prim.text);
 	}
 	return out.length ? out.join("\n") : null;
+}
+
+/**
+ * ¿El texto esta estructuralmente INCOMPLETO?
+ *
+ * POR QUE EXISTE (medido el 2026-11-08): el texto de una respuesta llega
+ * troceado en parches "delta" y el patch VACIO es un LATIDO de meta, no el
+ * fin del turno. El frame "final" (estado completo de la respuesta) puede
+ * llegar mas tarde. Si el texto acumulado esta a medio camino (llaves sin
+ * cerrar, cadena sin terminar, bloque de codigo sin cerrar) hay que ESPERAR
+ * ese frame final en vez de devolver la mitad de la respuesta.
+ *
+ * Es heuristico y NUNCA lanza: ante cualquier duda devuelve false (no
+ * truncado) para no meter latencia extra en una respuesta normal.
+ *
+ * @param {string} texto
+ * @returns {boolean}
+ */
+export function textoTruncado(texto) {
+	try {
+		if (typeof texto !== "string" || texto.length === 0) return false;
+		const pila = [];   // llaves/cerillas abiertas
+		let cadena = null; // delimitador de la cadena abierta
+		let escapado = false;
+		let cerca = null;  // delimitador del bloque de codigo abierto (``` o ~~~)
+		let i = 0;
+		const n = texto.length;
+		while (i < n) {
+			const c = texto[i];
+			// --- bloque de codigo (``` o ~~~) ---
+			if (cadena === null && (c === "`" || c === "~")) {
+				let j = i;
+				while (j < n && texto[j] === c) j++;
+				const racha = j - i;
+				const inicioLinea = i === 0 || texto[i - 1] === "\n";
+				if (cerca) {
+					// dentro del bloque: solo el cierre del mismo marca cuenta
+					if (c === cerca && racha >= 3) { cerca = null; i = j; continue; }
+					i = j; continue;
+				}
+				if (racha >= 3 && inicioLinea) { cerca = c; i = j; continue; }
+				if (racha === 1 && c === "`") { cadena = c; i = j; continue; }
+				i = j; continue;
+			}
+			// --- dentro de una cadena: solo importa su cierre ---
+			if (cadena !== null) {
+				if (escapado) { escapado = false; i++; continue; }
+				if (c === "\\") { escapado = true; i++; continue; }
+				if (c === cadena) cadena = null;
+				i++;
+				continue;
+			}
+			// --- apertura de cadena ---
+			if (!cerca && (c === '"' || c === "'" || c === "`")) {
+				// el apostrofo pegado a una letra es una CONTRACCION, no una
+				// cadena ("don't"): solo abre cadena si no precede a un alfanumerico
+				if (c === "'" && i > 0 && /[\p{L}\p{N}]/u.test(texto[i - 1])) { i++; continue; }
+				cadena = c; i++;
+				continue;
+			}
+			// --- llaves y cerillas ---
+			if (c === "{" || c === "[") { pila.push(c); i++; continue; }
+			if (c === "}" || c === "]") {
+				const tope = pila.pop();
+				// un cierre sin apertura es ruido; un cierre CRUZADO deja una
+				// apertura sin cerrar -> texto truncado
+				if (tope !== undefined && tope !== (c === "}" ? "{" : "[")) return true;
+				i++;
+				continue;
+			}
+			i++;
+		}
+		return cerca !== null || cadena !== null || pila.length > 0;
+	} catch {
+		return false; // nunca revienta: la duda se resuelve como "no truncado"
+	}
+}
+
+/**
+ * Heuristica de PROSA a medio camino: el texto termina ANUNCIANDO algo que
+ * nunca llega (una etiqueta, un titulo o un item de lista vacio).
+ *
+ * POR QUE EXISTE (medido el 2026-11-09): meta interrumpe la generacion en
+ * fronteras de estructura y ahi cae el patch VACIO (latido). Un texto como
+ * "**2. Lo que te falta:**" NO es JSON truncado, asi que `textoTruncado` no
+ * lo veia: el gateway cerraba el turno en el latido y la cola (los bullets
+ * que faltaban) se descartaba como "cola del turno anterior". El usuario
+ * veia la respuesta cortada justo en el encabezado de la lista.
+ *
+ * Es heuristico y NUNCA lanza: ante cualquier duda devuelve false (no
+ * incompleto) para no meter latencia extra en una respuesta normal.
+ *
+ * @param {string} texto
+ * @returns {boolean}
+ */
+export function textoInacabado(texto) {
+	try {
+		if (typeof texto !== "string" || texto.length === 0) return false;
+		const t = texto.replace(/\s+$/, "");
+		if (!t) return false;
+		// Etiqueta markdown cerrada pero sin contenido: "**2. Lo que te falta:**"
+		if (/:\*\*$/.test(t)) return true;
+		// Negrita abierta (asteriscos impares): "**2. Lo que te falta"
+		const negritas = (t.match(/\*\*/g) || []).length;
+		if (negritas % 2 === 1) return true;
+		// Item de lista vacio en su propia linea: "- " o "1. "
+		if (/(?:^|\n)[ \t]*(?:[-*+\u2022]|\d+[.)])[ \t]*$/.test(t)) return true;
+		// Titulo markdown al final: "## 2. Resultados" (el cuerpo no llega)
+		if (/(?:^|\n)#{1,6}[ \t]+\S[^\n]*$/.test(t)) return true;
+		return false;
+	} catch {
+		return false; // nunca revienta: la duda se resuelve como "completo"
+	}
+}
+
+// ¿La respuesta trae un bloque de codigo (tool call o archivo)?
+// Un turno con tool call tiene el TEXTO vacio: no es un turno vacio.
+export function tieneCodigo(response) {
+	for (const s of response?.sections ?? []) {
+		const prim = s?.view_model?.primitive ?? {};
+		if (prim.__typename === "GenAICodeUXPrimitive" && Array.isArray(prim.code_blocks)) {
+			const txt = prim.code_blocks.map((b) => b?.content ?? "").join("");
+			if (txt.trim()) return true;
+		}
+	}
+	return false;
 }

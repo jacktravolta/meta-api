@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 import {
 	FRAME, buildFrame, parseFrame, decodePb, encodePb, extractJsons,
 } from "./pb.mjs";
-import { buildRequestPayload, textOf, PROTOCOL } from "./gateway.mjs";
+import { buildRequestPayload, textOf, PROTOCOL, MetaGateway, textoTruncado, textoInacabado } from "./gateway.mjs";
+import wsPkg from "ws";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES_DIR = path.join(HERE, "fixtures");
@@ -164,6 +165,170 @@ test("segundo mensaje del hilo: f2.1.4 = respuesta previa y sin flags de primero
 	assert.equal(find(find(f2.pb, 4).pb, 1).str, "2", "f2.4.1 = indice del mensaje");
 	assert.equal(find(find(f1.pb, 1).pb, 1).str, "KADABRA__CHAT__UNIFIED_INPUT_BAR");
 	assert.equal(find(find(find(f1.pb, 1).pb, 12).pb, 4), undefined, "f1.1.12.4 ausente");
+});
+
+// --- DGW de mentira -------------------------------------------------------
+// Reproduce la secuencia de frames MEDIDA el 2026-11-08 contra meta.ai:
+//   full (preview "{\") -> deltas -> patch VACIO (LATIDO) -> mas deltas ->
+//   frame FINAL (estado completo de la respuesta, ~1.4 s despues del latido).
+// El latido NO es el fin del turno: cerrar ahi devolvia la respuesta cortada.
+
+const RID = "e.testresponseid0001";
+const WebSocketServer = wsPkg.WebSocketServer ?? wsPkg.Server;
+
+const SECCION = (text) => ({
+	view_model: { primitive: { __typename: "GenAIMarkdownTextUXPrimitive", text } },
+});
+
+const fullJson = (text) => ({
+	type: "full",
+	response_id: RID,
+	response: { response_id: RID, sections: [SECCION(text)] },
+});
+const deltaJson = (value) => ({
+	type: "patch",
+	response_id: RID,
+	operations: [{ op: "delta", path: "/sections/0/view_model/primitive/text", value }],
+});
+const latidoJson = () => ({ type: "patch", response_id: RID, operations: [] });
+const finalJson = (text) => ({ response_id: RID, sections: [SECCION(text)] });
+
+/** frame DATA del servidor: el payload es un pb con un leaf str = JSON */
+function frameDe(obj) {
+	const payload = encodePb([{ field: 1, wire: 2, kind: "str", str: JSON.stringify(obj) }]);
+	return buildFrame(FRAME.DATA, payload, FRAME.FLAG_SERVER);
+}
+
+/** gateway DGW local que ejecuta el guion cuando llega el request del cliente */
+async function dgwFalso(guion) {
+	const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+	await new Promise((res, rej) => { wss.once("listening", res); wss.once("error", rej); });
+	const puerto = wss.address().port;
+	wss.on("connection", (socket) => {
+		socket.send(buildFrame(FRAME.HANDSHAKE, JSON.stringify({ code: 200 })));
+		socket.on("message", (data) => {
+			let f;
+			try { f = parseFrame(Buffer.from(data)); } catch { return; }
+			if (f.type !== FRAME.DATA) return; // es el request del cliente
+			guion(socket);
+		});
+	});
+	return { wss, url: `ws://127.0.0.1:${puerto}/` };
+}
+
+/** MetaGateway que habla con el DGW local en vez de con meta.ai */
+class GatewayDePrueba extends MetaGateway {
+	constructor(opts) { super(opts); this.urlLocal = opts.urlLocal; }
+	url() { return this.urlLocal; }
+}
+
+async function turnoConGuion(guion) {
+	const { wss, url } = await dgwFalso(guion);
+	const gw = new GatewayDePrueba({ token: "ecto1:token-de-prueba", userId: "1", urlLocal: url });
+	try {
+		await gw.connect();
+		const t0 = Date.now();
+		const r = await gw.chat("analiza");
+		return { r, ms: Date.now() - t0 };
+	} finally {
+		gw.close();
+		await new Promise((res) => wss.close(res));
+	}
+}
+
+test("textoTruncado: distingue el texto a medio camino del texto completo", () => {
+	assert.equal(textoTruncado('{"'), true, "la preview de 2 chars esta truncada");
+	assert.equal(textoTruncado('{"a": 1, "b": [1, 2'), true, "llaves sin cerrar");
+	assert.equal(textoTruncado('{"a": "sin terminar'), true, "cadena sin terminar");
+	assert.equal(textoTruncado("```json\n{\"a\": 1"), true, "bloque de codigo sin cerrar");
+	assert.equal(textoTruncado('{"a": 1}'), false, "json completo");
+	assert.equal(textoTruncado("[1, 2, 3]"), false, "lista completa");
+	assert.equal(textoTruncado("Hola, todo listo."), false, "prosa normal");
+	assert.equal(textoTruncado('No inventes datos: usa "comillas".'), false, "comillas balanceadas");
+	assert.equal(textoTruncado("```json\n{\"a\": 1}\n```"), false, "json en bloque de codigo completo");
+	assert.equal(textoTruncado(""), false, "vacio");
+	assert.equal(textoTruncado(null), false, "null");
+	assert.equal(textoTruncado(undefined), false, "undefined");
+	assert.equal(textoTruncado(123), false, "no es texto");
+});
+
+test("textoInacabado: detecta la prosa que queda a medio camino", () => {
+	// el caso real del 2026-11-09: la respuesta terminaba en el encabezado de
+	// la lista y los bullets nunca llegaban
+	assert.equal(textoInacabado("**1. En simple:**\n- WMS\n**2. Lo que te falta:**"), true, "etiqueta sin contenido");
+	assert.equal(textoInacabado("Resumen del analisis:\n\n**Lo que te falta:**\n"), true, "etiqueta con salto de linea");
+	assert.equal(textoInacabado("**2. Lo que te falta"), true, "negrita abierta");
+	assert.equal(textoInacabado("Tus requisitos:\n- WMS\n-"), true, "item de lista vacio");
+	assert.equal(textoInacabado("Tus requisitos:\n1."), true, "item numerado vacio");
+	assert.equal(textoInacabado("## Resultados"), true, "titulo sin cuerpo");
+	// respuestas normales: NO deben pagar latencia extra
+	assert.equal(textoInacabado("Tu coincidencia es **42%**."), false, "negrita cerrada al final");
+	assert.equal(textoInacabado("Lo que te falta:\n- SAP EWM\n- Power BI"), false, "lista completa");
+	assert.equal(textoInacabado("¿Me pegas el CV y la oferta?"), false, "pregunta final");
+	assert.equal(textoInacabado('{"match_score": 38}'), false, "json completo");
+	assert.equal(textoInacabado(""), false, "vacio");
+	assert.equal(textoInacabado(null), false, "null");
+	assert.equal(textoInacabado(123), false, "no es texto");
+});
+
+test("el latido (patch vacio) NO cierra el turno: se espera el frame final", async () => {
+	// secuencia medida: el latido cae en medio del texto y el frame final
+	// (texto COMPLETO) llega despues.
+	const COMPLETO = '{"nombre": "Juan Pérez González", "cargo_actual": "Operario de Bodega", "skills_tecnicas": ["WMS", "Excel"]}';
+	const { r } = await turnoConGuion((socket) => {
+		socket.send(frameDe(fullJson('{"')));
+		socket.send(frameDe(deltaJson('nombre": "Juan Pérez González", "cargo_actual": "Operario de Bodega", ')));
+		socket.send(frameDe(latidoJson()));
+		setTimeout(() => {
+			socket.send(frameDe(deltaJson('"skills_tecnicas": ["WMS", "Excel"]}')));
+			socket.send(frameDe(finalJson(COMPLETO)));
+		}, 120);
+	});
+	assert.equal(r.text, COMPLETO, "el turno debe cerrar con el texto COMPLETO, no con el cortado");
+});
+
+test("una respuesta que NO esta truncada sigue cerrando en el latido (sin esperar)", async () => {
+	const TEXTO = "Hola, todo listo. Chau.";
+	const { r, ms } = await turnoConGuion((socket) => {
+		socket.send(frameDe(fullJson("Hola, todo listo.")));
+		socket.send(frameDe(deltaJson(" Chau.")));
+		socket.send(frameDe(latidoJson()));
+		// si el motor esperase de mas, adoptaria este frame final
+		setTimeout(() => socket.send(frameDe(finalJson("TEXTO QUE NO DEBE LLEGAR"))), 1200);
+	});
+	assert.equal(r.text, TEXTO, "la respuesta completa se devuelve tal cual");
+	assert.ok(ms < 600, `no debe esperar al frame final (tardo ${ms}ms)`);
+});
+
+test("si el frame final trae menos texto, se conserva el acumulado (no se pierde contenido)", async () => {
+	const ACUMULADO = '{"a": 1, "b": 2}';
+	const { r } = await turnoConGuion((socket) => {
+		socket.send(frameDe(fullJson('{"a": 1,')));
+		socket.send(frameDe(latidoJson()));
+		setTimeout(() => {
+			socket.send(frameDe(deltaJson(' "b": 2}')));
+			socket.send(frameDe(finalJson('{"a":1}')));
+		}, 80);
+	});
+	assert.equal(r.text, ACUMULADO, "el texto mas largo gana: el acumulado");
+});
+
+test("un latido con la prosa a medio camino NO cierra el turno (la cola no se pierde)", async () => {
+	// Regresion del 2026-11-09: el latido de meta cae sobre el encabezado de
+	// una lista y el gateway cerraba el turno ahi. Los bullets que llegaban
+	// despues se descartaban como "cola del turno anterior" y el usuario veia
+	// la respuesta cortada.
+	const CORTE = "**1. En simple:**\n- WMS\n**2. Lo que te falta:**";
+	const COMPLETO = CORTE + "\n- SAP EWM\n- Power BI";
+	const { r } = await turnoConGuion((socket) => {
+		socket.send(frameDe(fullJson(CORTE)));
+		socket.send(frameDe(latidoJson())); // el latido cae a medio camino
+		setTimeout(() => {
+			socket.send(frameDe(deltaJson("\n- SAP EWM\n- Power BI"))); // la cola llega despues
+			socket.send(frameDe(finalJson(COMPLETO)));
+		}, 80);
+	});
+	assert.equal(r.text, COMPLETO, "la cola del turno se conserva: la respuesta llega completa");
 });
 
 test("primer mensaje del hilo: flags de primero y sin f2.1.4", () => {
