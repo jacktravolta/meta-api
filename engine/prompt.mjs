@@ -97,6 +97,65 @@ export function recortarHistorial(lineas, maxChars) {
 }
 
 /**
+ * Modo de prompt: decide QUE instrucciones viajan a meta.
+ *
+ * - "base" (por defecto, o ausente): prompt del propietario + reglas de
+ *   entrega de archivos + prompt del cliente. Es el modo historico.
+ * - "cliente": SOLO viaja el prompt del cliente (su mensaje de sistema, su
+ *   historial y su peticion). Para un cliente de API que trae su propio
+ *   prompt: las instrucciones internas compiten con las suyas y el mensaje de
+ *   sistema del cliente se perdia si no mandaba tools.
+ *
+ * @param {string|undefined|null} valor
+ * @returns {{ok: boolean, modo: string, cliente: boolean, error?: string}}
+ */
+export function modoPrompt(valor) {
+	const v = valor === undefined || valor === null ? "" : String(valor).trim().toLowerCase();
+	if (!v) return { ok: true, modo: "base", cliente: false };
+	if (v === "base") return { ok: true, modo: "base", cliente: false };
+	if (v === "cliente") return { ok: true, modo: "cliente", cliente: true };
+	return {
+		ok: false, modo: "", cliente: false,
+		error: `prompt_mode invalido: "${String(valor)}" (valores admitidos: "base", "cliente")`,
+	};
+}
+
+/**
+ * ¿Viaja el prompt de SISTEMA del cliente?
+ * - modo "cliente": SIEMPRE (es el unico prompt que corre).
+ * - modo "base": solo si el cliente trae tools (comportamiento historico:
+ *   sin tools el mensaje de sistema se descartaba).
+ */
+export function debeViajarSistema({ modo = "base", conTools = false } = {}) {
+	return modo === "cliente" || conTools === true;
+}
+
+/**
+ * Compone el prompt FINAL que se le manda a meta.
+ *
+ * En modo "cliente" NO viajan las instrucciones del propietario ni las
+ * reglas de entrega de archivos: solo el prompt del cliente (que ya termina
+ * en [PETICION ACTUAL], ver construirPrompt).
+ *
+ * @param {{modo?: string, marcaCanal?: string, promptPropietario?: string,
+ *          reglasArchivos?: string, promptCliente?: string}} partes
+ * @returns {string}
+ */
+export function componerPromptFinal({
+	modo = "base", marcaCanal = "", promptPropietario = "", reglasArchivos = "", promptCliente = "",
+} = {}) {
+	const cliente = modo === "cliente";
+	const propio = String(promptPropietario ?? "").trim();
+	const bloquePropietario = !cliente && propio
+		? `[INSTRUCCIONES DEL PROPIETARIO]\n${propio}`
+		: "";
+	const reglas = cliente ? "" : String(reglasArchivos ?? "");
+	return [marcaCanal, bloquePropietario, reglas, promptCliente]
+		.filter((p) => (typeof p === "string" ? p.trim().length > 0 : !!p))
+		.join("\n\n");
+}
+
+/**
  * Arma el prompt completo para meta.
  *
  * REGLA: el ULTIMO mensaje es la peticion (lo que hay que responder) y todo

@@ -42,7 +42,7 @@ import { join, relative, extname, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runAgentLoop } from "./agent/loop.js";
 import { toolsContract, parseToolCalls, toOpenAiToolCalls, systemPrompt } from "./engine/toolcall.mjs";
-import { construirPrompt } from "./engine/prompt.mjs";
+import { construirPrompt, modoPrompt, debeViajarSistema, componerPromptFinal } from "./engine/prompt.mjs";
 import { dumpActivo, volcar } from "./engine/dump.mjs";
 import { extraerCodigo } from "./engine/codigo.mjs";
 import { materializar, detectarTipo } from "./engine/artifacts.mjs";
@@ -2624,7 +2624,22 @@ async function route(req, res) {
         if (n) { forzado = n; toolNames = toolNames.filter((x) => x === n); }
       } else if (choice === "none") toolNames = [];
       const contrato = tools.length ? toolsContract(tools, { forzado }) : "";
-      const sistema = tools.length ? recortar(systemPrompt(msgs), MAX_SYSTEM_CHARS) : "";
+      // Modo de prompt (body "prompt_mode" o header "x-meta-prompt-mode"):
+      //   "base"    (por defecto) = prompt del propietario + reglas de archivos
+      //                           + prompt del cliente.
+      //   "cliente"              = SOLO el prompt del cliente (el mensaje de
+      //                           sistema del cliente tambien viaja, aunque no
+      //                           mande tools). Para un cliente de API que trae
+      //                           su propio prompt: las instrucciones internas
+      //                           compiten con las suyas.
+      // Cualquier otro valor es un error 400 (no se adivina la intencion).
+      const modoPromptCli = modoPrompt(payload.prompt_mode ?? req.headers["x-meta-prompt-mode"]);
+      if (!modoPromptCli.ok) {
+        return json(400, { error: { message: modoPromptCli.error } });
+      }
+      const sistema = debeViajarSistema({ modo: modoPromptCli.modo, conTools: tools.length })
+        ? recortar(systemPrompt(msgs), MAX_SYSTEM_CHARS)
+        : "";
       // El prompt REAL: instrucciones + contrato + HISTORIAL COMPLETO + peticion.
       // (La version anterior mandaba solo el ultimo mensaje: meta se quedaba
       // sin la plantilla del checkpoint y devolvia un turno vacio ->
@@ -2636,14 +2651,22 @@ async function route(req, res) {
       const marcaCanal = canalId
         ? `[${usuario || "anon"}]${proyecto ? `[${proyecto}]` : ""}${tituloCanal ? " " + tituloCanal : ""}`
         : "";
-      const promptFinal = marcaCanal
-        ? `${marcaCanal}\n\n${REGLAS_ARCHIVOS}\n\n${armado.prompt || content}`
-        : `${REGLAS_ARCHIVOS}\n\n${armado.prompt || content}`;
+      // El modo decide QUE instrucciones viajan: en "cliente" NO viajan las
+      // instrucciones del propietario ni las reglas de entrega de archivos
+      // (ver componerPromptFinal en engine/prompt.mjs).
+      const promptFinal = componerPromptFinal({
+        modo: modoPromptCli.modo,
+        marcaCanal,
+        promptPropietario: "",
+        reglasArchivos: REGLAS_ARCHIVOS,
+        promptCliente: armado.prompt || content,
+      });
       // Diagnostico opt-in (META_DUMP=1): deja el request del cliente y el
       // prompt que realmente se le mando a meta.
       if (dumpActivo()) {
         volcar("request", {
           modelo: model, canal: channel, clave: conversationKey, modo: modoMotor,
+          modo_prompt: modoPromptCli.modo,
           stream: payload.stream === true, tools: toolNames,
           mensajes: msgs, promptFinal,
         });

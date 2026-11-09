@@ -5,7 +5,7 @@
 // devuelve un turno vacio -> "Compaction produced no summary".
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { construirPrompt, renderMensaje, textoDe, recortarHistorial } from "./prompt.mjs";
+import { construirPrompt, renderMensaje, textoDe, recortarHistorial, modoPrompt, debeViajarSistema, componerPromptFinal } from "./prompt.mjs";
 
 test("el historial completo viaja en el prompt (caso compaction/checkpoint)", () => {
 	const msgs = [
@@ -92,4 +92,69 @@ test("recortarHistorial conserva el final", () => {
 	const out = recortarHistorial(lineas, 150);
 	assert.match(out[0], /omitidos/);
 	assert.ok(out[out.length - 1].startsWith("c"));
+});
+
+test("modoPrompt: 'base' por defecto y 'cliente' explicito", () => {
+	assert.deepEqual(modoPrompt(undefined), { ok: true, modo: "base", cliente: false });
+	assert.deepEqual(modoPrompt(null), { ok: true, modo: "base", cliente: false });
+	assert.deepEqual(modoPrompt(""), { ok: true, modo: "base", cliente: false });
+	assert.deepEqual(modoPrompt("   "), { ok: true, modo: "base", cliente: false });
+	assert.deepEqual(modoPrompt("base"), { ok: true, modo: "base", cliente: false });
+	assert.deepEqual(modoPrompt("BASE"), { ok: true, modo: "base", cliente: false });
+	assert.deepEqual(modoPrompt("cliente"), { ok: true, modo: "cliente", cliente: true });
+	assert.deepEqual(modoPrompt("CLIENTE"), { ok: true, modo: "cliente", cliente: true });
+});
+
+test("modoPrompt: un modo desconocido se rechaza con un mensaje claro", () => {
+	const r = modoPrompt("hacker");
+	assert.equal(r.ok, false, "un modo desconocido no es valido");
+	assert.equal(r.cliente, false);
+	assert.match(r.error, /prompt_mode invalido/);
+	assert.match(r.error, /base/);
+	assert.match(r.error, /cliente/);
+});
+
+test("modo cliente: el prompt del cliente es el UNICO que viaja", () => {
+	const final = componerPromptFinal({
+		modo: "cliente",
+		marcaCanal: "[usuario][proyecto]",
+		promptPropietario: "Eres un agente rudo y malo",
+		reglasArchivos: "[REGLAS DE ENTREGA DE ARCHIVOS]\n- entrega el contenido",
+		promptCliente: "[PETICION ACTUAL]\nAnaliza esto y responde JSON",
+	});
+	assert.doesNotMatch(final, /INSTRUCCIONES DEL PROPIETARIO/, "no viaja el prompt del propietario");
+	assert.doesNotMatch(final, /REGLAS DE ENTREGA DE ARCHIVOS/, "no viajan las reglas de archivos");
+	assert.doesNotMatch(final, /agente rudo y malo/, "no viaja el texto del propietario");
+	assert.match(final, /Analiza esto y responde JSON/, "viaja la peticion del cliente");
+	// lo ULTIMO que lee meta es la peticion del cliente
+	assert.ok(final.trim().endsWith("Analiza esto y responde JSON"), "la peticion del cliente va al final");
+});
+
+test("modo base: el prompt del propietario y las reglas de archivos siguen viajando", () => {
+	const final = componerPromptFinal({
+		modo: "base",
+		marcaCanal: "[usuario]",
+		promptPropietario: "reglas del propietario",
+		reglasArchivos: "[REGLAS DE ENTREGA DE ARCHIVOS]\n- entrega el contenido",
+		promptCliente: "[PETICION ACTUAL]\nhola",
+	});
+	assert.match(final, /INSTRUCCIONES DEL PROPIETARIO/);
+	assert.match(final, /reglas del propietario/);
+	assert.match(final, /REGLAS DE ENTREGA DE ARCHIVOS/);
+	assert.match(final, /hola/);
+	assert.ok(final.trim().endsWith("hola"), "la peticion del cliente va al final");
+});
+
+test("modo cliente: el prompt de sistema del cliente viaja aunque no haya tools", () => {
+	assert.equal(debeViajarSistema({ modo: "cliente", conTools: false }), true, "en modo cliente siempre");
+	assert.equal(debeViajarSistema({ modo: "base", conTools: false }), false, "en modo base, sin tools, no");
+	assert.equal(debeViajarSistema({ modo: "base", conTools: true }), true, "en modo base, con tools, si");
+	// y el prompt armado lo lleva como [INSTRUCCIONES DEL SISTEMA]
+	const { prompt } = construirPrompt([
+		{ role: "system", content: "eres un extractor de JSON" },
+		{ role: "user", content: "analiza esto" },
+	], { sistema: "eres un extractor de JSON" });
+	assert.match(prompt, /INSTRUCCIONES DEL SISTEMA/);
+	assert.match(prompt, /eres un extractor de JSON/);
+	assert.ok(prompt.indexOf("eres un extractor de JSON") < prompt.indexOf("PETICION ACTUAL"));
 });
