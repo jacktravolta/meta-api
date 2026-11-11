@@ -22,6 +22,11 @@ bridge/msg-meta.txt
 bridge/ignorar-meta.flag
 engine/.auth.json
 engine/.session.json
+
+# Ajustes en caliente del panel + credenciales de la API (nunca versionar)
+engine/.ajustes.json
+engine/.api-keys.json
+engine/.webchat-key
 bridge/mirror-chat.txt
 bridge/mirror-chat.jsonl
 
@@ -42,3 +47,4 @@ engine/.run-state.json
 engine/.rooms.json
 engine/.usage.json
 
+.venv-sandbox

@@ -51,6 +51,27 @@ Sign in, close Chrome, then run `./relay/operar.sh start` and
 `./relay/operar.sh warmup`. The session lives in the profile, so this is a one-time
 action.
 
+## Contrato: motor único, sin navegador
+
+Desde 2026-11-11 el broker opera **solo** con el motor protocol-first de
+`engine/` (`META_ENGINE=graphql`): habla con el gateway DGW de Meta por
+WebSocket y **no abre ni un Chrome** en runtime. `META_ENGINE=browser` ya no
+existe: arrancar con él aborta con un mensaje claro en vez de caer al camino del
+navegador.
+
+Esto implica que **el puente de WhatsApp (WSP) se retiró**: `relay/`, las
+unidades `wsp.service`, `wsp-chrome.service`, `salud-relay.service`,
+`salud-meta.service`, `vigia-wsp.service`, `espejo.service`,
+`donbot-responder.service` y los scripts de servicio de `bridge/` que vigilaban
+el CDP 9233 ya no existen. Nadie relanza Chrome en el puerto 9233.
+
+Lo que **sí** conserva su propio navegador es `engine/login-meta.mjs`: el login
+manual de la sesión usa CDP 9298 (`META_SESSION_CDP`) con su propio perfil y es
+parte de `engine/`.
+
+`node --test engine/sin-navegador.test.mjs` protege este contrato: falla si
+vuelve una unidad WSP, un watchdog de navegador o un Chrome en el arranque.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -76,48 +97,34 @@ action.
 | `META_SANDBOX_BACKEND` | `bwrap` | agent command backend: `bwrap` (user-namespace jail, default) or `docker` (previous container path); any other value fails closed (see *Sandbox backends* below) |
 | `META_SANDBOX_IMAGE` | `meta-sandbox:1` | Docker image for agent commands (docker backend only). Build: `docker build -f agent/Dockerfile.sandbox -t meta-sandbox:1 agent/` |
 
+Las variables `META_MIN_WORKERS`, `META_MAX_WORKERS`, `META_MODE`,
+`META_IDLE_CLOSE_MS`, `META_VISIBLE`, `META_PROFILE` y `META_CDP_PORT`
+pertenecían al motor browser (Chrome/CDP), **retirado**: el broker ya no las
+usa.
+
 ## Session continuity
 
 The current thread URL is written to `state.json` right after every successful
 send and reloaded at boot, so a reopen resumes the same conversation instead of
 landing on the home screen. Only real `/prompt/<uuid>` URLs are stored.
 
-Relay channel selection and watcher state live under the ignored local
-`relay/state/` directory. `relay/operar.sh` seeds the current channel from
-`relay/canal.example.json` on first use; channel changes and detector history
-remain local and are never committed. Image attachments are kept under the user
+Relay channel selection and watcher state lived under the ignored local
+`relay/state/` directory; that whole stack was retired together with the WSP
+bridge (see *Contrato: motor único, sin navegador*). Image attachments are kept under the user
 state directory instead of ephemeral `/tmp`, so a broker restart cannot break a
 queued image job.
 
-## Lista blanca de destinos de WhatsApp
+## Lista blanca de destinos de WhatsApp (retirada)
 
-**Regla:** todo script que escribe en WhatsApp solo puede actuar sobre un canal
-de la lista blanca (hoy: `BOTEST`). El destino nunca se infiere de "lo que esté
-abierto en la pestaña".
+**Retirada con el puente WSP (2026-11-11).** La regla sigue siendo válida como
+referencia si algún día se reimplementa el puente sobre el motor protocol-first:
+todo script que escriba en WhatsApp solo puede actuar sobre un canal de la
+lista blanca (hoy: `BOTEST`), el destino nunca se infiere de "lo que esté
+abierto en la pestaña", el chequeo es fail-closed y ocurre **antes** de
+cualquier evento `Input.*`.
 
-- La lista vive en `relay/canal-ok.mjs` (`CANAL_PERMITIDOS`) y se consulta con
-  `canalPermitido(nombre)`; el rechazo se explica en español con
-  `motivoRechazo(nombre)`.
-- **Cada escritor de WhatsApp** — `relay/wsp.mjs` y los scripts de `bridge/` que
-  disparan eventos sobre la pestaña — tiene que validar `canalPermitido()` con el
-  título real del DOM **antes de cualquier evento `Input.*`**
-  (`Input.dispatchMouseEvent`, `Input.insertText`, `Input.dispatchKeyEvent`).
-  El chequeo va en cada punto de decisión: antes de escribir, antes de hacer
-  click en un resultado de la lista y, si el chat cambió, al reabrirlo.
-- Es **fail-closed**: título vacío, desconocido, que parezca un número de
-  teléfono o que no coincida exactamente ⇒ nada se escribe, nada se hace click y
-  el proceso sale con código distinto de cero.
-- El módulo es puro y sin dependencias; su test unitario es
-  `node --test relay/canal-ok.test.mjs`.
-
-Verificación de solo lectura (no envía nada, no crea pestañas, no hace click):
-
-```bash
-WSP_CDP=http://127.0.0.1:9333 node relay/dryrun-canal.mjs
-```
-
-Sale `0` si el guard dejaría pasar, `2` si bloquearía, `3` si CDP o WhatsApp no
-están disponibles.
+El código que la implementaba (`relay/canal-ok.mjs`, `relay/wsp.mjs` y sus
+guardiás) ya no está en el repo: quedó en el historial de git.
 
 ## Concurrency
 
@@ -343,13 +350,17 @@ Nothing inside the sandbox should ever assume root.
 
 | Failure | Handling |
 |---|---|
-| Chrome dies | `recycleChrome` rescues queued jobs before wiping the pool. A job rescued twice is marked error, never looped |
+| Chrome dies | No aplica al motor protocol-first: no hay Chrome en runtime. `recycleChrome` y el pool de pestañas quedan del camino browser, retirado |
 | Node dies | queued jobs are mirrored to `pending-jobs.json` and re-dispatched on boot |
 
 A job that had already typed its prompt into Meta before the crash gets replayed,
 so the message can appear twice in the thread.
 
-## Known limitation: one shared composer
+## Known limitation: one shared composer (motor browser, retirado)
+
+El párrafo siguiente describe el camino legacy del navegador. Con el motor
+protocol-first de `engine/` no hay pestaña compartida: cada turno va por el
+gateway de Meta.
 
 The broker and a human share a single tab. If you type in the visible window
 while a broker request is in flight, they collide on the same composer and the
@@ -399,9 +410,9 @@ META_ENGINE=graphql META_ENGINE_MODE=session node server.mjs
 
 | `META_ENGINE` | `META_ENGINE_MODE` | Qué hace |
 | --- | --- | --- |
-| `browser` (default) | — | Chrome/CDP + scraping del DOM (como siempre) |
-| `graphql` | `guest` (default) | Gateway DGW con usuario invitado: se crea solo y se renueva si caduca |
+| `graphql` (default) | `guest` (default) | Gateway DGW con usuario invitado: se crea solo y se renueva si caduca |
 | `graphql` | `session` | Gateway DGW con tu sesión (`engine/.session.json`) — **recomendado** |
+| `browser` | — | **Retirado.** Chrome/CDP + scraping del DOM: arrancar con este valor aborta |
 
 Notas del motor nuevo:
 

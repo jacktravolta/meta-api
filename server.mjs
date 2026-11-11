@@ -47,10 +47,12 @@ import { dumpActivo, volcar } from "./engine/dump.mjs";
 import { extraerCodigo } from "./engine/codigo.mjs";
 import { materializar, detectarTipo } from "./engine/artifacts.mjs";
 import { ajustesActuales, guardarAjustes } from "./engine/ajustes.mjs";
+import { getPrompt, savePrompt, PROMPT_MAX_CHARS } from "./engine/prompt-ajustes.mjs";
 import { crearClave, listarClaves, revocarClave, verificarClave, esClaveServicioWebchat, claveServicioWebchat } from "./engine/apikeys.mjs";
 import { promptTokens, completionTokens, registrar, consulta as consultaUsage } from "./engine/usage.mjs";
 import { uploadAll, toFile } from "./engine/upload.mjs";
 import { selfCheck as sandboxSelfCheck } from "./agent/sandbox.js";
+import { estadoLogin, abrirVentanaLogin, capturarSesionAhora } from "./engine/login-meta.mjs";
 // HOMOLOGADO cdpAutoCura: el Resolutor es SOLO un fallback. El selector principal
 // se evalúa primero; el Resolutor entra únicamente cuando el principal devuelve null.
 import { Resolutor, Telemetria } from "./bridge/lib/resolver.mjs";
@@ -122,13 +124,24 @@ const VISIBLE = process.env.META_VISIBLE === "1";
 //                         the send click. Same verification, ~20s instead of minutes.
 // Per-request override wins over the env default: {"mode":"speed"} in the body.
 const MODE_DEFAULT = String(process.env.META_MODE || "normal").toLowerCase() === "speed" ? "speed" : "normal";
-// Motor de conversacion:
-//   "browser" (default) -> Chrome/CDP + scraping del DOM (como siempre).
-//   "graphql"           -> motor protocol-first (gateway DGW de meta.ai): sin
-//                          navegador en runtime. engine/broker-engine.mjs.
-// El engine nuevo no acepta imagenes (el envelope solo lleva texto) y usa un
+// Motor de conversacion: SOLO "graphql" (motor protocol-first de engine/).
+//   "graphql" -> gateway DGW de meta.ai, sin navegador en runtime.
+//                engine/broker-engine.mjs.
+//   "browser" -> Chrome/CDP + scraping del DOM: RETIRADO. El broker no abre
+//                ni un Chrome y el stack WSP que lo consumia tambien se retiro
+//                (systemd/wsp.service ya no existe). Si hace falta de nuevo es
+//                un motor NUEVO, no un flag.
+// El engine no acepta imagenes (el envelope solo lleva texto) y usa un
 // usuario invitado por defecto (META_ENGINE_MODE=session para tu cuenta).
-const ENGINE = String(process.env.META_ENGINE || "browser").toLowerCase();
+const ENGINE = String(process.env.META_ENGINE || "graphql").toLowerCase();
+// Contrato duro: el broker opera unicamente con el motor de engine/. Pedir
+// otro motor aborta el arranque en vez de levantar Chrome a escondidas.
+if (ENGINE !== "graphql") {
+  console.error(
+    `[meta-api] META_ENGINE="${ENGINE}" ya no existe: el broker solo opera con el motor protocol-first de engine/ (META_ENGINE=graphql). Abortando.`
+  );
+  process.exit(1);
+}
 // "session" (default): tu cuenta. Cada usuario/canal tiene su propio chat.
 // "guest": usuario invitado autonomo (sin memoria entre reinicios).
 const ENGINE_MODE = String(process.env.META_ENGINE_MODE || "session").toLowerCase() === "guest" ? "guest" : "session";
@@ -589,23 +602,6 @@ const SPEC_COMPOSER_META = {
   masGrande: true,
 };
 
-async function killStrays() {
-  // A lingering Chrome with the SAME profile steals every new launch via its
-  // singleton lock (headless orphans made the "visible" mode show no window).
-  // Kill processes whose cmdline matches the profile; not our node server.
-  try {
-    await new Promise((resolve) => {
-      // NOTE: the "--" separator is REQUIRED: without it pkill parses the
-      // pattern itself as an option ("pkill: unrecognized option
-      // --user-data-dir=...") and this silently killed nothing, so orphan
-      // Chromes holding the profile/port survived every relaunch.
-      const p = spawn("pkill", ["-f", "--", "--user-data-dir=" + PROFILE]);
-      p.on("close", () => resolve());
-      p.on("error", () => resolve());
-    });
-    await sleep(800);
-  } catch { /* best-effort */ }
-}
 
 async function workerAlive(w) {
   // A CDP socket can be dead while the handle still looks valid. The only honest
@@ -1015,96 +1011,19 @@ async function growPool() {
 // Chrome was spawned twice and the thread ended with TWO worker tabs writing to
 // the same conversation — the second send then hit a disabled button. A single
 // in-flight promise serializes the launch; later callers await the same one.
+// El motor protocol-first (engine/) NO usa navegador: no hay Chrome que levantar
+// ni CDP que abrir. ensureChrome() queda como no-op explicito para que los
+// llamadores legacy (pool, dispatch) no revienten, pero nunca se lanza un
+// proceso de Chrome. El lanzador de Chrome y el helper que mataba procesos
+// con el mismo perfil se eliminaron: asi es imposible que el broker vuelva a
+// abrir un navegador por accidente.
+let ensureChromeAvisado = false;
 async function ensureChrome() {
-  if (ensuringChrome) return ensuringChrome;
-  ensuringChrome = ensureChromeInner().finally(() => { ensuringChrome = null; });
-  return ensuringChrome;
-}
-
-async function ensureChromeInner() {
-  if (chromeProc && workers.length) {
-    // Do NOT trust the handles: Chrome can die from a crash, an update, a captcha
-    // or a "restore pages" dialog while chromeProc and workers still look fine,
-    // leaving a zombie worker that hangs every request. Probe before trusting.
-    if (await workerAlive(workers[0])) return;
-    log("worker CDP sin respuesta: reciclo Chrome");
-    try { chromeProc.kill("SIGTERM"); } catch {}
-    chromeProc = null; workers = [];
+  if (!ensureChromeAvisado) {
+    ensureChromeAvisado = true;
+    log("ensureChrome: no-op, el motor protocol-first (engine/) no usa navegador");
   }
-  // AWAIT IT. killStrays spawns `pkill -f -- --user-data-dir=<PROFILE>`; called
-  // without await it runs CONCURRENTLY with the spawn below, so pkill can reach
-  // /proc after Chrome already appeared and SIGTERM the instance we just created.
-  // Chrome then never opens the debug port and every request dies 21s later with
-  // a bare "fetch failed". Intermittent by nature: it depends on who wins the race.
-  await killStrays();
-  if (chromeProc) { try { chromeProc.kill("SIGTERM"); } catch {} chromeProc = null; workers = []; }
-  log(`launching Chrome (${VISIBLE ? "VISIBLE on " + (process.env.DISPLAY || "no DISPLAY") : "headless"}) with ${MIN_WORKERS}+ workers (max ${MAX_WORKERS})…`);
-  const args = [
-    "--user-data-dir=" + PROFILE,
-    "--remote-debugging-port=" + CDP_PORT,
-    "--no-first-run", "--no-default-browser-check",
-    "--disable-component-update", "--disable-background-networking",
-    "--disable-gpu", "--no-sandbox", "--disable-sync",
-    // Permitir reproduccion sin gesto: WhatsApp baja el audio de las notas de voz
-    // recien al reproducirlas. Sin esto, en headless el media nunca se descarga.
-    "--autoplay-policy=no-user-gesture-required",
-    // Silenciar la salida: para bajar la nota de voz hay que REPRODUCIRLA (WhatsApp
-    // la descarga al reproducir). Sin esto suena en los parlantes del usuario.
-    "--mute-audio",
-    "--disable-blink-features=AutomationControlled",
-    // Minimal chrome: no restore/crash bubbles, no infobar, no "choose your
-    // search engine" screen, no background apps. Without these Chrome opens its
-    // default New Tab Page (Qwant on this machine) plus a crash-restore prompt.
-    "--disable-session-crashed-bubble",
-    "--hide-crash-restore-bubble",
-    "--disable-infobars",
-    "--disable-search-engine-choice-screen",
-    "--no-service-autorun",
-    "--disable-features=Translate,MediaRouter,OptimizationHints",
-    // Launch into a blank page, NOT the NTP, so no search tab is ever created.
-    "about:blank",
-  ];
-  if (!VISIBLE) args.unshift("--headless=new", "--window-size=1400,900");
-  // Do NOT use stdio:"ignore" for stderr: a failed launch used to log nothing at
-  // all, which turned every browser problem into guesswork.
-  chromeProc = spawn(CHROME, args, { stdio: ["ignore", "ignore", "pipe"] });
-  chromeProc.stderr.on("data", (b) => {
-    for (const line of b.toString().split("\n")) {
-      const s = line.trim();
-      if (!s) continue;
-      if (/DevTools listening|TensorFlow|XNNPACK/i.test(s)) continue;      // normal boot noise
-      if (/crashpad.*\.lock: File exists/i.test(s)) continue;              // benign: stale crashpad lock
-      log("chrome:", s);
-    }
-  });
-  chromeProc.on("exit", (code, signal) => log(`chrome exit code=${code} signal=${signal}`));
-
-  // discover browser page, then open the MINIMUM number of independent workers
-  let jsonUrl = `http://127.0.0.1:${CDP_PORT}/json/list`;
-  let cdpUp = false;
-  for (let i = 0; i < 30; i++) {
-    await sleep(700);
-    try { const r = await fetch(jsonUrl); if (r.ok) { cdpUp = true; break; } } catch { /* retry */ }
-  }
-  // Fail loudly and specifically. Falling through to tab creation just converts a
-  // dead browser into an opaque "fetch failed" 21 seconds later.
-  if (!cdpUp) {
-    try { chromeProc.kill("SIGTERM"); } catch {}
-    chromeProc = null; workers = [];
-    throw new Error(
-      `Chrome no abrio CDP en ${CDP_PORT} tras 21s. Perfil: ${PROFILE}. ` +
-      `Revisa las lineas "chrome:" de este log para la causa real.`
-    );
-  }
-  // Worker 0 resumes the remembered thread; any other minimum worker opens its own
-  // thread, so sessions never interleave into one conversation.
-  for (let i = 0; i < MIN_WORKERS; i++) {
-    workers.push(await createWorkerTab(i === 0 ? (lastThreadUrl || START_URL) : START_URL));
-  }
-  await closeStrayTabs();
-  for (const w of workers) await attachComposer(w);
-  log(`broker ready: ${workers.length}/${MAX_WORKERS} workers`);
-  return true;   // growPool() branches on this: a falsy value silently skipped growth
+  return;
 }
 
 // The page has SEVERAL textareas and the FIRST one is NOT the composer (on the home
@@ -2212,8 +2131,12 @@ function clavePresentada(req) {
 }
 
 // Rutas del panel: abiertas a las peticiones locales (el panel es local).
+// /v1/sesion* tambien: son rutas de gestion (abren una ventana de Chrome y
+// escriben credenciales), con el mismo criterio que /v1/ajustes, /v1/prompt
+// y /v1/keys*.
 function rutaDelPanel(pathname) {
-  return pathname === "/v1/ajustes" || pathname === "/v1/keys" || pathname.startsWith("/v1/keys/");
+  return pathname === "/v1/ajustes" || pathname === "/v1/prompt" || pathname === "/v1/keys" || pathname.startsWith("/v1/keys/")
+    || pathname === "/v1/sesion" || pathname === "/v1/sesion/abrir" || pathname === "/v1/sesion/capturar";
 }
 
 // Devuelve el mensaje de error si la peticion NO esta autorizada; null si
@@ -2257,6 +2180,25 @@ async function route(req, res) {
     }
   }
 
+  // --- Panel: prompt del agente --------------------------------------------
+  // El prompt lo escribe el propietario en el panel. Vacio ("") = usar el
+  // prompt base (asi funciona el "Restablecer" del panel). Se aplica en el
+  // turno SIGUIENTE: el prompt se lee del disco en cada turno (cache por
+  // mtime), asi que no hay que reiniciar ni invalidar el motor cacheado (el
+  // motor cachea credenciales, no el prompt).
+  if (req.method === "GET" && url.pathname === "/v1/prompt") {
+    return json(200, getPrompt());
+  }
+  if (req.method === "PUT" && url.pathname === "/v1/prompt") {
+    let p;
+    try { p = JSON.parse(body || "{}"); } catch { return json(400, { error: { message: "JSON invalido" } }); }
+    try {
+      return json(200, savePrompt(p));
+    } catch (err) {
+      return json(400, { error: { message: String(err?.message || err) } });
+    }
+  }
+
   // --- Panel: API keys ----------------------------------------------------
   if (req.method === "GET" && url.pathname === "/v1/keys") {
     return json(200, { claves: listarClaves() });
@@ -2275,6 +2217,51 @@ async function route(req, res) {
     const id = decodeURIComponent(url.pathname.slice("/v1/keys/".length));
     if (!revocarClave(id)) return json(404, { error: { message: "no existe esa clave" } });
     return json(200, { ok: true });
+  }
+
+  // --- Panel: sesion de Meta (login manual) --------------------------------
+  // Estado HONESTO: si el motor "session" cayo a invitado se dice (el webchat
+  // usa esto para mostrar el boton "Iniciar sesion"). NUNCA se devuelve el
+  // token ni los valores de las cookies.
+  if (req.method === "GET" && url.pathname === "/v1/sesion") {
+    try {
+      const base = await estadoLogin();
+      const info = motores.get("session")?.authInfo?.() ?? { modo: "session" };
+      return json(200, {
+        ...base,
+        modo: info.modo ?? "session",
+        caidaAInvitado: info.caidaAInvitado === true,
+        motivo: info.motivo ?? null,
+        userId: info.userId ?? null,
+      });
+    } catch (err) {
+      return json(500, { error: { message: String(err?.message || err) } });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/sesion/abrir") {
+    try {
+      const r = await abrirVentanaLogin();
+      return json(200, r);
+    } catch (err) {
+      return json(500, { error: { message: String(err?.message || err) } });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/v1/sesion/capturar") {
+    try {
+      const r = await capturarSesionAhora();
+      if (r.ok) {
+        // El motor cachea sus credenciales (this.creds): sin invalidarlo, el
+        // siguiente turno seguiria usando las viejas. SOLO se invalida el
+        // motor "session"; el de "guest" no se toca. Las salas viven en
+        // engine/.rooms.json, asi que no se pierde nada.
+        motores.delete("session");
+      }
+      return json(200, r);
+    } catch (err) {
+      return json(500, { error: { message: String(err?.message || err) } });
+    }
   }
 
   if (req.method === "GET" && url.pathname === "/health") {
@@ -2331,11 +2318,18 @@ async function route(req, res) {
   }
   // Warms the browser without sending anything: opens START_URL (home or a
   // reopened /prompt/<uuid>) so an operator can confirm the thread is loaded.
+  // Sin navegador: el motor protocol-first (engine/) no abre Chrome. La ruta
+  // se conserva porque algunos clientes la usan como "estas vivo?", pero dice
+  // la verdad: no hay workers ni URL de navegador que informar.
   if (req.method === "GET" && url.pathname === "/warmup") {
-    clearIdleTimer();
-    try { await ensureChrome(); } catch (err) { return json(502, { error: { message: String(err.message || err) } }); }
-    scheduleIdleClose();
-    return json(200, { status: "ok", workers: workers.length, url: (workers[0] && workers[0].url) || null });
+    return json(200, {
+      status: "ok",
+      motor: "graphql",
+      navegador: false,
+      workers: 0,
+      url: null,
+      detalle: "El motor protocol-first (engine/) no abre Chrome: no hay nada que calentar.",
+    });
   }
   if (req.method === "POST" && url.pathname === "/v1/agent") {
     let payload;
@@ -2394,8 +2388,19 @@ async function route(req, res) {
     const canalId = canalIdDe(p.user || req.headers["x-meta-user"], p.project || req.headers["x-meta-project"]);
     if (!canalId) return json(400, { error: { message: "falta user (o project)" } });
     const modo = normalizarModo(p.engine_mode ?? req.headers["x-meta-mode"]);
+    // El hilo anterior se BORRA de la cuenta de meta (best-effort): sin esto
+    // cada clear deja un chat huerfano en el historial. Un fallo de borrado
+    // (drift de protocolo, red) NUNCA bloquea el clear: la generacion nueva
+    // abre hilo fresco igual, y el residuo lo barre engine/cleanup-chats.mjs.
+    let hiloAnterior;
+    try {
+      const engine = await getMetaEngine(modo);
+      hiloAnterior = await engine.borrarConversacionCanal(canalId);
+    } catch (err) {
+      hiloAnterior = { ok: false, borrados: 0, errores: [String(err.message || err).slice(0, 120)] };
+    }
     const generacion = limpiarCanal(canalId, modo);
-    return json(200, { ok: true, canal: canalId, modo, generacion });
+    return json(200, { ok: true, canal: canalId, modo, generacion, hiloAnterior });
   }
 
   if (req.method === "GET" && url.pathname.startsWith("/v1/media/")) {
@@ -2651,13 +2656,21 @@ async function route(req, res) {
       const marcaCanal = canalId
         ? `[${usuario || "anon"}]${proyecto ? `[${proyecto}]` : ""}${tituloCanal ? " " + tituloCanal : ""}`
         : "";
+      // Prompt del propietario (panel -> PUT /v1/prompt): instrucciones extra
+      // que viajan ANTES del historial, para que meta las lea como reglas y no
+      // como peticion (lo ULTIMO que lee meta es la peticion actual: ver
+      // engine/prompt.mjs). Vacio = prompt base, sin bloque. Se lee del disco
+      // en CADA turno (cache por mtime): guardar aplica al siguiente mensaje
+      // sin reiniciar la API ni invalidar el motor cacheado (el motor cachea
+      // credenciales, no el prompt).
+      const promptPropietario = (getPrompt().prompt || "").trim();
       // El modo decide QUE instrucciones viajan: en "cliente" NO viajan las
       // instrucciones del propietario ni las reglas de entrega de archivos
       // (ver componerPromptFinal en engine/prompt.mjs).
       const promptFinal = componerPromptFinal({
         modo: modoPromptCli.modo,
         marcaCanal,
-        promptPropietario: "",
+        promptPropietario: promptPropietario ? recortar(promptPropietario, PROMPT_MAX_CHARS) : "",
         reglasArchivos: REGLAS_ARCHIVOS,
         promptCliente: armado.prompt || content,
       });
@@ -3000,7 +3013,13 @@ http.createServer(route).listen(PORT, HOST, () => {
   // Re-dispatch anything that was pending when we last died. ensureChrome() runs
   // lazily on the first request, so this only restores the handles.
   const recovered = loadPending();
-  for (const jobId of recovered) dispatchJob(jobs.get(jobId));
+  // En protocolo no hay pool de navegador: re-despachar un job pendiente
+  // abriria Chrome y contaminaria la conversacion compartida de Meta.
+  if (ENGINE !== "graphql") {
+    for (const jobId of recovered) dispatchJob(jobs.get(jobId));
+  } else if (recovered.length) {
+    log(`pendientes ignorados: ${recovered.length} (motor protocol-first, sin navegador)`);
+  }
   // Surface a broken agent workdir default at boot instead of at the first
   // refused submission: the route re-validates per request and 400s while the
   // configuration is wrong. Log-only on purpose — a chat-only deployment must
