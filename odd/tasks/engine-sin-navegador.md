@@ -153,10 +153,21 @@ quiero se comen el procesador"*.
 
 ## Commit de la unidad de trabajo
 
-- `3f2f7a7` — `fix(broker): motor unico engine/ y retirada del stack WSP`
-  (46 archivos, +316 / −4973; el WIP sin commitear de otra sesión **no** entró:
-  se stageó `server.mjs` con un blob *HEAD + este cambio*).
-- `docs(odd)` — este documento (checklist cerrado + evidencia).
+- `c936d6f` — `fix(broker): motor unico engine/ y retirada del stack WSP`
+  (el WIP sin commitear de otra sesión **no** entró en `server.mjs`: se stageó
+  con un blob *HEAD + este cambio*; el `.gitignore` que esa otra sesión ya
+  tenía en el index sí quedó incluido).
+- `b3df497` — este documento (checklist cerrado + evidencia).
+- **Ojo con el historial**: la primera versión de este commit fue `3f2f7a7`
+  (limpia, solo esta feature). Otra sesión corriendo en paralelo en este mismo
+  repo hizo `git reset HEAD~1` un minuto después y recommiteó todo el árbol de
+  trabajo, así que el commit actual (`c936d6f`) **además** arrastra el WIP de
+  esa sesión (rutas `/v1/prompt`, `/v1/sesion`, `engine/prompt-ajustes.mjs`,
+  `engine/login-meta.mjs`, `.gitignore`). `3f2f7a7` sigue en el reflog. El
+  cambio de esta feature está íntegro dentro de `c936d6f` (verificado:
+  `remote-debugging-port` = 0, guarda de arranque presente, `relay/` = 0
+  entradas, 0 unidades WSP).
+- `docs(odd)` — este párrafo (corrección de la referencia al commit).
 
 ## Espejo en Engram
 
