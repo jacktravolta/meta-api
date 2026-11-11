@@ -137,7 +137,42 @@ quiero se comen el procesador"*.
 - **CPU**: antes, `wsp` reconectando cada 5 s + `salud-relay` cada 10 s +
   `salud-meta` reiniciando el broker cada ~5 min. Después: 0 procesos de
   `bridge/`/`relay/` vivos.
+- **T2 ✅ RED→GREEN**: `node --test engine/sin-navegador.test.mjs` → 4/4 fail
+  antes del cambio, 4/4 pass después.
+- **T3/T4 ✅**: `META_ENGINE=browser` aborta con exit 1 y mensaje claro;
+  `/warmup` responde `{motor: "graphql", navegador: false, workers: 0}`;
+  `server.mjs` ya no contiene `--remote-debugging-port` ni el lanzador de Chrome.
+- **T5 ✅**: `relay/` completo, las 9 unidades systemd y los 5 scripts de
+  servicio de `bridge/` fuera del repo (commit `3f2f7a7`).
+- **T6 ✅**: `README.md` documenta el contrato motor único/sin navegador.
+- **T7 ✅ checks**: suite `engine/*.test.mjs` → **110 pass, 0 fail**
+  (10 archivos). En vivo: `POST /v1/chat/completions` → **200** con respuesta
+  real en **4,2 s** (`meta_engine_mode: session`) y **sin abrir Chrome**;
+  `/health` → `ok`; nada escuchando en 9233; `systemctl --user list-units` sin
+  ninguna unidad WSP/salud.
 
-## Próximo paso
+## Commit de la unidad de trabajo
 
-T2 (test en rojo) → T3/T4 (código) → T5 (borrados) → T6 (docs) → T7 (commit).
+- `3f2f7a7` — `fix(broker): motor unico engine/ y retirada del stack WSP`
+  (46 archivos, +316 / −4973; el WIP sin commitear de otra sesión **no** entró:
+  se stageó `server.mjs` con un blob *HEAD + este cambio*).
+- `docs(odd)` — este documento (checklist cerrado + evidencia).
+
+## Espejo en Engram
+
+- **PENDIENTE**: `odd/engine-sin-navegador/tasks`. Engram rechaza la escritura
+  de esta sesión (`session_already_ended` en `ses_e380a6e5affeQa1eHrw7chU1CV`:
+  el servidor se reinició y el runtime ya había cerrado la sesión). El documento
+  local es la fuente de verdad hasta que se resincronice.
+
+## Pendiente para otro cambio (NO es parte de esta feature)
+
+- El camino legacy del motor "browser" sigue **dormido** dentro de `server.mjs`
+  (pool, `workers`, `CDP_PORT`, `recycleChrome`): inalcanzable porque el motor
+  único es `graphql`, pero ahí está. Borrarlo es un refactor aparte.
+- `bridge/` conserva scripts de diagnóstico y de WhatsApp de la era navegador
+  (`diag-*`, `espejo-meta-wsp.mjs`, `wsp-qr.mjs`, …): no corren solos, no
+  queman processor, y `bridge/lib/resolver.mjs` lo importa `server.mjs`.
+- `relay/responder-donbot.mjs` y `relay/consola-escuchar.mjs` tenían cambios
+  **sin commitear** de otra sesión: se fueron con el borrado de `relay/` y no
+  son recuperables desde git.
