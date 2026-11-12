@@ -48,3 +48,25 @@ engine/.rooms.json
 engine/.usage.json
 
 .venv-sandbox
+
+# Salidas de runtime de bridge/: logs, espejos y volcados que escriben los
+# scripts (no son fuente). Antes estaban versionados y arrastraban datos de
+# conversacion dentro del repo.
+bridge/agent-log.txt
+bridge/dictado-log.txt
+bridge/espejo-log.txt
+bridge/espejo-msg.txt
+bridge/msg-tecnica.txt
+bridge/espejo-vistos.json
+bridge/espejo-vistos-img.json
+bridge/hilo-nuevo.json
+bridge/turno.json
+bridge/wsp-qr.png
+
+# Estado del prompt editable: lo escribe el panel, es del usuario (no fuente).
+engine/.prompt-ajustes.json
+
+# Residuos locales: bytecode de Python y volcados de diagnostico.
+__pycache__/
+*.pyc
+state/
