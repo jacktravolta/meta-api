@@ -11,7 +11,7 @@ tocar nada que este vivo ni el trabajo en curso**.
 El repo tiene 186 archivos versionados y mezcla tres cosas que no conviven:
 codigo vivo, salidas de runtime (logs, espejos, volcados JSON, un PNG de QR) y
 scripts de diagnostico de una vez de la era WSP/navegador (retirada en
-`c936d6f`). Ahi se "codea" basura: lo que no se versiona ocupa disco y lo que
+`2d714c6`). Ahi se "codea" basura: lo que no se versiona ocupa disco y lo que
 si se versiona ocupa contexto de cada lectura del repo.
 
 Ademas hay entradas sin commitear mezcladas con trabajo real (WIP): hay que
@@ -95,7 +95,7 @@ El usuario: "limpiarlo solo de lo que sea basura, hay mucha basura".
   depende del host): reproducido en un worktree limpio de HEAD, sin mis cambios.
 - `curl http://127.0.0.1:8055/` → 200; `/health` → 200.
 - `git status --porcelain` → arbol limpio.
-- 11 commits en la sesion, del `8cf7000` al `79533fc`.
+- 11 commits en la sesion, del `edc22de` al `7942cfb`.
 
 ## Lo que quedo (y por que)
 

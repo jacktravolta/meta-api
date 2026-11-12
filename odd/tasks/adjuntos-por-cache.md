@@ -12,7 +12,7 @@ con el browser para conseguir los bytes:
 - audio: CLICK_PLAY + `Network.setCacheDisabled(true)` en TODA la pestana + sniff.
 - video: abrir `media-viewer-modal` solo para sacar la URL del stream.
 - imagen: click en la burbuja + cierre del visor (y el Escape a ciegas que
-  cerraba el chat, corregido en 9cbda2f).
+  cerraba el chat, corregido en 0000000).
 
 ## Por que se puede
 WhatsApp guarda cada media recibido YA DESCIFRADO en Cache Storage:

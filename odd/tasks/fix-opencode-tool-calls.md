@@ -89,7 +89,7 @@ descarte el turno entero en silencio.
   `engine/toolcall.test.mjs` devuelve el parseo al comportamiento anterior
   (una sola tool call por respuesta) sin tocar el resto del arbol.
 - T4: staging selectivo, en dos commits: (1) la unidad de trabajo
-  `5449a52` (`engine/codigo.mjs`, `engine/toolcall.mjs`,
+  `54cd325` (`engine/codigo.mjs`, `engine/toolcall.mjs`,
   `engine/toolcall.test.mjs` y este doc) y (2) el registro del hash de esa
   unidad en este mismo doc.
   NO se arrastra el WIP de otras lineas de trabajo (engine/artifacts.mjs,

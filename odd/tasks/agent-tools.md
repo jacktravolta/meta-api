@@ -36,10 +36,10 @@ the agent path, budgets that allow multi-step, inputs that can't mount arbitrary
 and regression tests so the next change can't silently reopen a hole.
 
 ## Current state (from the exploration map)
-- Branch `feat/agent-tools` (from main @ e051404). Implementation fully wired and live:
+- Branch `feat/agent-tools` (from main @ 31c7056). Implementation fully wired and live:
   route L1781, submitAgent L1509, pump agent branch L1642, poll passthrough L1836.
 - Parser (tools.js:43-97): fence regex + SHELL_TAGS filter (untagged accepted, python rejected
-  since 0a06de0), last surviving block wins, prompt markers stripped; JSON form = legacy path.
+  since c9c88c1), last surviving block wins, prompt markers stripped; JSON form = legacy path.
 - Sandbox (sandbox.js): classify() deny-by-default (WRITE_MARKERS blocklist + per-segment
   READ_ONLY whitelist), docker run with --network none/--read-only/--cap-drop=ALL, double
   timeout brake (inner timeout + host-side docker kill by name), output capped 8192.
@@ -105,6 +105,6 @@ and regression tests so the next change can't silently reopen a hole.
 
 
 ## Ejecución (2026-10-05)
-- T1-T7+T9: delegados y completados, 8 commits db4a1e8..31de051, 35/35 tests.
+- T1-T7+T9: delegados y completados, 8 commits 77fdf1e..920e266, 35/35 tests.
 - T8: verificación parent: suite re-ejecutada 35/35 (~1.4s), 0 archivos systemd/ tocados, selfCheck docker vivo sin leak.
 - T10: VERIFICADO EN VIVO (05-oct, job-39368622): tarea de conteo de lineas resuelta en 7 steps con adaptacion a error (wc fallo -> find -> respuesta correcta '2067 lineas'), fences sin tag, transcript completo, budget ok (~150s de 900s). Broker en produccion (budget 150K, idle 30s) corriendo el codigo del branch.

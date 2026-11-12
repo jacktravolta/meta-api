@@ -381,18 +381,18 @@ Node 22 es obligatorio: `/home/test/.nvm/versions/node/v22.23.3/bin/node`
 ## 11. Commits
 
 ```
-e043fb1 feat(api): el chunk final del SSE incluye meta_conversation_id
-638f0c4 fix(engine): 180 s de espera por el primer frame antes de abortar
-1667727 docs(engine): runbook de drift + verificador mecanico de slots
-4616c21 fix(engine): la conversacion de 9h reanuda el MISMO hilo al reconectar
-3c0b1f0 fix(engine): reconectar el hilo caido conservando su memoria
-f627d78 docs(engine): informe final de handoff y estado actualizado
-b447f89 chore(engine): sacar el estado de runtime del control de versiones
-1596aaa feat(engine): memoria por hilo, adjuntos/imagenes y emulacion multicanal
-61cd093 feat(engine): motor protocol-first integrado al broker (META_ENGINE=graphql)
-53bc8f1 feat(engine): motor protocol-first funcionando con meta.ai (invitado y sesion propia)
-608130c feat(engine): cliente del gateway DGW con tests golden
-0d1232d feat(engine): esqueleto del motor protocol-first
+ddd0fa7 feat(api): el chunk final del SSE incluye meta_conversation_id
+0f47b72 fix(engine): 180 s de espera por el primer frame antes de abortar
+0f2e2c5 docs(engine): runbook de drift + verificador mecanico de slots
+7a3c2bf fix(engine): la conversacion de 9h reanuda el MISMO hilo al reconectar
+2eab8de fix(engine): reconectar el hilo caido conservando su memoria
+e89e006 docs(engine): informe final de handoff y estado actualizado
+e4a82ba chore(engine): sacar el estado de runtime del control de versiones
+b2b948c feat(engine): memoria por hilo, adjuntos/imagenes y emulacion multicanal
+6da0cad feat(engine): motor protocol-first integrado al broker (META_ENGINE=graphql)
+926dafd feat(engine): motor protocol-first funcionando con meta.ai (invitado y sesion propia)
+4376866 feat(engine): cliente del gateway DGW con tests golden
+97e3edb feat(engine): esqueleto del motor protocol-first
 ```
 
 (El commit final con el reintento de errores de DNS y los resultados de la

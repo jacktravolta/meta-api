@@ -143,7 +143,7 @@ quiero se comen el procesador"*.
   `/warmup` responde `{motor: "graphql", navegador: false, workers: 0}`;
   `server.mjs` ya no contiene `--remote-debugging-port` ni el lanzador de Chrome.
 - **T5 ✅**: `relay/` completo, las 9 unidades systemd y los 5 scripts de
-  servicio de `bridge/` fuera del repo (commit `3f2f7a7`).
+  servicio de `bridge/` fuera del repo (commit `2d714c6`).
 - **T6 ✅**: `README.md` documenta el contrato motor único/sin navegador.
 - **T7 ✅ checks**: suite `engine/*.test.mjs` → **110 pass, 0 fail**
   (10 archivos). En vivo: `POST /v1/chat/completions` → **200** con respuesta
@@ -153,18 +153,21 @@ quiero se comen el procesador"*.
 
 ## Commit de la unidad de trabajo
 
-- `c936d6f` — `fix(broker): motor unico engine/ y retirada del stack WSP`
+- `2d714c6` — `fix(broker): motor unico engine/ y retirada del stack WSP`
   (el WIP sin commitear de otra sesión **no** entró en `server.mjs`: se stageó
   con un blob *HEAD + este cambio*; el `.gitignore` que esa otra sesión ya
   tenía en el index sí quedó incluido).
-- `b3df497` — este documento (checklist cerrado + evidencia).
-- **Ojo con el historial**: la primera versión de este commit fue `3f2f7a7`
-  (limpia, solo esta feature). Otra sesión corriendo en paralelo en este mismo
-  repo hizo `git reset HEAD~1` un minuto después y recommiteó todo el árbol de
-  trabajo, así que el commit actual (`c936d6f`) **además** arrastra el WIP de
+- `ce2353c` — este documento (checklist cerrado + evidencia).
+- **Ojo con el historial**: la primera versión de este commit se hizo en otro
+  commit que fue descartado con un `git reset HEAD~1` (otra sesión corriendo en
+  paralelo en este mismo repo recommiteó todo el árbol de trabajo). Ese
+  commit ya no existe: el historial se reescribió el 2026-11-12, antes de
+  publicar el repo, para quitar de todos los commits un número de teléfono
+  real y los logs de runtime que habían quedado versionados. El commit actual
+  (`2d714c6`) **además** arrastra el WIP de
   esa sesión (rutas `/v1/prompt`, `/v1/sesion`, `engine/prompt-ajustes.mjs`,
-  `engine/login-meta.mjs`, `.gitignore`). `3f2f7a7` sigue en el reflog. El
-  cambio de esta feature está íntegro dentro de `c936d6f` (verificado:
+  `engine/login-meta.mjs`, `.gitignore`). El
+  cambio de esta feature está íntegro dentro de `2d714c6` (verificado:
   `remote-debugging-port` = 0, guarda de arranque presente, `relay/` = 0
   entradas, 0 unidades WSP).
 - `docs(odd)` — este párrafo (corrección de la referencia al commit).

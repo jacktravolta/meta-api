@@ -115,15 +115,15 @@ canal (conversacion nueva) sin cambiar su id.
 ## Commits (2026-11-02, rama feat/consola-prefijo)
 | Commit | Unidad | Archivos |
 | --- | --- | --- |
-| `77109eb` | Modulos del engine que `server.mjs` importa (sin trackear: el arbol commiteado no arrancaba) | `engine/prompt.mjs`, `engine/prompt.test.mjs`, `engine/dump.mjs`, `engine/ajustes.mjs`, `engine/apikeys.mjs` |
-| `8ddddb0` | Espejo de artefactos por canal + sandbox POR HILO | `engine/artifacts.mjs` |
-| `c948508` | Canal estable, clear explicito, media por canal, timeouts | `server.mjs` |
-| `cc27c09` | App webchat (proxy + boton "Limpiar canal") | `webchat/server.py`, `webchat/index.html` |
+| `945cedc` | Modulos del engine que `server.mjs` importa (sin trackear: el arbol commiteado no arrancaba) | `engine/prompt.mjs`, `engine/prompt.test.mjs`, `engine/dump.mjs`, `engine/ajustes.mjs`, `engine/apikeys.mjs` |
+| `8579af9` | Espejo de artefactos por canal + sandbox POR HILO | `engine/artifacts.mjs` |
+| `9740203` | Canal estable, clear explicito, media por canal, timeouts | `server.mjs` |
+| `b26ff13` | App webchat (proxy + boton "Limpiar canal") | `webchat/server.py`, `webchat/index.html` |
 | (este commit) | Documento del feature | `odd/tasks/canal-estable-clear.md` |
 
-Orden obligatorio: `77109eb` -> `8ddddb0` -> `c948508` -> `cc27c09`.
-`server.mjs` importa los cuatro modulos de `77109eb`; con `c948508` sin
-`77109eb` el arbol no arranca (imports rotos).
+Orden obligatorio: `945cedc` -> `8579af9` -> `9740203` -> `b26ff13`.
+`server.mjs` importa los cuatro modulos de `945cedc`; con `9740203` sin
+`945cedc` el arbol no arranca (imports rotos).
 
 Fuera de estas unidades (WIP de otra linea de trabajo, NO commiteado):
 `engine/gateway.mjs`, `engine/broker-engine.mjs`, `engine/limites.test.mjs`,

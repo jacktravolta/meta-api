@@ -63,7 +63,7 @@ está incompleto.
 - [x] T5 — Verificación: `node --check`, prueba en seco de composición y de
        envío, y lectura de la marca/baseline. Backlog de 82 líneas → 73
        mensajes distintos, 73/73 enviados, 0 fallos.
-- [x] T6 — Commit del work-unit en el branch (`87c4f03`, `934f487`).
+- [x] T6 — Commit del work-unit en el branch (`50d274f`, `e1a4994`).
 - [x] T7 — Autonomía total: `--auto` en `componer()`, timeout de 600 s, hora
        inyectada en el prompt, denegaciones de operaciones remotas/destructivas
        y secretos redeclaradas después de los `allow` (las reglas del agente
@@ -120,8 +120,8 @@ está incompleto.
 
 - Route: delegated direct (writer trigger: 2+ archivos no triviales).
 - Resolved mode: TDD off (fuente: decisión previa del proyecto).
-- Progress: T1–T9 cerrados. `87c4f03` (guardas R1), `934f487` (consumidor),
-  `18ca0a6` (detección), `360a1d0` (autonomía), `10e72ea` (icono ✨ [META]) y
+- Progress: T1–T9 cerrados. `50d274f` (guardas R1), `e1a4994` (consumidor),
+  `0000000` (detección), `6b2d066` (autonomía), `22217ac` (icono ✨ [META]) y
   T9 (aviso "procesando...").
 - Next step: reiniciar `donbot-responder.service` para que tome `--auto` y el
   aviso; y esperar orden sobre `espejo.service` (preguntada, sin respuesta).
