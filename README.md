@@ -1,5 +1,7 @@
 # meta-api — Meta AI behind an OpenAI-compatible API
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
 Exposes Meta AI as an OpenAI-compatible endpoint. There is no official Meta
 API: the broker speaks Meta's own gateway (DGW) over WebSocket, so a request is
 a real turn in Meta AI — with your own account or as an invited guest. No
@@ -484,3 +486,9 @@ Documentación del motor:
 - `engine/probe.mjs` — CLI: `node engine/probe.mjs "hola" [--session]`.
 - `engine/conversation.mjs` — conversación sostenida con espejo en `bridge/mirror-chat.txt`.
 - `engine/multichannel.mjs` — emulación de N canales en paralelo con prueba de memoria.
+
+## License
+
+**GPL-3.0**. Texto completo en [LICENSE](LICENSE).
+
+Copyright (C) 2026 djlabs.cl.
