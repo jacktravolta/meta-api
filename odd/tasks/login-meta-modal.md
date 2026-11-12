@@ -100,10 +100,9 @@ entonces.
       ambos abren el modal (`:1381-1382`) y el aviso de reemplazo está en la
       tarjeta. El botón automático `#btn-login` conserva su visibilidad por
       necesidad (no cambió).
-- [ ] **T7 — Webchat integrado en el puerto de la API.** (pedido del dueño,
-      2026-11-02) **Un solo servicio y un solo puerto: 8055.** La API (Node)
-      sirve el front y sus rutas `/api/*`; el proxy Python (8060) queda como
-      legado y su servicio se detiene.
+- [x] **T7 — Webchat integrado en el puerto de la API.** (pedido del dueño,
+      2026-11-02; cerrado 2026-11-11) **Un solo servicio y un solo puerto: 8055.**
+      La API (Node) sirve el front y sus rutas `/api/*`.
       - `GET /` → `webchat/index.html` (con el content-type correcto).
       - `GET /api/estado` → lo mismo que hoy devuelve el proxy (mismos campos +
         `caidaAInvitado`/`motivo`/`tiene_sesion`).
@@ -119,8 +118,18 @@ entonces.
         loopback), igual que `/v1/ajustes` y `/v1/keys*`. Con `auth=abierta`
         (por defecto) todo funciona; con `auth=api-key` el panel sigue operable
         desde loopback/túnel.
-      - `webchat/server.py` se conserva como legado documentado, pero su servicio
-        (8060) deja de levantarse: una sola entrada al sistema.
+      - **Desviacion respecto del plan original**: `webchat/server.py` no se
+        conserva como legado. Sus rutas quedaron implementadas de forma nativa en
+        `server.mjs` (traduccion `/api/*` → `/v1/*` reutilizando los mismos
+        manejadores, sin duplicar logica) y el servicio `meta-webchat.service`
+        (8060) se elimino por completo del host. Un proxy muerto de 440 lineas
+        es basura, no legado.
+      - Evidencia: `engine/un-puerto.test.mjs` (7 tests, incluido uno real que
+        levanta el broker y prueba `/`, `/api/estado` y la traduccion de
+        `/api/chat`); suite completa `node --test engine/*.test.mjs` = 117 pass,
+        0 fail; `curl http://127.0.0.1:8055/` → 200 `text/html`;
+        `/api/estado` → 200 con la identidad real ("Tu cuenta"); nada escucha en
+        8060.
 
 - [x] **T8 — Editor del system prompt desde el webchat.** (pedido del dueño,
       2026-11-03) `engine/prompt-ajustes.mjs` (nuevo: `getPrompt()`/`savePrompt()`,

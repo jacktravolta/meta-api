@@ -73,11 +73,36 @@ proxy o agregado sobre endpoints `/v1/*` que el broker Node ya implementa.
 
 ## Progreso
 
-_(pendiente)_
+- [x] **T1** `server.mjs`: el front se sirve en `GET /` (+ `/index.html`) con
+      `text/html; charset=utf-8`.
+- [x] **T2** `server.mjs`: capa de traduccion `/api/*` -> `/v1/*` que reutiliza
+      los manejadores existentes (`traducirFront`). `/api/chat` y `/api/clear`
+      traducen el cuerpo; `/api/estado` es un agregado propio que reutiliza
+      `payloadHealth()` y `payloadSesion()` (extraidos para no duplicar).
+- [x] **T3** `server.mjs`: `rutaDelFront()` exime `/` y `/api/*` de la puerta de
+      auth **solo en loopback**. La API cruda (`/v1/*`) sigue exigiendo clave.
+- [x] **T4** `engine/un-puerto.test.mjs` (7 tests): contrato por fuente + una
+      prueba real que levanta el broker y prueba `/`, `/api/estado`, `/health` y
+      la traduccion de `/api/chat`.
+- [x] **T5** `meta-webchat.service` retirado del host (disable + stop + unidad
+      borrada + daemon-reload) y `webchat/server.py` eliminado del repo. Nada
+      escucha en 8060.
+- [x] **T6** README: se documento el front y la tabla de equivalencia
+      `/api/*` -> `/v1/*`.
 
 ## Evidencia
 
-_(se completa por tarea con el commit de la unidad de trabajo)_
+- `node --test engine/*.test.mjs` → **117 pass, 0 fail** (110 previos + 7 nuevos).
+- `node --test agent/*.test.js` → 52 pass, 0 fail.
+- `systemctl --user restart meta-api` → `active`; journal sin errores.
+- `curl http://127.0.0.1:8055/` → **HTTP 200** `text/html; charset=utf-8`.
+- `curl http://127.0.0.1:8055/api/estado` → 200, `identidad: "Tu cuenta"`,
+  `logueado: true`, `modo: session`.
+- `curl http://127.0.0.1:8055/health` → 200 `status: ok`.
+- `ss -ltnp` → solo `127.0.0.1:8055`; el 8060 dejo de existir.
+- `POST /api/chat` con cuerpo vacio → 400 `messages[].role user required`: es el
+  error de la API, o sea que la traduccion llego al manejador correcto (y no
+  gasto un turno de Meta).
 
 ## Ruta por tarea
 

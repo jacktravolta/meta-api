@@ -51,6 +51,32 @@ Sign in, close Chrome, then run `./relay/operar.sh start` and
 `./relay/operar.sh warmup`. The session lives in the profile, so this is a one-time
 action.
 
+## Front (webchat): la API y el panel en el mismo puerto
+
+El webchat es el **front de esta misma API**: no hay un servicio aparte. El
+broker sirve el panel en `http://127.0.0.1:8055/` y sus rutas `/api/*` son las
+mismas que la API expone como `/v1/*`:
+
+| Ruta del front | Ruta de la API | Que hace |
+| --- | --- | --- |
+| `GET /` | — | el panel (`webchat/index.html`) |
+| `GET /api/estado` | `/health` + `/v1/sesion` | salud e identidad agregadas |
+| `POST /api/chat` | `POST /v1/chat/completions` | el turno (SSE) |
+| `POST /api/clear` | `POST /v1/chat/clear` | limpia el canal |
+| `GET/PUT /api/ajustes` | `/v1/ajustes` | ajustes en caliente |
+| `GET/POST /api/keys` | `/v1/keys` | API keys |
+| `GET /api/sesion` (+ `/abrir`, `/capturar`) | `/v1/sesion` (+ `/abrir`, `/capturar`) | sesion de Meta |
+| `GET/PUT /api/prompt` | `/v1/prompt` | prompt del agente |
+
+El front es un cliente local: sus rutas quedan fuera de la puerta de clave en
+`loopback`, igual que las rutas de panel. La API cruda (`/v1/*`) sigue
+exigiendo clave cuando `auth=api-key`.
+
+Hasta 2026-11-11 el panel corria en su propio servicio Python
+(`webchat/server.py`, puerto 8060) y hacia de proxy hacia 8055. Eso se
+elimino: mismo puerto, mismo proceso, una sola implementacion de cada ruta.
+`engine/un-puerto.test.mjs` protege el contrato.
+
 ## Contrato: motor único, sin navegador
 
 Desde 2026-11-11 el broker opera **solo** con el motor protocol-first de

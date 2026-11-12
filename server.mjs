@@ -72,6 +72,10 @@ if (NODE_MAJOR < 22) {
 }
 
 const MEDIA_DIR = join(import.meta.dirname, "engine", ".media");
+// El front del webchat se sirve desde el MISMO puerto que la API: es un HTML
+// autocontenido (sin <script src> ni <link> externos), asi que se entrega
+// tal cual, sin pipeline de assets.
+const FRONT_WEBCHAT = join(import.meta.dirname, "webchat", "index.html");
 // Tipo real de cada archivo servido: sin esto, un CSV o un PDF llegan al
 // navegador como application/octet-stream y no se pueden previsualizar.
 const MIME_MEDIA = {
@@ -2139,6 +2143,13 @@ function rutaDelPanel(pathname) {
     || pathname === "/v1/sesion" || pathname === "/v1/sesion/abrir" || pathname === "/v1/sesion/capturar";
 }
 
+// Rutas del front (webchat). El front vive en el MISMO puerto que la API, asi
+// que tambien queda fuera de la puerta de auth en loopback, igual que las
+// rutas de panel: el front es un cliente local del broker, no un visitante.
+function rutaDelFront(pathname) {
+  return pathname === "/" || pathname === "/index.html" || pathname.startsWith("/api/");
+}
+
 // Devuelve el mensaje de error si la peticion NO esta autorizada; null si
 // puede seguir. No revela si la clave existe, solo revoca o caduca.
 function authRechaza(req, pathname) {
@@ -2148,18 +2159,204 @@ function authRechaza(req, pathname) {
   const valida = clave ? (verificarClave(clave) || esClaveServicioWebchat(clave)) : false;
   if (valida) return null;
   if (rutaDelPanel(pathname) && esLoopback(req)) return null;
+  if (rutaDelFront(pathname) && esLoopback(req)) return null;
   return "Se requiere una clave de API valida. Envia la en 'Authorization: Bearer <clave>' o en 'X-API-Key: <clave>'.";
+}
+
+// --- Capa del front: "/api/..." -> "/v1/..." --------------------------------
+// El front (webchat/index.html) habla "/api/..."; la API habla "/v1/...". Como
+// los dos viven en el MISMO puerto, se traduce la ruta y el cuerpo y sigue el
+// MISMO manejador: una sola implementacion de cada cosa, sin dos versiones que
+// puedan divergir. Lo que el front rompe hoy (webchat/server.py) se elimina.
+const RUTAS_FRONT = new Map([
+  ["/api/ajustes", "/v1/ajustes"],
+  ["/api/keys", "/v1/keys"],
+  ["/api/sesion", "/v1/sesion"],
+  ["/api/sesion/abrir", "/v1/sesion/abrir"],
+  ["/api/sesion/capturar", "/v1/sesion/capturar"],
+  ["/api/prompt", "/v1/prompt"],
+]);
+
+// Identidad de la peticion: "session" (tu cuenta) o "guest" (invitado). El
+// back decide quien habla; el front solo expresa la intencion.
+function modoEngine(modo) {
+  return String(modo || "session").toLowerCase() === "guest" ? "guest" : "session";
+}
+
+// Traduce la ruta y el cuerpo del front a los de la API. Si el cuerpo no es
+// JSON valido se devuelve tal cual: lo responde el manejador de la API con su
+// propio 400, no el front con un error inventado.
+function traducirFront(metodo, pathname, cuerpo) {
+  if (!pathname.startsWith("/api/")) return { ruta: pathname, cuerpo };
+  // "/api/estado" es un agregado propio (salud + sesion): no se traduce.
+  if (pathname === "/api/estado") return { ruta: pathname, cuerpo };
+  if (metodo === "POST" && pathname === "/api/chat") {
+    let b;
+    try { b = JSON.parse(cuerpo || "{}"); } catch { return { ruta: "/v1/chat/completions", cuerpo }; }
+    return {
+      ruta: "/v1/chat/completions",
+      cuerpo: JSON.stringify({
+        model: b.model || "meta-ai",
+        messages: Array.isArray(b.mensajes) ? b.mensajes : [],
+        stream: true,
+        user: b.user || "webchat",
+        engine_mode: modoEngine(b.modo),
+      }),
+    };
+  }
+  if (metodo === "POST" && pathname === "/api/clear") {
+    let b;
+    try { b = JSON.parse(cuerpo || "{}"); } catch { return { ruta: "/v1/chat/clear", cuerpo }; }
+    return {
+      ruta: "/v1/chat/clear",
+      cuerpo: JSON.stringify({
+        user: b.user || "webchat",
+        project: b.project || "",
+        engine_mode: modoEngine(b.modo),
+      }),
+    };
+  }
+  const directa = RUTAS_FRONT.get(pathname);
+  if (directa) return { ruta: directa, cuerpo };
+  if (pathname.startsWith("/api/keys/")) {
+    return { ruta: "/v1/keys/" + pathname.slice("/api/keys/".length), cuerpo };
+  }
+  return { ruta: pathname, cuerpo };
+}
+
+// Estado de la sesion de Meta (la que usa el motor). NUNCA devuelve el token
+// ni los valores de las cookies: solo el estado.
+async function payloadSesion() {
+  const base = await estadoLogin();
+  const info = motores.get("session")?.authInfo?.() ?? { modo: "session" };
+  return {
+    ...base,
+    modo: info.modo ?? "session",
+    caidaAInvitado: info.caidaAInvitado === true,
+    motivo: info.motivo ?? null,
+    userId: info.userId ?? null,
+  };
+}
+
+// Salud del broker. Vive en una funcion propia porque /api/estado (el front)
+// la reutiliza: el front necesita la salud y la sesion en la misma respuesta.
+function payloadHealth() {
+  return {
+      status: "ok",
+      workers: workers.map((w) => ({ id: w.id, busy: w.busy, q: w.queue.length })),
+      // Count only ACTIVE work. `jobs.size` counted every job ever submitted
+      // (finished ones were never pruned), so /health grew without bound and
+      // reported "pending" work that did not exist.
+      jobs_pending: [...jobs.values()].filter((j) => j.status === "queued" || j.status === "running").length,
+      // Honest self-report: /async is a deferred job handle, not parallelism.
+      concurrency: workers.length,
+      pool: { min: MIN_WORKERS, max: MAX_WORKERS, size: workers.length,
+              queued: workers.reduce((n, w) => n + w.queue.length, 0) },
+      // ESTIMATED, not measured: Meta's UI exposes no token counter. The page cannot
+    // be used: the thread is virtualized, so `main` reads ~250 chars on a long
+    // thread while `body` is ~190k chars of React payload. This counts what this
+    // broker sent and received instead.
+    context: { soft_pct: CONTEXT_SOFT_PCT, budget_chars: CONTEXT_BUDGET_CHARS,
+               seed_chars: CONTEXT_SEED_CHARS,
+               per_worker: workers.map((w) => ({
+                 id: w.id,
+                 chars: w.ctxChars || 0,
+                 pct: Math.round(((w.ctxChars || 0) / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100),
+                 rotates_at: Math.round(((w.ctxChars || 0) / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100) >= CONTEXT_SOFT_PCT,
+               })) },
+      async_semantics: workers.length > 1 ? "parallel-across-tabs" : "serialized-single-tab",
+      mode_default: MODE_DEFAULT,
+      cooldown_until: cooldownUntil > Date.now() ? new Date(cooldownUntil).toISOString() : null,
+      // Idle lifecycle visibility: is Chrome open, when will it auto-close, and
+      // which conversation will the next request resume.
+      browser_open: !!chromeProc,
+      idle_close_ms: IDLE_CLOSE_MS,
+      idle_closes_at: idleTimer ? new Date(idleDeadline).toISOString() : null,
+      resume_url: lastThreadUrl,
+      // Motor protocol-first: que identidad esta en uso REALMENTE (cuenta o
+      // invitado) y por que. Si dice "session" y no hay sesion, el motor
+      // intenta capturar el acceso desde el navegador y, si no puede, cae a
+      // invitado: el cliente lo ve aqui.
+      ...(ENGINE === "graphql" ? {
+        motor: {
+          modo: ENGINE_MODE,
+          ...(motores.get(ENGINE_MODE)?.authInfo?.() ?? { modo: ENGINE_MODE, modo_configurado: ENGINE_MODE }),
+          salas: motores.get(ENGINE_MODE)?.roomsList?.()?.length ?? 0,
+          // El modo es configurable por peticion: {"engine_mode":"guest"} en el
+          // cuerpo o header x-meta-mode. Aqui se ve cual es el por defecto y
+          // que modos ya tienen motor creado en este proceso.
+          modo_por_defecto: ENGINE_MODE,
+          modos_disponibles: ["session", "guest"],
+          modos_activos: [...motores.keys()],
+        },
+      } : {}),
+  };
 }
 
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
-  const body = await new Promise((resolve) => { let d = ""; req.on("data", (c) => (d += c)); req.on("end", () => resolve(d)); });
+  let body = await new Promise((resolve) => { let d = ""; req.on("data", (c) => (d += c)); req.on("end", () => resolve(d)); });
   const json = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj, null, 2)); };
 
   // La autenticacion va ANTES de cualquier ruta: sin clave valida no se toca
   // el motor (no se abre chrome, no se gasta un turno de meta).
+  // Se consulta con la ruta ORIGINAL: "/api/chat" es una ruta del front
+  // (exenta en loopback) aunque despues se traduzca a "/v1/chat/completions".
   const authMsg = authRechaza(req, url.pathname);
   if (authMsg) return json(401, { error: { message: authMsg } });
+
+  // El front y la API son el mismo servicio: se traduce "/api/..." a "/v1/..."
+  // y sigue el mismo manejador.
+  const t = traducirFront(req.method, url.pathname, body);
+  url.pathname = t.ruta;
+  body = t.cuerpo;
+
+  // --- Front del webchat (en el mismo puerto que la API) ------------------
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+    try {
+      const html = readFileSync(FRONT_WEBCHAT, "utf8");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" });
+      return res.end(html);
+    } catch (err) {
+      return json(404, { error: { message: "el front del webchat no esta disponible" } });
+    }
+  }
+
+  // --- /api/estado: salud + sesion agregadas para el front ----------------
+  if (req.method === "GET" && url.pathname === "/api/estado") {
+    try {
+      const raw = payloadHealth();
+      const sesion = await payloadSesion();
+      const motor = raw.motor || {};
+      const modo = motor.modo;
+      const caidaAInvitado = Boolean(motor.caidaAInvitado);
+      const motivo = motor.motivo ? String(motor.motivo) : null;
+      // "logueado" es HONESTO: no basta con que el motor este configurado como
+      // "session"; la sesion propia tiene que estar EN USO y el motor no puede
+      // haber caido a invitado. Si no, el front cree que hay sesion y no
+      // ofrece ninguna ayuda.
+      const haySesion = typeof sesion.haySesion === "boolean" ? sesion.haySesion : Boolean(motor.tieneSesion);
+      const sesionEnUso = haySesion && modo === "session" && !caidaAInvitado;
+      return json(200, {
+        ok: raw.status === "ok",
+        api: `http://${HOST}:${PORT}`,
+        modo,
+        identidad: sesionEnUso ? "Tu cuenta" : "Invitado",
+        logueado: sesionEnUso,
+        user_id: motor.userId ?? null,
+        salas: motor.salas,
+        modo_por_defecto: motor.modo_por_defecto,
+        modos_disponibles: motor.modos_disponibles || ["session", "guest"],
+        modos_activos: motor.modos_activos || [],
+        caidaAInvitado,
+        motivo,
+        tiene_sesion: haySesion,
+        raw,
+      });
+    } catch (err) {
+      return json(503, { ok: false, api: `http://${HOST}:${PORT}`, error: String(err?.message || err) });
+    }
+  }
 
   // --- Panel: ajustes en caliente ------------------------------------------
   if (req.method === "GET" && url.pathname === "/v1/ajustes") {
@@ -2225,15 +2422,7 @@ async function route(req, res) {
   // token ni los valores de las cookies.
   if (req.method === "GET" && url.pathname === "/v1/sesion") {
     try {
-      const base = await estadoLogin();
-      const info = motores.get("session")?.authInfo?.() ?? { modo: "session" };
-      return json(200, {
-        ...base,
-        modo: info.modo ?? "session",
-        caidaAInvitado: info.caidaAInvitado === true,
-        motivo: info.motivo ?? null,
-        userId: info.userId ?? null,
-      });
+      return json(200, await payloadSesion());
     } catch (err) {
       return json(500, { error: { message: String(err?.message || err) } });
     }
@@ -2265,56 +2454,7 @@ async function route(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/health") {
-    return json(200, {
-      status: "ok",
-      workers: workers.map((w) => ({ id: w.id, busy: w.busy, q: w.queue.length })),
-      // Count only ACTIVE work. `jobs.size` counted every job ever submitted
-      // (finished ones were never pruned), so /health grew without bound and
-      // reported "pending" work that did not exist.
-      jobs_pending: [...jobs.values()].filter((j) => j.status === "queued" || j.status === "running").length,
-      // Honest self-report: /async is a deferred job handle, not parallelism.
-      concurrency: workers.length,
-      pool: { min: MIN_WORKERS, max: MAX_WORKERS, size: workers.length,
-              queued: workers.reduce((n, w) => n + w.queue.length, 0) },
-      // ESTIMATED, not measured: Meta's UI exposes no token counter. The page cannot
-    // be used: the thread is virtualized, so `main` reads ~250 chars on a long
-    // thread while `body` is ~190k chars of React payload. This counts what this
-    // broker sent and received instead.
-    context: { soft_pct: CONTEXT_SOFT_PCT, budget_chars: CONTEXT_BUDGET_CHARS,
-               seed_chars: CONTEXT_SEED_CHARS,
-               per_worker: workers.map((w) => ({
-                 id: w.id,
-                 chars: w.ctxChars || 0,
-                 pct: Math.round(((w.ctxChars || 0) / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100),
-                 rotates_at: Math.round(((w.ctxChars || 0) / Math.max(1, CONTEXT_BUDGET_CHARS)) * 100) >= CONTEXT_SOFT_PCT,
-               })) },
-      async_semantics: workers.length > 1 ? "parallel-across-tabs" : "serialized-single-tab",
-      mode_default: MODE_DEFAULT,
-      cooldown_until: cooldownUntil > Date.now() ? new Date(cooldownUntil).toISOString() : null,
-      // Idle lifecycle visibility: is Chrome open, when will it auto-close, and
-      // which conversation will the next request resume.
-      browser_open: !!chromeProc,
-      idle_close_ms: IDLE_CLOSE_MS,
-      idle_closes_at: idleTimer ? new Date(idleDeadline).toISOString() : null,
-      resume_url: lastThreadUrl,
-      // Motor protocol-first: que identidad esta en uso REALMENTE (cuenta o
-      // invitado) y por que. Si dice "session" y no hay sesion, el motor
-      // intenta capturar el acceso desde el navegador y, si no puede, cae a
-      // invitado: el cliente lo ve aqui.
-      ...(ENGINE === "graphql" ? {
-        motor: {
-          modo: ENGINE_MODE,
-          ...(motores.get(ENGINE_MODE)?.authInfo?.() ?? { modo: ENGINE_MODE, modo_configurado: ENGINE_MODE }),
-          salas: motores.get(ENGINE_MODE)?.roomsList?.()?.length ?? 0,
-          // El modo es configurable por peticion: {"engine_mode":"guest"} en el
-          // cuerpo o header x-meta-mode. Aqui se ve cual es el por defecto y
-          // que modos ya tienen motor creado en este proceso.
-          modo_por_defecto: ENGINE_MODE,
-          modos_disponibles: ["session", "guest"],
-          modos_activos: [...motores.keys()],
-        },
-      } : {}),
-    });
+    return json(200, payloadHealth());
   }
   // Warms the browser without sending anything: opens START_URL (home or a
   // reopened /prompt/<uuid>) so an operator can confirm the thread is loaded.
