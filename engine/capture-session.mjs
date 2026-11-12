@@ -38,9 +38,13 @@ const call = (method, params = {}) => new Promise((r) => { const id = seq++; pen
 
 await call("Network.enable");
 await call("Page.enable");
-if (!/meta\.ai/.test(page.url)) {
-	await call("Page.navigate", { url: "https://www.meta.ai/" });
-}
+// Se RECARGA la pagina SIEMPRE. El WS del gateway se crea al cargar, asi que
+// si la pestana ya estaba cargada (p. ej. la que abrio el login del usuario)
+// el evento webSocketCreated ya ocurrio antes de que este script se
+// conectara y la captura fallaba siempre con "no se abrio el WS del gateway".
+await call("Page.navigate", {
+	url: /^https?:\/\//.test(page.url) ? page.url : "https://www.meta.ai/",
+});
 
 // esperar el WS del gateway
 for (let i = 0; i < 40 && !socketUrl; i++) await new Promise((r) => setTimeout(r, 500));
@@ -58,7 +62,9 @@ const creds = {
 	capturedAt: new Date().toISOString(),
 	source: "capture-session.mjs",
 };
-console.error("token:", token.slice(0, 12) + "…", "| cookies:", cookies.map((c) => c.name).join(", "));
+// NUNCA se imprime el token (ni un fragmento): los logs se leen y se copian.
+// Solo se dice que se capturo y el NOMBRE de las cookies.
+console.error("token capturado (oculto) | cookies:", cookies.map((c) => c.name).join(", "));
 session.save(creds);
 console.error("guardado:", session.FILE);
 process.exit(0);
