@@ -25,6 +25,13 @@ Endpoints:
     POST /api/keys      -> proxy a /v1/keys (crea una clave; el secreto sale
                           SOLO en esta respuesta)
     DELETE /api/keys/<i> -> proxy a /v1/keys/<i> (revoca una clave)
+    GET  /api/sesion    -> proxy a /v1/sesion (estado de la sesion de Meta:
+                          si hay sesion, si se puede abrir la ventana, etc.)
+    POST /api/sesion/abrir    -> proxy a /v1/sesion/abrir (abre la ventana de
+                          Chrome con Meta.ai en el escritorio del servidor)
+    POST /api/sesion/capturar -> proxy a /v1/sesion/capturar (guarda la
+                          sesion; TIMEOUT amplio: la captura espera al
+                          WebSocket de Meta y el login puede tardar)
     GET  /v1/media/<f>  -> proxy de las imagenes y archivos generados. El
                           "?modo=" se acepta y se ignora (queda por compatibilidad
                           con URLs ya construidas).
@@ -42,6 +49,7 @@ Arranque:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -61,6 +69,11 @@ HOST = os.environ.get("WEBCHAAT_HOST", "127.0.0.1")
 # minutos: el deadline del motor es de 10 min y su presupuesto total (turno +
 # reintento) es de 15 min, asi que el proxy espera 16.
 TIMEOUT = httpx.Timeout(960.0, connect=10.0)
+
+# La captura de la sesion NO usa el timeout generico del proxy (20 s): espera
+# al WebSocket de Meta y el login puede tardar (el usuario esta escribiendo su
+# correo y su contrasena en la ventana). Con 20 s SIEMPRE fallaria.
+TIMEOUT_CAPTURA_SESION = 180.0
 
 # Credencial de servicio del webchat. La API la crea sola (engine/.webchat-key,
 # modo 600, EN CLARO) y este proxy la lee del disco para mandarla en X-API-Key.
@@ -130,30 +143,79 @@ async def estado() -> JSONResponse:
 
     Conserva su contrato original (503 si la API esta caida) y agrega lo que
     el back expone ahora: el modo por defecto y que motores ya estan creados.
+
+    "logueado" es HONESTO: no basta con que el motor este configurado como
+    "session"; la sesion propia tiene que estar EN USO y el motor no puede
+    haber caido a invitado. Antes decia "session" (y por lo tanto "Tu cuenta")
+    cuando el motor ya estaba hablando como invitado: el front creia que
+    habia sesion y no ofrecia ningun ayuda.
     """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(f"{API}/health", headers=cabecerasApi())
-            d = r.json()
+        # Las dos consultas van en paralelo: /health da el estado del motor y
+        # /v1/sesion dice si hay sesion guardada (eso solo se sabe cuando ya
+        # existe un motor en memoria, y al arrancar la API todavia no hay).
+        (codigo, d), (_, sesion) = await asyncio.gather(
+            _getJson(f"{API}/health", 10.0),
+            _getJson(f"{API}/v1/sesion", 5.0),
+        )
+        if codigo == 0:
+            raise RuntimeError("la API no respondio")
         motor = d.get("motor") or {}
         modo = motor.get("modo")
+        caida_a_invitado = bool(motor.get("caidaAInvitado"))
+        motivo = motor.get("motivo")
+        motivo = str(motivo) if motivo else None
+        # Si la API sabe si hay sesion (haySesion), manda eso: es la senal que
+        # usa tambien el boton "Iniciar sesion" del front. Si el endpoint aun
+        # no existe, se usa el tieneSesion que expone /health.
+        hay_sesion = sesion.get("haySesion")
+        if isinstance(hay_sesion, bool):
+            tiene_sesion = hay_sesion
+        else:
+            tiene_sesion = bool(motor.get("tieneSesion"))
+        # La sesion propia esta EN USO solo si el motor dice "session", hay
+        # sesion guardada y no ha caido a invitado.
+        sesion_en_uso = tiene_sesion and modo == "session" and not caida_a_invitado
         return JSONResponse({
             "ok": d.get("status") == "ok",
             "api": API,
             "modo": modo,
             # "logueado" = la sesion propia del usuario; "invitado" = sin sesion
-            "identidad": "Tu cuenta" if modo == "session" else "Invitado",
-            "logueado": modo == "session",
+            "identidad": "Tu cuenta" if sesion_en_uso else "Invitado",
+            "logueado": sesion_en_uso,
             "user_id": motor.get("userId"),
             "salas": motor.get("salas"),
             # modos que el back acepta por peticion ("engine_mode")
             "modo_por_defecto": motor.get("modo_por_defecto"),
             "modos_disponibles": motor.get("modos_disponibles") or ["session", "guest"],
             "modos_activos": motor.get("modos_activos") or [],
+            # senal honesta de la sesion: con esto decide el front si hace
+            # falta ofrecer el boton "Iniciar sesion".
+            "caidaAInvitado": caida_a_invitado,
+            "motivo": motivo,
+            "tiene_sesion": tiene_sesion,
             "raw": d,
         })
     except Exception as exc:  # noqa: BLE001 - el front muestra el error
         return JSONResponse({"ok": False, "api": API, "error": str(exc)}, status_code=503)
+
+
+async def _getJson(url: str, timeout: float) -> tuple[int, dict]:
+    """GET a la API devolviendo (status, cuerpo JSON).
+
+    Nunca lanza: si la API no responde devuelve (0, {}) para que el llamador
+    decida si eso es tolerable (como con /v1/sesion) o un fallo de verdad.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=cabecerasApi())
+        try:
+            cuerpo = r.json()
+        except Exception:  # noqa: BLE001
+            cuerpo = {}
+        return r.status_code, cuerpo if isinstance(cuerpo, dict) else {}
+    except Exception:  # noqa: BLE001
+        return 0, {}
 
 
 @app.post("/api/clear")
@@ -221,22 +283,94 @@ async def keys_delete(clave_id: str) -> JSONResponse:
     return await _proxyApi("DELETE", f"/v1/keys/{quote(clave_id, safe='')}")
 
 
-async def _proxyApi(metodo: str, ruta: str, contenido: bytes | None = None) -> JSONResponse:
+@app.get("/api/sesion")
+async def sesion_get() -> JSONResponse:
+    """Estado de la sesion de Meta (la que usa el motor).
+
+    Proxy tal cual de /v1/sesion: el front lo usa para decidir si hace falta
+    iniciar sesion y para saber si el servidor puede abrir la ventana.
+    """
+    return await _proxyApi("GET", "/v1/sesion")
+
+
+@app.post("/api/sesion/abrir")
+async def sesion_abrir() -> JSONResponse:
+    """Abre la ventana de Chrome con Meta.ai en el escritorio del servidor.
+
+    Proxy tal cual de /v1/sesion/abrir: el JSON y el status son los REALES de
+    la API (si no hay escritorio, el back lo dice con su propio mensaje).
+    """
+    return await _proxyApi("POST", "/v1/sesion/abrir")
+
+
+@app.post("/api/sesion/capturar")
+async def sesion_capturar() -> JSONResponse:
+    """Guarda la sesion que hay abierta en el Chrome de sesion.
+
+    TIMEOUT amplio (180 s): la captura espera al WebSocket de Meta y el
+    login puede tardar (el usuario esta escribiendo su correo y su contrasena
+    en la ventana del servidor). Con los 20 s del proxy generico SIEMPRE
+    fallaria, y el front veria un error que no existe.
+    """
+    return await _proxyApi("POST", "/v1/sesion/capturar", timeout=TIMEOUT_CAPTURA_SESION)
+
+
+@app.get("/api/prompt")
+async def prompt_get() -> JSONResponse:
+    """Prompt del agente editable desde el panel ("" = usar el prompt base).
+
+    Proxy tal cual de /v1/prompt: el JSON y el status son los REALES de la
+    API (incluido el 400 si el prompt excede el maximo).
+    """
+    return await _proxyApi("GET", "/v1/prompt")
+
+
+@app.put("/api/prompt")
+async def prompt_put(req: Request) -> JSONResponse:
+    """Guarda el prompt del agente. TIMEOUT normal: la API solo valida y
+    escribe en disco, no habla con Meta."""
+    return await _proxyApi("PUT", "/v1/prompt", contenido=await req.body())
+
+
+def _mensajeError(exc: Exception) -> str:
+    """Texto del error de TRANSPORTE (no de la API).
+
+    httpx deja VACIO el mensaje de los timeouts (str(exc) == ""): sin esto el
+    front recibiria un error sin texto y no podria explicar nada. Aqui se dice
+    que paso, sin inventar nada de la API.
+    """
+    texto = str(exc).strip()
+    if texto:
+        return texto
+    if isinstance(exc, httpx.TimeoutException):
+        return "la API no respondió a tiempo"
+    return f"no se pudo hablar con la API ({type(exc).__name__})"
+
+
+async def _proxyApi(
+    metodo: str,
+    ruta: str,
+    contenido: bytes | None = None,
+    timeout: float = 20.0,
+) -> JSONResponse:
     """Proxy JSON generico hacia la API.
 
     Devuelve el JSON y el status de la API tal cual (incluido el 400 con su
     mensaje y el 404 de una clave que no existe). Si la API no responde, un
     502 con { "error": { "message": ... } }: el front siempre tiene algo real
     que mostrar.
+
+    `timeout` se puede ampliar para las llamadas lentas (la captura de la
+    sesion).
     """
     cabeceras = cabecerasApi({"Accept": "application/json"})
     if contenido is not None:
         cabeceras["Content-Type"] = "application/json"
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.request(metodo, f"{API}{ruta}", content=contenido, headers=cabeceras)
     except Exception as exc:  # noqa: BLE001 - el front muestra el error
-        return JSONResponse({"error": {"message": str(exc)}}, status_code=502)
+        return JSONResponse({"error": {"message": _mensajeError(exc)}}, status_code=502)
     try:
         datos = r.json()
     except Exception:  # noqa: BLE001
