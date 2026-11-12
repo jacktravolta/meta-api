@@ -70,3 +70,10 @@ engine/.prompt-ajustes.json
 __pycache__/
 *.pyc
 state/
+
+# Salida generada: engine/pacman-loop.mjs escribe el juego que desarrolla
+# Meta. No es fuente, se regenera corriendo el script.
+games/
+
+# Indice local de CodeGraph (88 MB): lo regenera la herramienta.
+.codegraph/
