@@ -65,17 +65,54 @@ El usuario: "limpiarlo solo de lo que sea basura, hay mucha basura".
 
 ## Progreso
 
-- [x] **T3 (parcial)** — Residuos locales sin versionar borrados (316 KB):
-      `webchat/__pycache__/` (bytecode Python), `state/` (5 volcados de
-      diagnostico: `conversacion-larga-5h*.txt`, `telemetria-meta.jsonl`),
-      9 `engine/diag-*.mjs` de una vez (NO se borro `engine/diag-vacio.mjs`,
-      que esta versionado), `.atl/.skill-registry.cache.json`.
-      El servicio sigue sano tras la limpieza: `/health` -> 200.
+- [x] **T1** Versionados: fuera de git las salidas de runtime de `bridge/`
+      (10 archivos: `agent-log.txt`, `dictado-log.txt`, `espejo-log.txt`,
+      `espejo-msg.txt`, `msg-tecnica.txt`, `espejo-vistos.json`,
+      `espejo-vistos-img.json`, `hilo-nuevo.json`, `turno.json`, `wsp-qr.png`).
+      El mas importante era `espejo-log.txt`: arrastraba conversaciones
+      completas dentro del repo. Los archivos siguen en disco (los scripts los
+      regeneran) y ahora estan ignorados.
+- [x] **T2** Versionados: **33 scripts sin una sola referencia** en el repo
+      (grep de basename sobre los versionados, cero coincidencias):
+      29 de `bridge/` (diagnosticos del CDP de WhatsApp, era WSP retirada) y
+      4 de `engine/` (`sweep.mjs` —"experimento temporal" segun su propio
+      archivo—, `probe-img.mjs`, `probe-tools.mjs`, `screenshot-juego.mjs`).
+      Se conserva `engine/mejorar-imagen.mjs`: es herramienta de uso manual, no
+      un residuo.
+- [x] **T3** Locales: `webchat/__pycache__/`, `state/` (5 volcados), 9
+      `engine/diag-*.mjs` de una vez (NO `engine/diag-vacio.mjs`, que esta
+      versionado), `.atl/.skill-registry.cache.json`.
+- [x] **T4** `.gitignore`: cubren lo borrado (`__pycache__/`, `*.pyc`, `state/`,
+      los logs de `bridge/`, `engine/.prompt-ajustes.json`, `games/`,
+      `.codegraph/`).
+- [x] **T5** Verificado: tests en verde, `/health` 200, front 200.
 
 ## Evidencia
 
-- T3: `git status --porcelain --untracked-files=all` ya no lista residuos;
-  `curl /health` -> HTTP 200.
+- `node --test engine/*.test.mjs` → 117 pass, 0 fail.
+- `node --test agent/*.test.js` → 1 fallo **preexistente**
+  (`agent/sandbox.test.js` "selfCheck enforces the whole default posture",
+  depende del host): reproducido en un worktree limpio de HEAD, sin mis cambios.
+- `curl http://127.0.0.1:8055/` → 200; `/health` → 200.
+- `git status --porcelain` → arbol limpio.
+- 11 commits en la sesion, del `8cf7000` al `79533fc`.
+
+## Lo que quedo (y por que)
+
+- `bridge/` conserva los scripts del WSP que el documento de la feature
+  `guard-canal-whatsapp` referencia (`chk-wsp.mjs`, `probe-wsp.mjs`,
+  `ver-wsp.mjs`, `wsp-qr.mjs`, `fix-wsp-layout.mjs`, `reload-wsp.mjs`,
+  `simular-usuario.mjs`, `espejo-meta-wsp.mjs`, `enviar-media-wsp.mjs`). Son
+  historia documentada de una feature cerrada; borrarlos dejaria los docs
+  mintiendo. Si en algun momento se limpian esos docs, se borran con ellos.
+- `bridge/lib/` esta vivo: `bridge/lib/resolver.mjs` lo importa `server.mjs`.
+- `bridge/reglas.txt` es contenido (reglas del donbot), no salida de runtime.
+- `engine/capture-*.mjs`, `engine/dgw-*.mjs` y `engine/probe.mjs` se quedan:
+  son los arneses con los que se descubrio el protocolo; su conocimiento esta
+  en `engine/PROTOCOL.md` pero el arnes sirve para re-verificar.
+- `engine/fixtures/capture-ws-*.json` se quedan: son capturas del protocolo
+  real, no se regeneran baratas.
+
 
 ## Ruta por tarea
 
