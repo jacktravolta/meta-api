@@ -1,8 +1,12 @@
 # meta-api — Meta AI behind an OpenAI-compatible API
 
-Exposes Meta AI as an OpenAI-compatible endpoint. There is no Meta API: the
-"model" is a real Chrome instance driven through the DevTools Protocol (CDP), so
-requests are serialized and latency is browser latency.
+Exposes Meta AI as an OpenAI-compatible endpoint. There is no official Meta
+API: the broker speaks Meta's own gateway (DGW) over WebSocket, so a request is
+a real turn in Meta AI — with your own account or as an invited guest. No
+browser is involved at runtime.
+
+The webchat front is served by the same process on the same port: see
+*Front (webchat)* below.
 
 ```
 POST /v1/chat/completions        OpenAI-compatible (sync)
@@ -17,29 +21,40 @@ GET  /v1/models · GET /health
 - **Node >= 22.** The global `WebSocket` does not exist before Node 21. The
   server refuses to boot on anything older. Note that `/usr/bin/node` on this
   machine is 18.x — use nvm's: `/home/test/.nvm/versions/node/v22.23.3/bin/node`.
-- **Chrome Beta** at `/usr/bin/google-chrome-beta`.
-- **A Chrome profile with a live Meta AI session** (see *Login* below).
+- **No dependencies.** There is no `package.json` and nothing to install: the
+  broker, the engine and the webchat front are Node's standard library only.
+- **No browser at runtime.** The engine speaks Meta's gateway over WebSocket
+  (see *Motor protocol-first*). Chrome is needed only once, for the manual
+  login that captures a session (see *Login*).
 
 ## Install
 
 ```bash
-./relay/operar.sh install
-./relay/operar.sh start
+# 1) the unit and its drop-ins
+mkdir -p ~/.config/systemd/user
+cp systemd/meta-api.service ~/.config/systemd/user/
+cp -r systemd/meta-api.service.d ~/.config/systemd/user/
+
+# 2) adjust the two absolute paths in the unit: WorkingDirectory and ExecStart
+#    (the Node binary must be 22+)
+
+# 3) start it
+systemctl --user daemon-reload
+systemctl --user enable --now meta-api
+systemctl --user status meta-api
 ```
 
-The installer copies the broker and watcher units plus tracked drop-ins, but does
-**not** enable or start them. `start` enables and starts the broker, opens the
-logged-in Meta tab, and starts the watcher. `watch` attaches the current terminal
-to watcher logs. `stop` disables autostart and runtime-masks both units so another
-unit cannot indirectly restart scraping; a later `start` removes the masks and
-starts the stack again.
-The unit expects this checkout at `/home/test/test/meta-api` and Node 22 at the path in the
-unit; adjust those two paths in `systemd/meta-api.service` if you relocate it.
+The broker listens on `127.0.0.1:8055` by default (`META_API_HOST` /
+`META_API_PORT`). The webchat front is served on the same port — see *Front
+(webchat)* below. The unit expects this checkout at `/home/test/test/meta-api`
+and Node 22 at the path in the unit; adjust those two paths in
+`systemd/meta-api.service` if you relocate it.
 
 ## Login
 
-Meta AI will not render a composer without a session. The profile ships a stale
-cookie set, so log in once, by hand:
+The engine works with an invited (guest) session out of the box. To use your
+own Meta AI account instead, sign in once, by hand, and let the broker capture
+the session:
 
 ```bash
 systemctl --user stop meta-api
@@ -47,9 +62,10 @@ google-chrome-beta --user-data-dir=/home/test/.config/google-chrome-beta-debug \
   --no-first-run https://www.meta.ai
 ```
 
-Sign in, close Chrome, then run `./relay/operar.sh start` and
-`./relay/operar.sh warmup`. The session lives in the profile, so this is a one-time
-action.
+Sign in and close Chrome. Then open the webchat at `http://127.0.0.1:8055/`: it
+detects that there is no session and offers **Iniciar sesión**, which opens the
+login window and captures the session into `engine/.session.json` (mode 600).
+The token and the cookie values are never returned by the API — only the state.
 
 ## Front (webchat): la API y el panel en el mismo puerto
 
@@ -103,6 +119,10 @@ vuelve una unidad WSP, un watchdog de navegador o un Chrome en el arranque.
 | Variable | Default | Meaning |
 |---|---|---|
 | `META_API_HOST` / `META_API_PORT` | `127.0.0.1` / `8055` | listen address |
+| `META_ENGINE` | `graphql` | the only engine. Any other value aborts the boot with a clear message (the browser engine was removed) |
+| `META_ENGINE_MODE` | `session` | default identity: `session` (your account) or `guest` (invited). A request may override it with `{"engine_mode": "guest"}` or the `x-meta-mode` header |
+| `META_SESSION_CDP` | `9298` | CDP port of the Chrome used **only** to capture the session during the manual login |
+| `META_SESSION_PROFILE` | `~/.config/google-chrome-beta-debug` | Chrome profile used for that capture |
 | `META_MIN_WORKERS` | `1` | tabs opened up front. Each tab is an independent conversation |
 | `META_MAX_WORKERS` | `10` | hard cap on the pool. Requests beyond it queue on the least loaded worker |
 | `META_MODE` | `normal` | `speed` pastes with `Input.insertText`. `normal` types per character over CDP |
