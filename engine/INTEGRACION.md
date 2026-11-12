@@ -233,7 +233,25 @@ Lo que hace la API:
    viaja como un turno seguido en el **mismo hilo** de Meta (que conserva el
    contexto en su lado). Solo se usa la respuesta del último trozo.
 
-Verificado en vivo: request de 650 KB → 17 trozos → resumen correcto en 65 s.
+### 5.3 Un canal = un turno a la vez (y el hilo se rehace solo)
+
+- **Serializacion**: opencode manda la peticion del **titulo** en paralelo con
+  el turno principal. Si los dos turnos se cruzan en el mismo socket, las
+  respuestas se mezclan (los dos turnos quedan con el mismo `response_id` y no
+  hay respuesta). Por eso el motor **encola los turnos de un canal**: el
+  segundo espera al primero. Efecto medido: el turno completo paso de 76 s a
+  21 s.
+- **Turno vacio = hilo muerto**: medido el 2026-11-01, un turno que vuelve
+  sin texto **y** sin bloque de codigo deja el hilo sin responder para
+  siempre (todas las peticiones siguientes, aun con prompts chicos, se quedan
+  sin respuesta). Por eso:
+  1. el puntero de hilo (`reply_to`) **no avanza** con un turno vacio;
+  2. el motor **rehace el chat** (conversation_id nuevo) y vuelve a mandar el
+     prompt completo;
+  3. si un turno se queda mudo hasta el tope, tambien se rehace el hilo y se
+     reintenta una vez.
+- Ojo: un turno con **tool call** tiene el texto vacio, pero **no** es un turno
+  vacio (la llamada va en un bloque de codigo). `tieneCodigo()` lo distingue.
 
 ---
 

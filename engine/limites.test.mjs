@@ -10,7 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildFrame, FRAME, MAX_FRAME_BODY, MAX_PROMPT_BYTES } from "./pb.mjs";
-import { buildRequestPayload } from "./gateway.mjs";
+import { buildRequestPayload, tieneCodigo } from "./gateway.mjs";
 import { dividirPrompt, piezaDeContexto } from "./partir.mjs";
 import { toolsContract } from "./toolcall.mjs";
 
@@ -81,8 +81,34 @@ test("el envelope de un prompt de 40 KB entra en el frame", () => {
 	assert.ok(frame.length <= MAX_FRAME_BODY + 6, `frame de ${frame.length} bytes`);
 });
 
-test("contrato de tools compacto: 20 tools con schema grande no revientan el frame", () => {
-	const tools = Array.from({ length: 20 }, (_, i) => ({
+test("un turno con tool call NO es un turno vacio (el texto va vacio, el codigo no)", () => {
+	// caso real: meta entrega la tool call en GenAICodeUXPrimitive y el texto
+	// markdown queda vacio. Si se tomara por vacio, el hilo quedaria muerto.
+	const conTool = {
+		sections: [{
+			view_model: {
+				primitive: {
+					__typename: "GenAICodeUXPrimitive",
+					language: "json",
+					code_blocks: [{ content: '{"tool":"read","arguments":{"path":"x"}}' }],
+				},
+			},
+		}],
+	};
+	assert.equal(tieneCodigo(conTool), true, "la tool call cuenta como contenido");
+
+	const soloTexto = {
+		sections: [{
+			view_model: { primitive: { __typename: "GenAIMarkdownTextUXPrimitive", text: "hola" } },
+		}],
+	};
+	assert.equal(tieneCodigo(soloTexto), false, "un texto no es codigo, pero si es contenido");
+
+	const vacio = { sections: [{ view_model: { primitive: { __typename: "GenAIMarkdownTextUXPrimitive", text: "" } } }] };
+	assert.equal(tieneCodigo(vacio), false);
+});
+
+test("contrato de tools compacto: 20 tools con schema grande no revientan el frame", () => {	const tools = Array.from({ length: 20 }, (_, i) => ({
 		type: "function",
 		function: {
 			name: `tool_${i}`,

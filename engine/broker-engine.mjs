@@ -31,6 +31,7 @@ import { uploadAll } from "./upload.mjs";
 import { downloadImages } from "./media.mjs";
 import { extraerCodigo } from "./codigo.mjs";
 import { evento } from "./eventos.mjs";
+import { dumpActivo, volcar } from "./dump.mjs";
 import * as session from "./session.mjs";
 import { randomUUID } from "node:crypto";
 
@@ -45,6 +46,13 @@ const ROOMS = path.join(HERE, ".rooms.json");
 const MAX_ROOM_ID = 999_999;
 
 const DEFAULT_TTL_MS = 45 * 60_000; // conexion sin uso: se cierra (el hilo se reanuda)
+
+// Cebo de hilo nuevo: mensaje atador que se manda antes de la peticion real
+// cuando el hilo aun no tiene respuestas (ver #send).
+const CEBO = "[INICIO DE HILO] Este es el contexto de trabajo de la sesion. Guardalo. Responde solo la palabra OK.\n\n";
+const CEBO_CHARS = 2500;
+const CEBO_DEADLINE_MS = 25_000;
+const CEBO_WATCHDOG_MS = 12_000;
 
 function loadStore() {
 	try { return JSON.parse(fs.readFileSync(STORE, "utf8")); } catch { return {}; }
@@ -72,6 +80,7 @@ function saveRooms(rooms) {
 }
 
 export class MetaEngine {
+	#colas; // key -> promise: serializa los turnos de un canal
 	// idleMs: cuanto se espera el PRIMER frame de la respuesta. Con varias
 	// conversaciones simultaneas, el servidor puede encolar y tardar mas de
 	// 120 s -> el cliente abortaba (4001 KEEPALIVE_TIMEOUT) y perdia el turno.
@@ -79,7 +88,7 @@ export class MetaEngine {
 	// con un error claro en vez de colgar al cliente. Meta responde en 3-6 s
 	// normalmente: 45 s de silencio ya es un turno perdido.
 	constructor({ mode = "session", idleMs = 45_000, deadlineMs = 75_000, askTimeoutMs = 120_000,
-		cdpPort = 9298, debug = false,
+		cdpPort = 9298, debug = false, cebo = true,
 		fallbackToGuest = true } = {}) {
 		this.mode = mode === "guest" ? "guest" : "session";
 		this.idleMs = idleMs;
@@ -89,10 +98,14 @@ export class MetaEngine {
 		this.askTimeoutMs = askTimeoutMs;
 		this.cdpPort = cdpPort;
 		this.debug = debug;
+		// cebo de hilo nuevo (ver #send): ata el hilo a la peticion antes de
+		// mandarla, para que meta no la responda con el contexto de otro chat.
+		this.cebo = cebo !== false;
 		// si la sesion propia caduca y no se puede recuperar, se sigue como
 		// invitado en vez de dejar la API sin servicio.
 		this.fallbackToGuest = fallbackToGuest;
 		this.channels = new Map(); // key -> { convId, gw, title, lastUsed }
+		this.#colas = new Map(); // key -> promise: un turno a la vez por canal
 		this.store = loadStore();
 		this.rooms = loadRooms(); // id corto -> { usuario, canal, ... }
 		this.creds = null;
@@ -114,6 +127,61 @@ export class MetaEngine {
 	 */
 	async credentials() {
 		return this.#credentials();
+	}
+
+	/**
+	 * Borra en Meta la conversacion vigente del canal (best-effort) y retira
+	 * sus entradas del store (memoria Y disco) y de los canales vivos. Lo usa
+	 * el clear: sin esto cada clear deja un chat huerfano en la cuenta de
+	 * meta. NUNCA lanza: un fallo de borrado no puede bloquear un clear, y el
+	 * residuo lo barre engine/cleanup-chats.mjs.
+	 */
+	async borrarConversacionCanal(canalId) {
+		const claves = Object.keys(this.store).filter(
+			(k) => k === canalId || k.startsWith(`${canalId}:`)
+		);
+		const convIds = [...new Set(claves.map((k) => this.store[k]?.convId).filter(Boolean))];
+		if (!convIds.length) return { ok: true, borrados: 0, errores: [], detalle: "sin hilo previo" };
+
+		let gql = this.gql;
+		if (!gql) {
+			try { gql = new MetaGraphQL(await this.#credentials()); }
+			catch (err) {
+				return { ok: false, borrados: 0, errores: [`credenciales: ${String(err.message || err).slice(0, 90)}`] };
+			}
+		}
+
+		const errores = [];
+		let borrados = 0;
+		for (const convId of convIds) {
+			try {
+				const r = await gql.deleteConversation(convId);
+				if (r?.success === true || r?.__typename === "ConversationDeleted") borrados++;
+				else errores.push(`${String(convId).slice(0, 8)}: ${String(r?.message ?? r?.__typename ?? "respuesta no reconocida").slice(0, 90)}`);
+			} catch (err) {
+				errores.push(`${String(convId).slice(0, 8)}: ${String(err.message || err).slice(0, 90)}`);
+			}
+			await new Promise((r) => setTimeout(r, 300));
+		}
+
+		// Las entradas salen del store EN DISCO siempre: la generacion nueva no
+		// debe retomar un hilo marcado para borrar, ni al reiniciar el broker.
+		for (const k of claves) delete this.store[k];
+		try {
+			const disk = loadStore();
+			for (const k of claves) delete disk[k];
+			fs.writeFileSync(STORE, JSON.stringify(disk, null, 1), { mode: 0o600 });
+			fs.chmodSync(STORE, 0o600);
+		} catch { /* el store es opcional */ }
+		// y los canales vivos de este canal se cierran y descartan
+		for (const k of claves) {
+			const vivo = this.channels.get(k);
+			if (vivo) {
+				try { vivo.gw.close(); } catch { /* ya cerrado */ }
+				this.channels.delete(k);
+			}
+		}
+		return { ok: errores.length === 0, borrados, errores };
 	}
 
 	/**
@@ -310,6 +378,32 @@ export class MetaEngine {
 		return entry;
 	}
 
+	/**
+	 * Rehace el hilo de un usuario: chat nuevo (conversation_id nuevo) y punteros
+	 * a cero. Se usa cuando un turno se queda mudo: un hilo envenenado (por
+	 * ejemplo, tras un turno vacio) NO vuelve a responder, y el cliente no
+	 * puede quedarse esperando para siempre.
+	 */
+	#resetHilo(key, motivo = "turno sin respuesta") {
+		const c = this.channels.get(key);
+		if (c) {
+			try { c.gw.close(); } catch { /* ignore */ }
+			this.channels.delete(key);
+		}
+		const s = this.store[key];
+		if (s) {
+			delete s.convId;
+			delete s.replyTo;
+			delete s.messageIndex;
+			delete s.title;
+			s.depth = 0;
+			s.updatedAt = new Date().toISOString();
+			this.store[key] = s;
+			saveStoreEntry(key, s);
+		}
+		evento("HILO_REHECHO", { usuario: key, motivo });
+	}
+
 	async #conn(key) {
 		const now = Date.now();
 		for (const [k, c] of this.channels) {
@@ -347,6 +441,11 @@ export class MetaEngine {
 		const onJson = opts.onJson;
 		let ultimo = null;
 		const t0 = Date.now();
+		const key = this.#channelKey(opts.userId ?? "anon", opts.channel ?? "default");
+		// El primer intento manda el prompt entero. Si el turno vuelve VACIO,
+		// el hilo queda muerto (medido): se rehace el chat y se vuelve a mandar
+		// el prompt COMPLETO en el hilo nuevo (no un "continua" sin contexto).
+		let mandarOriginal = true;
 		for (let i = 0; i <= maxReintentos; i++) {
 			// presupuesto total: no se reintenta si ya se gasto el tiempo
 			const gastado = Date.now() - t0;
@@ -357,7 +456,7 @@ export class MetaEngine {
 				});
 				break;
 			}
-			const r = await this.ask(i === 0 ? prompt : "continua", {
+			const r = await this.ask(mandarOriginal ? prompt : "continua", {
 				...opts,
 				onJson: (j) => { frames.push(j); onJson?.(j); },
 			});
@@ -367,7 +466,13 @@ export class MetaEngine {
 			if (texto || bloques.length || (r.images?.length)) {
 				return { ...r, intentos: i + 1, bloques, ms: Date.now() - t0 };
 			}
-			evento("TURNO_VACIO", { usuario: `${opts.userId}:${opts.channel}`, intento: i + 1, ms: Date.now() - t0 });
+			evento("TURNO_VACIO", { usuario: `${opts.userId}:${opts.channel}`, intento: i + 1, ms: Date.now() - t0, vacio: r.vacio === true });
+			if (r.vacio && i < maxReintentos) {
+				this.#resetHilo(key, "turno vacio");
+				mandarOriginal = true;
+				continue;
+			}
+			mandarOriginal = false; // el siguiente reintento es "continua"
 		}
 		return { ...ultimo, intentos: maxReintentos + 1, bloques: [], ms: Date.now() - t0 };
 	}
@@ -380,10 +485,33 @@ export class MetaEngine {
 	async ask(prompt, { userId = "anon", channel = "default", onText, onJson, attachments = [],
 		watchdogMs = 20_000, watchdogPrompt = "continua" } = {}) {
 		const key = this.#channelKey(userId, channel);
+		// Un canal = un socket = un turno a la vez. OpenCode manda la peticion
+		// del TITULO en paralelo con el turno principal: si los dos turnos se
+		// cruzan en el mismo socket, las respuestas se mezclan (medido: ambos
+		// turnos se quedan con el mismo response_id y no hay respuesta).
+		return this.#enCola(key, () => this.#askEnCola(key, prompt, { onText, onJson, attachments, watchdogMs, watchdogPrompt }));
+	}
+
+	/** Serializa por canal: el turno que llega espera al que esta en curso. */
+	async #enCola(key, fn) {
+		const previo = this.#colas.get(key) ?? Promise.resolve();
+		let liberar;
+		const mio = new Promise((r) => { liberar = r; });
+		this.#colas.set(key, previo.then(() => mio));
+		await previo;
+		try {
+			return await fn();
+		} finally {
+			liberar();
+		}
+	}
+
+	async #askEnCola(key, prompt, { onText, onJson, attachments, watchdogMs, watchdogPrompt }) {
 		let lastError = null;
 		let renewed = false;
 		let reconnected = false;
 		const t0 = Date.now();
+		let hiloReset = false;
 		// El try incluye la APERTURA de la conexion: un fallo de DNS o de
 		// upgrade no debe costar el turno (medido: 14 EAI_AGAIN en la emulacion
 		// de 1 h, cada uno perdia un turno).
@@ -399,6 +527,18 @@ export class MetaEngine {
 				return await this.#send(key, entry, prompt, onText, attachments, renewed, reconnected, onJson, watchdogMs, watchdogPrompt, restante);
 			} catch (err) {
 				lastError = err;
+				const msg = String(err?.message ?? err);
+				// turno mudo: el hilo puede estar envenenado -> se rehace una vez
+				// y se reintenta en el chat nuevo (el prompt va completo, asi que
+				// no se pierde el contexto).
+				if (!hiloReset && /sin respuesta completa|sin frames por|KEEPALIVE_TIMEOUT|presupuesto/i.test(msg)) {
+					hiloReset = true;
+					this.#resetHilo(key, msg.slice(0, 80));
+					if (entry) {
+						try { entry.gw.close(); } catch { /* ignore */ }
+					}
+					continue;
+				}
 				const authError = err instanceof GatewayError
 					&& (err.code === CLOSE.UNAUTHORIZED || err.code === CLOSE.REJECTED);
 				// se fuerza la reconexion para el proximo intento
@@ -438,6 +578,33 @@ export class MetaEngine {
 			reply_to: entry.gw.replyTo, adjuntos: uploaded.length,
 			chars: prompt.length, prompt: prompt.replace(/\s+/g, " ").slice(0, 120),
 		});
+		// --- CEBO DE HILO NUEVO ---
+		// El PRIMER mensaje de una conversacion (sin reply_to) se lo responde
+		// meta con el contexto del chat ACTIVO de la cuenta: medido el
+		// 2026-11-01, la respuesta se colaba de un chat ajeno (el del gimnasio
+		// del usuario) y no tenia nada que ver con la peticion. El SEGUNDO
+		// mensaje del hilo (con reply_to) siempre va bien.
+		// Rebanada: se manda una version compacta de la peticion para atar el
+		// hilo a NUESTRO tema, se descarta su respuesta, y la peticion real
+		// entra despues con reply_to (hilo inequivoco).
+		if (!entry.gw.replyTo && !entry.gw.depth && this.cebo) {
+			const compacto = prompt.length > CEBO_CHARS
+				? prompt.slice(0, CEBO_CHARS) + "\n[...contexto recortado, la peticion completa viene despues...]"
+				: prompt;
+			const tc = Date.now();
+			try {
+				await entry.gw.chat(`${CEBO}${compacto}`, {
+					attachments: [],
+					idleMs: this.idleMs,
+					deadlineMs: CEBO_DEADLINE_MS,
+					watchdogMs: CEBO_WATCHDOG_MS,
+					watchdogPrompt,
+				});
+				evento("CEBO", { usuario: key, conv: entry.convId, ms: Date.now() - tc, chars: compacto.length });
+			} catch (err) {
+				evento("CEBO_FALLO", { usuario: key, conv: entry.convId, motivo: String(err.message ?? err).slice(0, 120) });
+			}
+		}
 		let nudge = null;
 		// El frame DGW tiene el largo en u16 (65535 bytes): un prompt grande no
 		// entra en un solo turno. Se parte en trozos y cada trozo va como un
@@ -445,13 +612,16 @@ export class MetaEngine {
 		// Solo se usa la respuesta del ULTIMO trozo: las partes anteriores solo
 		// existen para entregar el contexto.
 		const piezas = dividirPrompt(prompt, MAX_PROMPT_BYTES);
+		// Diagnostico opt-in: los frames crudos de meta (META_DUMP=1).
+		const crudos = dumpActivo() ? [] : null;
+		if (crudos) volcar("prompt", { usuario: key, conv: entry.convId, chars: prompt.length, partes: piezas.length, prompt });
 		if (piezas.length > 1) {
 			evento("PROMTO_PARTIDO", {
 				usuario: key, conv: entry.convId, partes: piezas.length,
 				chars: prompt.length, max_pieza: MAX_PROMPT_BYTES,
 			});
 		}
-		let text = "", reqId = null, responseId = null, images = [], response = null;
+		let text = "", reqId = null, responseId = null, images = [], response = null, vacio = false;
 		for (let i = 0; i < piezas.length; i++) {
 			const ultima = i === piezas.length - 1;
 			const r = await entry.gw.chat(piezaDeContexto(piezas[i], i, piezas.length), {
@@ -459,6 +629,7 @@ export class MetaEngine {
 				// cliente veria los "OK" de las partes intermedias.
 				onText: ultima ? onText : undefined,
 				onJson: ultima ? onJson : undefined,
+				onCrudo: crudos ? (j) => crudos.push(j) : undefined,
 				attachments: i === 0 ? uploaded : [],
 				idleMs: this.idleMs,
 				deadlineMs: presupuestoMs ? Math.min(this.deadlineMs, presupuestoMs) : this.deadlineMs,
@@ -469,9 +640,11 @@ export class MetaEngine {
 				},
 			});
 			if (ultima) ({ text, reqId, responseId, images, response } = r);
+			if (ultima) vacio = r.vacio === true;
 		}
 		// las imagenes generadas llegan como URL CDN firmada (caduca): se bajan
 		const bajadas = await downloadImages(images, { convId: entry.convId });
+		if (crudos) volcar("meta", { usuario: key, conv: entry.convId, chars: (text ?? "").length, vacio, crudos, respuesta: response });
 		evento("RESPUESTA", {
 			usuario: key, conv: entry.convId, ms: Date.now() - t0, chars: (text ?? "").length,
 			imagenes: bajadas.length, response_id: responseId,
@@ -514,6 +687,7 @@ export class MetaEngine {
 			text, conversationId: entry.convId, userId: this.creds?.userId ?? null,
 			renewed, reconnect: reconnect || !!entry.reopened,
 			nudge, response,
+			vacio,
 			images: bajadas.map((i) => ({ url: i.url, mime: i.mime, bytes: i.bytes, path: i.path })),
 		};
 	}
