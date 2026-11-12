@@ -156,6 +156,17 @@
   .aviso.err { color: var(--err); }
   .aviso.warn { color: var(--warn); }
   .boton-chico { font-size: 12px; padding: 4px 9px; }
+  /* Filas del estado de la sesion (tarjeta "Sesion de Meta"): dato y valor. */
+  .fila-estado { display: flex; justify-content: space-between; gap: 14px; font-size: 12.5px; padding: 3px 0; }
+  .fila-estado .k { color: var(--dim); }
+  .fila-estado .v { text-align: right; word-break: break-word; }
+  /* Textarea del editor de prompt: mismo aspecto que los inputs del panel. */
+  textarea.panel-campo {
+    width: 100%; font: inherit; color: var(--txt); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+    resize: vertical; min-height: 140px; font-size: 13px; line-height: 1.5;
+  }
+  textarea.panel-campo:focus { outline: none; border-color: #3d5a8a; }
   /* El secreto nuevo: se destaca porque solo se ve esta vez. */
   .secreto { margin-top: 14px; border: 1px solid #57431a; background: #2a2314; border-radius: 10px; padding: 12px; }
   .secreto-cab { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; font-size: 13px; }
@@ -176,6 +187,37 @@
   .pill.revocada { color: var(--err); border-color: #5c2222; background: #2a1515; }
   .pill.caducada { color: var(--warn); border-color: #57431a; background: #2a2314; }
   .vacio-panel { color: var(--dim); font-size: 12.5px; padding: 8px 0; }
+
+  /* ---------------------------------------------------------------- login de Meta
+     Boton del header + modal del flujo de inicio de sesion. Mismo fondo,
+     tipografia y variables que el resto: es la MISMA aplicacion. */
+  #btn-login { border-color: var(--accent); color: #cfe0ff; white-space: nowrap; }
+  #btn-login[hidden] { display: none; }
+  .modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px; }
+  .modal[hidden] { display: none; }
+  .modal-fondo { position: absolute; inset: 0; background: rgba(5, 7, 11, .72); }
+  .modal-caja {
+    position: relative; width: min(560px, 100%); max-height: 88vh; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px 18px 18px; box-shadow: 0 18px 50px rgba(0, 0, 0, .45);
+  }
+  .modal-cab { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+  .modal-cab h2 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  .modal-x { margin-left: auto; padding: 2px 9px; line-height: 1.35; }
+  .pasos { margin: 0 0 14px; padding-left: 22px; display: grid; gap: 12px; }
+  .pasos li { font-size: 13.5px; line-height: 1.5; }
+  .acciones-paso { margin-top: 7px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .paso-ok { font-size: 12.5px; color: var(--ok); }
+  .paso-ok[hidden] { display: none; }
+  /* Aviso flotante: confirmaciones cortas (por ejemplo, "sesion guardada"). */
+  .toast {
+    position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 60;
+    max-width: 92vw; padding: 9px 14px; border-radius: 10px; background: var(--panel-2);
+    border: 1px solid #21462a; color: var(--ok); font-size: 13px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .4);
+  }
+  .toast[hidden] { display: none; }
+  .toast.err { border-color: #5c2222; color: var(--err); }
 </style>
 </head>
 <body>
@@ -189,7 +231,12 @@
     <button type="button" id="seg-sesion" class="seg on" title="Enviar por la API con sesión">Con sesión</button>
     <button type="button" id="seg-guest" class="seg invitado" title="Enviar por la API de invitado (sin sesión)">Sin sesión</button>
   </div>
+  <!-- Siempre alcanzable (a diferencia de #btn-login, que aparece solo cuando
+       falta sesion): abre el modal para ver el estado, iniciar sesion o
+       REEMPLAZAR la guardada. -->
+  <button type="button" id="btn-sesion" class="solo-chat" title="Sesión de Meta: ver estado, iniciar sesión o reemplazar la guardada">Sesión de Meta</button>
   <span id="estado" class="badge">conectando…</span>
+  <button type="button" id="btn-login" hidden title="Iniciar sesión en Meta">Iniciar sesión</button>
   <span id="modelo" class="badge">meta-ai</span>
   <span class="crece"></span>
   <button id="nueva" class="solo-chat" title="Limpiar el canal: meta abre una conversacion nueva con el mismo canal">Limpiar canal</button>
@@ -251,6 +298,46 @@
         <span id="msg-ajustes" class="aviso"></span>
       </div>
       <p class="nota peq" id="ajustes-actualizado"></p>
+    </div>
+
+    <!-- ------------------------------------------------ sesion de Meta -->
+    <!-- Siempre visible en el panel: el boton #btn-login del header aparece
+         solo cuando falta sesion, y este estado NO depende de eso. Todo lo
+         que se muestra viene de /api/sesion: aqui no se inventa nada. -->
+    <div class="tarjeta">
+      <div class="tarjeta-cab">
+        <h2>Sesión de Meta</h2>
+        <span id="sesion-badge" class="badge">—</span>
+        <button type="button" id="sesion-actualizar" class="chico" title="Volver a pedir el estado real a la API">Actualizar</button>
+      </div>
+      <p class="nota warn" style="margin-bottom: 12px;">Guardar una sesión nueva <strong>reemplaza la sesión vigente</strong>: la captura sobrescribe lo que está guardado.</p>
+      <div id="sesion-filas">
+        <span class="vacio-panel">Consultando el estado de la sesión…</span>
+      </div>
+      <p class="aviso" id="msg-sesion"></p>
+      <div class="acciones" style="margin-top: 10px;">
+        <button type="button" id="abrir-modal-sesion" class="primario" title="Abre el flujo de inicio de sesión (guardar reemplaza la sesión vigente)">Iniciar sesión en Meta…</button>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------ prompt del agente -->
+    <div class="tarjeta ancha">
+      <div class="tarjeta-cab">
+        <h2>Prompt del agente</h2>
+        <span id="prompt-badge" class="badge">—</span>
+      </div>
+      <p class="nota">Instrucciones extra que la API le entrega a Meta en cada mensaje, antes del historial. Se aplican desde el <strong>próximo mensaje</strong>, sin reiniciar la API. Vacío = prompt base.</p>
+      <div class="campo">
+        <label for="prompt-txt">Prompt personalizado</label>
+        <textarea id="prompt-txt" class="panel-campo" rows="10" placeholder="Ej: Responde siempre en español. Antes de generar un archivo, confirma el formato que necesito."></textarea>
+        <p class="ayuda"><span id="prompt-contador">0</span> / <span id="prompt-max">—</span> caracteres</p>
+      </div>
+      <div class="acciones">
+        <button type="button" id="guardar-prompt" class="primario">Guardar prompt</button>
+        <button type="button" id="restablecer-prompt">Restablecer</button>
+        <span id="msg-prompt" class="aviso"></span>
+      </div>
+      <p class="nota peq" id="prompt-actualizado"></p>
     </div>
 
     <!-- ------------------------------------------------ api keys -->
@@ -316,6 +403,46 @@
   </div>
 </section>
 
+<!-- ------------------------------------------------ modal: iniciar sesión en Meta -->
+<!--
+  Flujo de 3 pasos. Todo lo que se cuenta (si hay escritorio, si la ventana ya
+  estaba abierta, cuando se guardo la sesion) viene de /api/sesion: aqui no se
+  inventa nada. Si algo falla, se muestra el mensaje REAL de la API.
+-->
+<div id="modal-sesion" class="modal" hidden>
+  <div class="modal-fondo" id="modal-fondo"></div>
+  <div class="modal-caja" role="dialog" aria-modal="true" aria-labelledby="modal-sesion-titulo">
+    <div class="modal-cab">
+      <h2 id="modal-sesion-titulo">Iniciar sesión en Meta</h2>
+      <button type="button" id="modal-cerrar" class="modal-x" title="Cerrar" aria-label="Cerrar">✕</button>
+    </div>
+
+    <ol class="pasos">
+      <li>
+        Abre una ventana de Chrome con Meta.ai en el escritorio del servidor.
+        <div class="acciones-paso">
+          <button type="button" id="abrir-meta" class="primario">Abrir Meta</button>
+          <span class="paso-ok" id="paso-ok-1" hidden>✓ ventana abierta</span>
+        </div>
+      </li>
+      <li>Inicia sesión con tu cuenta (correo y contraseña) en esa ventana.</li>
+      <li>
+        Vuelve aquí y pulsa Guardar sesión.
+        <div class="acciones-paso">
+          <button type="button" id="guardar-sesion">Guardar sesión</button>
+          <span class="paso-ok" id="paso-ok-3" hidden>✓ sesión guardada</span>
+        </div>
+      </li>
+    </ol>
+
+    <p class="aviso" id="sesion-aviso"></p>
+    <p class="nota peq" id="sesion-detalle"></p>
+  </div>
+</div>
+
+<!-- Aviso flotante: confirmaciones cortas (por ejemplo, "sesión guardada"). -->
+<div id="toast" class="toast" hidden role="status" aria-live="polite"></div>
+
 <script>
 // ---------------------------------------------------------------- estado
 const CLAVE_HILO = "webchat.hilo";
@@ -331,6 +458,12 @@ let modoSel = localStorage.getItem(CLAVE_MODO) === "guest" ? "guest" : "session"
 let ultimoModo = null;
 let historial = [];          // mensajes OpenAI (system no hace falta: meta lo pone el cliente)
 let ocupada = false;
+// Momento en que se guardo la sesion de Meta desde el modal (0 = nunca). El
+// motor puede seguir en invitado un rato despues de guardar (la API lo
+// reinicia en el siguiente turno): durante esa ventana el boton "Iniciar
+// sesion" no vuelve a aparecer, porque el usuario ya hizo lo que tenia que
+// hacer.
+let sesionGuardadaEn = 0;
 
 // ---------------------------------------------------------------- estado de la API
 async function refrescarEstado() {
@@ -349,7 +482,8 @@ async function refrescarEstado() {
     const elegido = modoSel === "guest" ? "sin sesión" : "con sesión";
     badge.title = `API ${d.api} · modo por defecto ${d.modo} · salas ${d.salas ?? "-"}` +
       ` · modos: ${(d.modos_disponibles || ["session", "guest"]).join(", ")}` +
-      ` · elegido: ${elegido}`;
+      ` · elegido: ${elegido}` +
+      (d.motivo ? ` · motivo: ${d.motivo}` : "");
     if (ultimoModo && ultimoModo !== modoSel) {
       badge.className = "badge warn";
       badge.textContent = `Último turno: ${ultimoModo === "guest" ? "invitado" : "tu cuenta"} (elegiste ${elegido})`;
@@ -357,6 +491,9 @@ async function refrescarEstado() {
       badge.className = "badge ok";
       badge.textContent = `${d.identidad} · ${elegido}` + (d.user_id ? ` (${d.user_id})` : "");
     }
+    // El boton "Iniciar sesion" se decide aqui (no hay ningun bucle nuevo):
+    // aparece solo cuando hace falta, con la senal HONESTA del back.
+    aplicarEstadoSesion(d);
   } catch (e) {
     badge.className = "badge err";
     badge.textContent = "API inaccesible";
@@ -872,6 +1009,8 @@ function aplicarVista() {
   if (panel) {
     cargarAjustes();
     cargarClaves();
+    cargarSesionPanel();
+    cargarPrompt();
   }
 }
 
@@ -1158,6 +1297,352 @@ $("#copiar-secreto").addEventListener("click", async () => {
     msg.className = "aviso err";
     msg.textContent = "No se pudo copiar: selecciona el texto y cópialo a mano.";
   }
+});
+
+// ---------------------------------------------------------------- sesion de Meta (panel)
+//
+// Estado SIEMPRE visible en el panel (el #btn-login del header aparece solo
+// cuando hace falta: ese comportamiento no se toca). Todo lo que se muestra
+// viene de /api/sesion, el MISMO endpoint que alimenta el modal: no hay una
+// segunda fuente de verdad. Si algo falla, el mensaje real del back.
+
+let infoSesionPanel = null;   // lo que respondio /api/sesion (null = cargando)
+
+function filaEstado(clave, valor) {
+  const fila = document.createElement("div");
+  fila.className = "fila-estado";
+  const k = document.createElement("span");
+  k.className = "k";
+  k.textContent = clave;
+  const v = document.createElement("span");
+  v.className = "v";
+  v.textContent = valor;
+  fila.appendChild(k);
+  fila.appendChild(v);
+  return fila;
+}
+
+function pintarSesionPanel() {
+  const badge = $("#sesion-badge");
+  const cont = $("#sesion-filas");
+  const msg = $("#msg-sesion");
+  cont.innerHTML = "";
+  const d = infoSesionPanel;
+  if (!d) return;   // se queda el "Consultando…" del HTML
+
+  if (d.error) {
+    badge.className = "badge err";
+    badge.textContent = "no se pudo leer";
+    const span = document.createElement("span");
+    span.className = "vacio-panel";
+    span.textContent = "No se pudo leer el estado de la sesión: " + d.error;
+    cont.appendChild(span);
+    msg.className = "aviso";
+    msg.textContent = "";
+    return;
+  }
+
+  // La señal HONESTA: sesión guardada Y el motor sin caer a invitado.
+  const activa = d.haySesion === true && d.caidaAInvitado !== true;
+  badge.className = "badge " + (activa ? "ok" : d.haySesion ? "warn" : "err");
+  badge.textContent = activa ? "activa" : d.haySesion ? "invitado" : "sin sesión";
+
+  cont.appendChild(filaEstado("Sesión guardada", d.capturadoEn ? formateaFecha(d.capturadoEn) : "no"));
+  cont.appendChild(filaEstado("Identidad en uso", activa && d.modo === "session" ? "tu cuenta" : "invitado"));
+  cont.appendChild(filaEstado("Navegador de sesión", d.cdpActivo ? `activo (puerto ${d.cdpPuerto})` : "no responde"));
+  cont.appendChild(filaEstado("Escritorio del servidor", d.display || "sin DISPLAY"));
+
+  if (!d.haySesion) {
+    msg.className = "aviso warn";
+    msg.textContent = "No hay sesión guardada: el chat funciona como invitado.";
+  } else if (d.caidaAInvitado) {
+    msg.className = "aviso warn";
+    msg.textContent = "El motor cayó a invitado" + (d.motivo ? ": " + d.motivo : "") + ". Inicia sesión y guarda para volver a tu cuenta.";
+  } else {
+    msg.className = "aviso";
+    msg.textContent = "";
+  }
+}
+
+async function cargarSesionPanel() {
+  try {
+    const r = await fetch("/api/sesion");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    infoSesionPanel = d;
+  } catch (e) {
+    infoSesionPanel = { error: e.message || String(e) };
+  }
+  pintarSesionPanel();
+}
+
+$("#sesion-actualizar").addEventListener("click", () => cargarSesionPanel());
+// Abre el MISMO modal del botón del header: un solo flujo, un solo estado.
+$("#btn-sesion").addEventListener("click", abrirModalSesion);
+$("#abrir-modal-sesion").addEventListener("click", abrirModalSesion);
+
+// ---------------------------------------------------------------- prompt del agente (panel)
+//
+// Editor del prompt del propietario. El tope lo manda la API (20000); aqui se
+// muestra y se frena con maxlength. Guardar NO reinicia nada: la API lee el
+// prompt del disco en cada turno, asi que aplica desde el proximo mensaje.
+
+const PROMPT_MAX = 20000;   // mismo tope que la API (engine/prompt-ajustes.mjs)
+$("#prompt-txt").maxLength = PROMPT_MAX;
+$("#prompt-max").textContent = PROMPT_MAX.toLocaleString("es-CL");
+
+function pintarContadorPrompt() {
+  $("#prompt-contador").textContent = $("#prompt-txt").value.length.toLocaleString("es-CL");
+}
+
+// Pinta el estado que devolvio la API (lo REAL, no lo que el navegador creo).
+function pintarEstadoPrompt(d) {
+  $("#prompt-txt").value = typeof d.prompt === "string" ? d.prompt : "";
+  pintarContadorPrompt();
+  const badge = $("#prompt-badge");
+  badge.className = "badge " + (d.prompt ? "ok" : "");
+  badge.textContent = d.prompt ? "personalizado" : "prompt base";
+  $("#prompt-actualizado").textContent = d.actualizadoEn
+    ? "Último guardado: " + formateaFecha(d.actualizadoEn)
+    : "Nunca se guardó un prompt: se usa el prompt base.";
+}
+
+async function cargarPrompt() {
+  const msg = $("#msg-prompt");
+  try {
+    const r = await fetch("/api/prompt");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    pintarEstadoPrompt(d);
+    msg.className = "aviso";
+    msg.textContent = "";
+  } catch (e) {
+    const badge = $("#prompt-badge");
+    badge.className = "badge err";
+    badge.textContent = "no se pudo leer";
+    msg.className = "aviso err";
+    msg.textContent = e.message || String(e);
+  }
+}
+
+async function guardarPromptValor(texto, mensajeOk) {
+  const boton = texto === "" ? $("#restablecer-prompt") : $("#guardar-prompt");
+  const msg = $("#msg-prompt");
+  boton.disabled = true;
+  msg.className = "aviso";
+  msg.textContent = "Guardando…";
+  try {
+    const r = await fetch("/api/prompt", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: texto }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    pintarEstadoPrompt(d);
+    msg.className = "aviso ok";
+    msg.textContent = mensajeOk;
+    avisoFlotante(texto === "" ? "Prompt restablecido ✓" : "Prompt guardado ✓");
+  } catch (e) {
+    msg.className = "aviso err";
+    msg.textContent = e.message || String(e);
+  } finally {
+    boton.disabled = false;
+  }
+}
+
+$("#prompt-txt").addEventListener("input", pintarContadorPrompt);
+
+$("#guardar-prompt").addEventListener("click", () => {
+  guardarPromptValor($("#prompt-txt").value, "Prompt guardado: aplica desde el próximo mensaje.");
+});
+
+$("#restablecer-prompt").addEventListener("click", () => {
+  // Mismo criterio que revocar una clave: la accion es destructiva (se pierde
+  // el prompt guardado), se pide confirmacion.
+  if (!window.confirm("¿Restablecer el prompt base? Se borra el prompt guardado y no se puede deshacer.")) return;
+  guardarPromptValor("", "Prompt restablecido: se usa el prompt base desde el próximo mensaje.");
+});
+
+// ---------------------------------------------------------------- login de Meta
+//
+// El boton "Iniciar sesion" del header aparece SOLO cuando hace falta: no hay
+// sesion guardada o el motor cayo a invitado. La decision sale del refresco
+// periodico de /api/estado (el que ya existe): no hay ningun bucle nuevo.
+//
+// El modal tiene tres pasos y muestra lo REAL: el estado que devuelve
+// /api/sesion, el mensaje de la API y, si algo falla, el error tal cual
+// (error.message). Nunca un texto generico inventado.
+const AVISO_OPTIMISTA_MS = 30000;
+let infoSesion = null;       // lo que respondio /api/sesion (null = cargando)
+let faseSesion = "inicial";  // inicial | abriendo | abierta | guardando | guardada | error
+let errorSesion = "";        // el mensaje REAL del error
+let detalleSesion = "";      // el mensaje REAL de la API en el ultimo paso
+let toastTic = null;
+
+function haceFaltaLogin(d) {
+  if (!d.tiene_sesion) return true;
+  if (!d.caidaAInvitado) return false;
+  // Tras guardar la sesion, el motor puede seguir en invitado un rato (la API
+  // lo reinicia en el siguiente turno). En esa ventana el boton no reaparece:
+  // el usuario ya hizo lo que tenia que hacer.
+  return Date.now() - sesionGuardadaEn > AVISO_OPTIMISTA_MS;
+}
+
+function aplicarEstadoSesion(d) {
+  const btn = $("#btn-login");
+  const falta = haceFaltaLogin(d);
+  btn.hidden = !falta;
+  btn.title = falta
+    ? "Iniciar sesión en Meta" + (d.motivo ? `: ${d.motivo}` : "")
+    : "La sesión de Meta está activa";
+}
+
+function avisoFlotante(texto, esError = false) {
+  const t = $("#toast");
+  t.className = "toast" + (esError ? " err" : "");
+  t.textContent = texto;
+  t.hidden = false;
+  clearTimeout(toastTic);
+  toastTic = setTimeout(() => { t.hidden = true; }, 4000);
+}
+
+function pintarModalSesion() {
+  const btnAbrir = $("#abrir-meta");
+  const btnGuardar = $("#guardar-sesion");
+  const ocupado = faseSesion === "abriendo" || faseSesion === "guardando";
+  const cargando = infoSesion == null;
+  const puede = !!infoSesion && infoSesion.puedeAbrirVentana === true;
+
+  btnAbrir.disabled = ocupado || cargando || !puede;
+  btnGuardar.disabled = ocupado || cargando || faseSesion === "guardada";
+  btnAbrir.textContent = faseSesion === "abriendo" ? "Abriendo…" : "Abrir Meta";
+  btnGuardar.textContent = faseSesion === "guardando" ? "Guardando…" : "Guardar sesión";
+  $("#paso-ok-1").hidden = !(faseSesion === "abierta" || faseSesion === "guardando" || faseSesion === "guardada");
+  $("#paso-ok-3").hidden = faseSesion !== "guardada";
+
+  const aviso = $("#sesion-aviso");
+  let texto = "";
+  let clase = "";
+  if (faseSesion === "abriendo") {
+    texto = "abriendo…";
+  } else if (faseSesion === "abierta") {
+    texto = "ventana abierta: inicia sesión en ella";
+    clase = "ok";
+  } else if (faseSesion === "guardando") {
+    texto = "guardando… (puede tardar hasta un minuto)";
+  } else if (faseSesion === "guardada") {
+    texto = "sesión guardada ✓";
+    clase = "ok";
+  } else if (faseSesion === "error") {
+    texto = errorSesion;
+    clase = "err";
+  } else if (cargando) {
+    texto = "consultando el estado de la sesión…";
+  } else if (infoSesion.error) {
+    texto = infoSesion.error;
+    clase = "err";
+  } else if (!puede) {
+    texto = "En este servidor no se puede abrir la ventana de Chrome: no hay un escritorio disponible.";
+    clase = "warn";
+  }
+  aviso.className = "aviso" + (clase ? " " + clase : "");
+  aviso.textContent = texto;
+
+  // El detalle: solo datos que dio la API.
+  const partes = [];
+  if (detalleSesion) partes.push(detalleSesion);
+  if (!cargando && !infoSesion.error) {
+    if (infoSesion.ventanaAbierta) partes.push("La ventana de sesión ya estaba abierta.");
+    if (infoSesion.capturadoEn) partes.push("Sesión guardada: " + formateaFecha(infoSesion.capturadoEn));
+    partes.push(infoSesion.display
+      ? "Escritorio del servidor: " + infoSesion.display
+      : "El servidor no tiene escritorio (sin DISPLAY).");
+  }
+  if (!cargando && !infoSesion.error && !puede) {
+    partes.push("Para iniciar sesión con tu cuenta, la API tiene que correr con un escritorio visible. Mientras tanto el chat funciona como invitado.");
+  }
+  $("#sesion-detalle").textContent = partes.join(" · ");
+}
+
+async function cargarInfoSesion() {
+  try {
+    const r = await fetch("/api/sesion");
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    infoSesion = d;
+  } catch (e) {
+    infoSesion = { error: e.message || String(e) };
+  }
+  pintarModalSesion();
+}
+
+async function abrirMeta() {
+  if (faseSesion === "abriendo" || faseSesion === "guardando") return;
+  faseSesion = "abriendo";
+  errorSesion = "";
+  detalleSesion = "";
+  pintarModalSesion();
+  try {
+    const r = await fetch("/api/sesion/abrir", { method: "POST" });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    faseSesion = "abierta";
+    detalleSesion = d.mensaje || "";
+  } catch (e) {
+    faseSesion = "error";
+    errorSesion = e.message || String(e);
+  }
+  pintarModalSesion();
+}
+
+async function guardarSesion() {
+  if (faseSesion === "guardando" || faseSesion === "guardada") return;
+  faseSesion = "guardando";
+  errorSesion = "";
+  detalleSesion = "";
+  pintarModalSesion();
+  try {
+    const r = await fetch("/api/sesion/capturar", { method: "POST" });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(mensajeError(d, r.status));
+    faseSesion = "guardada";
+    detalleSesion = d.mensaje || "";
+    sesionGuardadaEn = Date.now();
+    refrescarEstado();          // el boton tiene que desaparecer
+    await cargarInfoSesion();   // el estado REAL (fecha de captura, etc.)
+    avisoFlotante("Sesión guardada ✓");
+  } catch (e) {
+    faseSesion = "error";
+    errorSesion = e.message || String(e);
+  }
+  pintarModalSesion();
+}
+
+function abrirModalSesion() {
+  faseSesion = "inicial";
+  errorSesion = "";
+  detalleSesion = "";
+  infoSesion = null;
+  $("#modal-sesion").hidden = false;
+  pintarModalSesion();
+  cargarInfoSesion();
+}
+
+function cerrarModalSesion() {
+  $("#modal-sesion").hidden = true;
+  // El modal pudo cambiar la sesion (guardar): el panel tiene que volver a
+  // preguntar para no mostrar un estado viejo.
+  if (vistaSel === "panel") cargarSesionPanel();
+}
+
+$("#btn-login").addEventListener("click", abrirModalSesion);
+$("#modal-cerrar").addEventListener("click", cerrarModalSesion);
+$("#modal-fondo").addEventListener("click", cerrarModalSesion);
+$("#abrir-meta").addEventListener("click", abrirMeta);
+$("#guardar-sesion").addEventListener("click", guardarSesion);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("#modal-sesion").hidden) cerrarModalSesion();
 });
 
 // Estado inicial de la vista.
