@@ -95,7 +95,7 @@ El usuario: "limpiarlo solo de lo que sea basura, hay mucha basura".
   depende del host): reproducido en un worktree limpio de HEAD, sin mis cambios.
 - `curl http://127.0.0.1:8055/` → 200; `/health` → 200.
 - `git status --porcelain` → arbol limpio.
-- 11 commits en la sesion, del `edc22de` al `7942cfb`.
+- 14 commits en la sesion, del `edc22de` al `96eaa25`.
 
 ## Lo que quedo (y por que)
 
